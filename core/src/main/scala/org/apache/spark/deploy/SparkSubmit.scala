@@ -67,8 +67,6 @@ private[spark] class SparkSubmit extends Logging {
   import DependencyUtils._
   import SparkSubmit._
 
-  private val KUBERNETES_STORE_DIAGNOSTICS =
-    "spark.kubernetes.storeDiagnostics"
   private val KUBERNETES_DIAGNOSTICS_MESSAGE_LIMIT_BYTES = 64 * 1024 // 64 KiB
 
   def doSubmit(args: Array[String]): Unit = {
@@ -1057,14 +1055,13 @@ private[spark] class SparkSubmit extends Logging {
       t: Throwable): Unit = {
     // Swallow exceptions when storing diagnostics, this shouldn't fail the application.
     try {
-      if (sparkConf.getBoolean(KUBERNETES_STORE_DIAGNOSTICS, false)
-        && !isShell(args.primaryResource) && !isSqlShell(args.mainClass)
+      if (!isShell(args.primaryResource) && !isSqlShell(args.mainClass)
         && !isThriftServer(args.mainClass)) {
         val diagnostics = SparkStringUtils.abbreviate(
           org.apache.hadoop.util.StringUtils.stringifyException(t),
           KUBERNETES_DIAGNOSTICS_MESSAGE_LIMIT_BYTES)
         SparkSubmitUtils.
-          getSparkDiagnosticsSetters(args.master)
+          getSparkDiagnosticsSetters(args.master, sparkConf)
           .map(_.setDiagnostics(diagnostics, sparkConf))
       }
     } catch {
@@ -1247,12 +1244,13 @@ private[spark] object SparkSubmitUtils {
     }
   }
 
-  private[deploy] def getSparkDiagnosticsSetters(master: String): Option[SparkDiagnosticsSetter] = {
+  private[deploy] def getSparkDiagnosticsSetters(
+    master: String, sparkConf: SparkConf): Option[SparkDiagnosticsSetter] = {
     val loader = Utils.getContextOrSparkClassLoader
     val serviceLoaders =
       ServiceLoader.load(classOf[SparkDiagnosticsSetter], loader)
         .asScala
-        .filter(_.supports(master))
+        .filter(_.supports(master, sparkConf))
 
     serviceLoaders.size match {
       case x if x > 1 =>
@@ -1287,6 +1285,8 @@ private[spark] trait SparkSubmitOperation {
 }
 
 private[spark] trait SparkDiagnosticsSetter {
+
   def setDiagnostics(diagnostics: String, conf: SparkConf): Unit
-  def supports(clusterManagerUrl: String): Boolean
+
+  def supports(clusterManagerUrl: String, conf: SparkConf): Boolean
 }

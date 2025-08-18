@@ -70,7 +70,10 @@ private[spark] class SparkKubernetesDiagnosticsSetter(
     }
   }
 
-  override def supports(clusterManagerUrl: String): Boolean = {
-    clusterManagerUrl.startsWith("k8s://")
+  override def supports(clusterManagerUrl: String, conf: SparkConf): Boolean = {
+    if (conf.get(KUBERNETES_STORE_DIAGNOSTICS)) {
+      return clusterManagerUrl.startsWith("k8s://")
+    }
+    false
   }
 }
