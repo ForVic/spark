@@ -25,15 +25,14 @@ import org.mockito.{ArgumentCaptor, Mock, MockitoAnnotations}
 import org.mockito.ArgumentMatchers.any
 import org.mockito.Mockito._
 import org.scalatest.BeforeAndAfterEach
-import org.scalatest.funsuite.AnyFunSuite
 import org.scalatestplus.mockito.MockitoSugar
 
-import org.apache.spark.SparkConf
+import org.apache.spark.{SparkConf, SparkFunSuite}
 import org.apache.spark.deploy.k8s.Config._
 import org.apache.spark.deploy.k8s.Constants.DIAGNOSTICS_ANNOTATION
 import org.apache.spark.deploy.k8s.Fabric8Aliases.PODS
 
-class SparkKubernetesDiagnosticsSetterSuite extends AnyFunSuite
+class SparkKubernetesDiagnosticsSetterSuite extends SparkFunSuite
   with MockitoSugar with BeforeAndAfterEach {
 
   @Mock
@@ -60,10 +59,14 @@ class SparkKubernetesDiagnosticsSetterSuite extends AnyFunSuite
     setter = new SparkKubernetesDiagnosticsSetter(clientProvider)
   }
 
-  test("supports() should return true only for k8s:// URLs") {
-    assert(setter.supports(k8sClusterManagerUrl))
-    assert(!setter.supports("yarn"))
-    assert(!setter.supports("spark://localhost"))
+  test("supports() should return true only for k8s:// URLs when the feature is enabled") {
+    assert(setter.supports(k8sClusterManagerUrl,
+      new SparkConf().set(KUBERNETES_STORE_DIAGNOSTICS, true)))
+    assert(!setter.supports(k8sClusterManagerUrl, new SparkConf()))
+    assert(!setter.supports(k8sClusterManagerUrl,
+      new SparkConf().set(KUBERNETES_STORE_DIAGNOSTICS, false)))
+    assert(!setter.supports("yarn", new SparkConf().set(KUBERNETES_STORE_DIAGNOSTICS, true)))
+    assert(!setter.supports("spark://localhost", new SparkConf()))
   }
 
   test("setDiagnostics should throw if driver pod name is missing") {
