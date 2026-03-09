@@ -69,6 +69,7 @@ import org.apache.spark.internal.{Logging, MessageWithContext}
 import org.apache.spark.internal.LogKeys
 import org.apache.spark.internal.LogKeys._
 import org.apache.spark.internal.config._
+import org.apache.spark.internal.config.Python.PYSPARK_EXECUTOR_MEMORY
 import org.apache.spark.internal.config.Streaming._
 import org.apache.spark.internal.config.Tests.IS_TESTING
 import org.apache.spark.internal.config.UI._
@@ -2628,6 +2629,18 @@ private[spark] object Utils
       isDriver: Boolean): T = {
     instantiateSerializerOrShuffleManager[T](
       conf.get(propertyName), conf, isDriver)
+  }
+
+  /**
+   * Return whether executor autoscaling is enabled in the given conf.
+   */
+  def isExecutorAutScalingEnabled(conf: ReadOnlySparkConf): Boolean = {
+    val autoscalingEnabled = conf.get(EXECUTOR_AUTOSCALING_ENABLED)
+    val noPySparkExecutorMemory = conf.get(PYSPARK_EXECUTOR_MEMORY).isEmpty
+    val memoryOffHeapEnabled = conf.get(MEMORY_OFFHEAP_ENABLED)
+    val dynamicAllocationEnabled = isDynamicAllocationEnabled(conf)
+
+    autoscalingEnabled && noPySparkExecutorMemory && !memoryOffHeapEnabled && dynamicAllocationEnabled
   }
 
   /**
