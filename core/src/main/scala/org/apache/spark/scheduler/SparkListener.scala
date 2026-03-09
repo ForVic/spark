@@ -295,6 +295,14 @@ case class SparkListenerLogStart(sparkVersion: String) extends SparkListenerEven
 case class SparkListenerResourceProfileAdded(resourceProfile: ResourceProfile)
   extends SparkListenerEvent
 
+@DeveloperApi
+case class SparkListenerStageResourceProfileUpdated(
+    stageId: Int,
+    stageAttemptId: Int,
+    stageState: String,
+    stageResourceProfileId: Int,
+    taskIndexToResourceProfileId: Map[Int, Int]) extends SparkListenerEvent
+
 /**
  * Interface for listening to events from the Spark scheduler. Most applications should probably
  * extend SparkListener or SparkFirehoseListener directly, rather than implementing this class.
@@ -492,6 +500,11 @@ private[spark] trait SparkListenerInterface {
    * Called when a Resource Profile is added to the manager.
    */
   def onResourceProfileAdded(event: SparkListenerResourceProfileAdded): Unit
+
+  /**
+   * Called when a stage's resource profile assignments are updated.
+   */
+  def onStageResourceProfileUpdated(event: SparkListenerStageResourceProfileUpdated): Unit
 }
 
 
@@ -585,4 +598,7 @@ abstract class SparkListener extends SparkListenerInterface {
   override def onOtherEvent(event: SparkListenerEvent): Unit = { }
 
   override def onResourceProfileAdded(event: SparkListenerResourceProfileAdded): Unit = { }
+
+  override def onStageResourceProfileUpdated(
+      event: SparkListenerStageResourceProfileUpdated): Unit = { }
 }

@@ -134,6 +134,8 @@ private[spark] object JsonProtocol extends JsonUtils {
         blockUpdateToJson(blockUpdate, g)
       case resourceProfileAdded: SparkListenerResourceProfileAdded =>
         resourceProfileAddedToJson(resourceProfileAdded, g)
+      case stageResourceProfileUpdated: SparkListenerStageResourceProfileUpdated =>
+        stageResourceProfileUpdatedToJson(stageResourceProfileUpdated, g)
       case _ =>
         mapper.writeValue(g, event)
     }
@@ -335,6 +337,25 @@ private[spark] object JsonProtocol extends JsonUtils {
     executorResourceRequestMapToJson(profileAdded.resourceProfile.executorResources, g)
     g.writeFieldName("Task Resource Requests")
     taskResourceRequestMapToJson(profileAdded.resourceProfile.taskResources, g)
+    g.writeEndObject()
+  }
+
+  def stageResourceProfileUpdatedToJson(
+      event: SparkListenerStageResourceProfileUpdated,
+      g: JsonGenerator): Unit = {
+    g.writeStartObject()
+    g.writeStringField(
+      "Event",
+      SPARK_LISTENER_EVENT_FORMATTED_CLASS_NAMES.stageResourceProfileUpdated)
+    g.writeNumberField("Stage ID", event.stageId)
+    g.writeNumberField("Stage Attempt ID", event.stageAttemptId)
+    g.writeStringField("Stage State", event.stageState)
+    g.writeNumberField("Stage Resource Profile Id", event.stageResourceProfileId)
+    g.writeObjectFieldStart("Task Index to Resource Profile Id Map")
+    event.taskIndexToResourceProfileId.toSeq.sortBy(_._1).foreach { case (taskIndex, profileId) =>
+      g.writeNumberField(taskIndex.toString, profileId)
+    }
+    g.writeEndObject()
     g.writeEndObject()
   }
 
@@ -932,6 +953,8 @@ private[spark] object JsonProtocol extends JsonUtils {
     val stageExecutorMetrics = Utils.getFormattedClassName(SparkListenerStageExecutorMetrics)
     val blockUpdate = Utils.getFormattedClassName(SparkListenerBlockUpdated)
     val resourceProfileAdded = Utils.getFormattedClassName(SparkListenerResourceProfileAdded)
+    val stageResourceProfileUpdated =
+      Utils.getFormattedClassName(SparkListenerStageResourceProfileUpdated)
   }
 
   def sparkEventFromJson(json: String): SparkListenerEvent = {
@@ -962,6 +985,7 @@ private[spark] object JsonProtocol extends JsonUtils {
       case `stageExecutorMetrics` => stageExecutorMetricsFromJson(json)
       case `blockUpdate` => blockUpdateFromJson(json)
       case `resourceProfileAdded` => resourceProfileAddedFromJson(json)
+      case `stageResourceProfileUpdated` => stageResourceProfileUpdatedFromJson(json)
       case other =>
         val otherClass = Utils.classForName(other)
         if (classOf[SparkListenerEvent].isAssignableFrom(otherClass)) {
@@ -1055,6 +1079,24 @@ private[spark] object JsonProtocol extends JsonUtils {
     val rp = new ResourceProfile(executorReqs.toMap, taskReqs.toMap)
     rp.setResourceProfileId(profId)
     SparkListenerResourceProfileAdded(rp)
+  }
+
+  def stageResourceProfileUpdatedFromJson(
+      json: JsonNode): SparkListenerStageResourceProfileUpdated = {
+    val stageId = json.get("Stage ID").extractInt
+    val stageAttemptId = json.get("Stage Attempt ID").extractInt
+    val stageState = json.get("Stage State").extractString
+    val stageResourceProfileId = json.get("Stage Resource Profile Id").extractInt
+    val taskIndexToResourceProfileId =
+      json.get("Task Index to Resource Profile Id Map").properties().asScala.map { field =>
+        field.getKey.toInt -> field.getValue.extractInt
+      }.toMap
+    SparkListenerStageResourceProfileUpdated(
+      stageId,
+      stageAttemptId,
+      stageState,
+      stageResourceProfileId,
+      taskIndexToResourceProfileId)
   }
 
   def executorResourceRequestFromJson(json: JsonNode): ExecutorResourceRequest = {

@@ -271,6 +271,11 @@ private[spark] class EventLoggingListener(
     logEvent(event, flushLogger = true)
   }
 
+  override def onStageResourceProfileUpdated(
+      event: SparkListenerStageResourceProfileUpdated): Unit = {
+    logEvent(event, flushLogger = true)
+  }
+
   override def onOtherEvent(event: SparkListenerEvent): Unit = {
     if (event.logEvent) {
       logEvent(event, flushLogger = true)
