@@ -220,4 +220,32 @@ class ResourceProfileManagerSuite extends SparkFunSuite {
     assert(equivProf.nonEmpty)
     assert(equivProf.get.id == rpAlreadyExist.get.id, s"resourceProfile should have existed")
   }
+
+  test("has equivalent profile based on resources") {
+    val conf = new SparkConf().set(EXECUTOR_CORES, 4)
+    val rpmanager = new ResourceProfileManager(conf, listenerBus)
+
+    val rp1 = buildResourceProfile("2048", "4096")
+    val returnedProfile1 = rpmanager.addResourceProfile(rp1, reuseEquivalentProfile = true)
+    assert(returnedProfile1 eq rp1)
+
+    val rp2 = buildResourceProfile("2048", "4096")
+    val returnedProfile2 = rpmanager.addResourceProfile(rp2, reuseEquivalentProfile = true)
+    assert(returnedProfile2 eq rp1)
+    assert(returnedProfile2.resourcesEqual(rp2))
+
+    rpmanager.checkDuplicateEquivalentProfiles()
+  }
+
+  private def buildResourceProfile(memory: String, overhead: String): ResourceProfile = {
+    new ResourceProfileBuilder()
+      .require(new ExecutorResourceRequests()
+        .cores(4)
+        .memory(memory)
+        .memoryOverhead(overhead)
+        .offHeapMemory("2000")
+        .pysparkMemory("100"))
+      .require(new TaskResourceRequests().cpus(1))
+      .build()
+  }
 }

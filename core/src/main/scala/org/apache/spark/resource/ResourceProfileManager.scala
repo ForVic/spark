@@ -128,14 +128,28 @@ private[spark] class ResourceProfileManager(sparkConf: SparkConf,
         taskRp.isInstanceOf[TaskResourceProfile])
   }
 
-  def addResourceProfile(rp: ResourceProfile): Unit = {
+  def addResourceProfile(
+      rp: ResourceProfile,
+      reuseEquivalentProfile: Boolean = false): ResourceProfile = {
     isSupported(rp)
     var putNewProfile = false
+    var profileToReturn: ResourceProfile = null
     writeLock.lock()
     try {
-      if (!resourceProfileIdToResourceProfile.contains(rp.id)) {
-        val prev = resourceProfileIdToResourceProfile.put(rp.id, rp)
-        if (prev.isEmpty) putNewProfile = true
+      profileToReturn = if (reuseEquivalentProfile) {
+        resourceProfileIdToResourceProfile.valuesIterator
+          .find(_.resourcesEqual(rp))
+          .getOrElse {
+            resourceProfileIdToResourceProfile.put(rp.id, rp)
+            putNewProfile = true
+            rp
+          }
+      } else {
+        resourceProfileIdToResourceProfile.get(rp.id).getOrElse {
+          resourceProfileIdToResourceProfile.put(rp.id, rp)
+          putNewProfile = true
+          rp
+        }
       }
     } finally {
       writeLock.unlock()
@@ -143,10 +157,12 @@ private[spark] class ResourceProfileManager(sparkConf: SparkConf,
     // do this outside the write lock only when we add a new profile
     if (putNewProfile) {
       // force the computation of maxTasks and limitingResource now so we don't have cost later
-      rp.limitingResource(sparkConf)
-      logInfo(log"Added ResourceProfile id: ${MDC(LogKeys.RESOURCE_PROFILE_ID, rp.id)}")
-      listenerBus.post(SparkListenerResourceProfileAdded(rp))
+      profileToReturn.limitingResource(sparkConf)
+      logInfo(log"Added ResourceProfile id: " +
+        log"${MDC(LogKeys.RESOURCE_PROFILE_ID, profileToReturn.id)}")
+      listenerBus.post(SparkListenerResourceProfileAdded(profileToReturn))
     }
+    profileToReturn
   }
 
   /*
@@ -174,6 +190,26 @@ private[spark] class ResourceProfileManager(sparkConf: SparkConf,
       resourceProfileIdToResourceProfile.find { case (_, rpEntry) =>
         rpEntry.resourcesEqual(rp)
       }.map(_._2)
+    } finally {
+      readLock.unlock()
+    }
+  }
+
+  private[spark] def checkDuplicateEquivalentProfiles(rpIds: Iterable[Int] = null): Unit = {
+    readLock.lock()
+    try {
+      val ids = if (rpIds == null) {
+        resourceProfileIdToResourceProfile.keys
+      } else {
+        rpIds
+      }
+      ids.toSeq.combinations(2).foreach {
+        case Seq(a, b) =>
+          val rp1 = resourceProfileIdToResourceProfile(a)
+          val rp2 = resourceProfileIdToResourceProfile(b)
+          assert(!rp1.resourcesEqual(rp2))
+        case _ =>
+      }
     } finally {
       readLock.unlock()
     }

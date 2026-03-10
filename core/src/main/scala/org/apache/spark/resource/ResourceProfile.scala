@@ -473,29 +473,40 @@ object ResourceProfile extends Logging {
       rp: ResourceProfile,
       memoryOpt: Option[String] = None,
       memoryOverheadOpt: Option[String] = None,
+      offHeapMemoryOpt: Option[String] = None,
+      pySparkMemoryOpt: Option[String] = None,
       coresOpt: Option[Int] = None,
       cpusOpt: Option[Double] = None): ResourceProfile = {
-    val updatedExecutorResources = new mutable.HashMap[String, ExecutorResourceRequest]
-    updatedExecutorResources ++= rp.executorResources
-    val updatedTaskResources = new mutable.HashMap[String, TaskResourceRequest]
-    updatedTaskResources ++= rp.taskResources
+    val executorResourceRequests = new ExecutorResourceRequests()
+    rp.getCustomExecutorResources().foreach { case (_, resource) =>
+      executorResourceRequests.resource(resource)
+    }
+    rp.getExecutorMemory.foreach(memory => executorResourceRequests.memory(s"${memory}m"))
+    rp.getOverheadMemory.foreach(memoryOverhead =>
+      executorResourceRequests.memoryOverhead(s"${memoryOverhead}m"))
+    rp.getExecutorOffHeap.foreach(offHeapMemory =>
+      executorResourceRequests.offHeapMemory(s"${offHeapMemory}m"))
+    rp.getPySparkMemory.foreach(pySparkMemory =>
+      executorResourceRequests.pysparkMemory(s"${pySparkMemory}m"))
+    rp.getExecutorCores.foreach(executorResourceRequests.cores)
 
-    memoryOpt.foreach { memory =>
-      updatedExecutorResources(MEMORY) =
-        new ExecutorResourceRequest(MEMORY, Utils.byteStringAsMb(memory))
-    }
-    memoryOverheadOpt.foreach { memoryOverhead =>
-      updatedExecutorResources(OVERHEAD_MEM) =
-        new ExecutorResourceRequest(OVERHEAD_MEM, Utils.byteStringAsMb(memoryOverhead))
-    }
-    coresOpt.foreach { cores =>
-      updatedExecutorResources(CORES) = new ExecutorResourceRequest(CORES, cores)
-    }
-    cpusOpt.foreach { cpus =>
-      updatedTaskResources(CPUS) = new TaskResourceRequest(CPUS, cpus)
-    }
+    memoryOpt.foreach(executorResourceRequests.memory)
+    memoryOverheadOpt.foreach(executorResourceRequests.memoryOverhead)
+    offHeapMemoryOpt.foreach(executorResourceRequests.offHeapMemory)
+    pySparkMemoryOpt.foreach(executorResourceRequests.pysparkMemory)
+    coresOpt.foreach(executorResourceRequests.cores)
 
-    new ResourceProfile(updatedExecutorResources.toMap, updatedTaskResources.toMap)
+    val taskResourceRequests = new TaskResourceRequests()
+    rp.getCustomTaskResources().foreach { case (_, resource) =>
+      taskResourceRequests.resource(resource)
+    }
+    rp.getTaskCpus.foreach(taskResourceRequests.cpus)
+    cpusOpt.foreach(cpus => taskResourceRequests.addRequest(new TaskResourceRequest(CPUS, cpus)))
+
+    new ResourceProfileBuilder()
+      .require(executorResourceRequests)
+      .require(taskResourceRequests)
+      .build()
   }
 
   /**

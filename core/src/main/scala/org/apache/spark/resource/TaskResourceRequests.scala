@@ -77,6 +77,14 @@ class TaskResourceRequests() extends Serializable {
   /**
    * Add a certain [[TaskResourceRequest]] to the request set.
    */
+  def resource(resource: TaskResourceRequest): this.type = {
+    _taskResources.put(resource.resourceName, resource)
+    this
+  }
+
+  /**
+   * Add a certain [[TaskResourceRequest]] to the request set.
+   */
   def addRequest(treq: TaskResourceRequest): this.type = {
     _taskResources.put(treq.resourceName, treq)
     this

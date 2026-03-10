@@ -142,6 +142,8 @@ class ResourceProfileSuite extends SparkFunSuite with MockitoSugar {
         .cores(2)
         .memory("2g")
         .memoryOverhead("512m")
+        .pysparkMemory("256m")
+        .offHeapMemory("128m")
         .resource("gpu", 1, "discover.sh", "nvidia"))
       .require(new TaskResourceRequests().cpus(1).resource("gpu", 0.5))
       .build()
@@ -150,11 +152,15 @@ class ResourceProfileSuite extends SparkFunSuite with MockitoSugar {
       baseProfile,
       memoryOpt = Some("4g"),
       memoryOverheadOpt = Some("1024m"),
+      offHeapMemoryOpt = Some("512m"),
+      pySparkMemoryOpt = Some("384m"),
       coresOpt = Some(4),
       cpusOpt = Some(2.0))
 
     assert(updatedProfile.getExecutorMemory.contains(4096L))
     assert(updatedProfile.getOverheadMemory.contains(1024L))
+    assert(updatedProfile.getExecutorOffHeap.contains(512L))
+    assert(updatedProfile.getPySparkMemory.contains(384L))
     assert(updatedProfile.getExecutorCores.contains(4))
     assert(updatedProfile.getTaskCpus.contains(2))
     assert(updatedProfile.executorResources("gpu") === baseProfile.executorResources("gpu"))

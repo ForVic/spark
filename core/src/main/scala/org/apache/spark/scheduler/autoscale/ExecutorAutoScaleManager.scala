@@ -226,10 +226,8 @@ private[spark] class ExecutorAutoScaleManager(
     val cacheKey = (rp.executorResources, rp.taskResources)
     val addedRp = resourcesToRpId.get(cacheKey)
       .map(resourceProfileManager.resourceProfileFromId)
-      .orElse(resourceProfileManager.getEquivalentProfile(rp))
       .getOrElse {
-        resourceProfileManager.addResourceProfile(rp)
-        rp
+        resourceProfileManager.addResourceProfile(rp, reuseEquivalentProfile = true)
       }
     resourcesToRpId(cacheKey) = addedRp.id
     addedRp
