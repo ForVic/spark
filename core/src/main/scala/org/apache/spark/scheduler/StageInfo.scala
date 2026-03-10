@@ -17,6 +17,9 @@
 
 package org.apache.spark.scheduler
 
+import java.util.concurrent.atomic.AtomicInteger
+
+import scala.collection.Map
 import scala.collection.mutable.HashMap
 
 import org.apache.spark.annotation.DeveloperApi
@@ -28,7 +31,7 @@ import org.apache.spark.storage.RDDInfo
  * Stores information about a stage to pass from the scheduler to SparkListeners.
  */
 @DeveloperApi
-class StageInfo(
+class StageInfo private[scheduler] (
     val stageId: Int,
     private val attemptId: Int,
     val name: String,
@@ -36,12 +39,36 @@ class StageInfo(
     val rddInfos: Seq[RDDInfo],
     val parentIds: Seq[Int],
     val details: String,
-    val taskMetrics: TaskMetrics = null,
-    private[spark] val taskLocalityPreferences: Seq[Seq[TaskLocation]] = Seq.empty,
-    private[spark] val shuffleDepId: Option[Int] = None,
-    val resourceProfileId: Int,
-    private[spark] var isShufflePushEnabled: Boolean = false,
-    private[spark] var shuffleMergerCount: Int = 0) {
+    val taskMetrics: TaskMetrics,
+    private[spark] val taskLocalityPreferences: Seq[Seq[TaskLocation]],
+    private[spark] val shuffleDepId: Option[Int],
+    private[spark] var isShufflePushEnabled: Boolean,
+    private[spark] var shuffleMergerCount: Int,
+    private[scheduler] val defaultResourceProfileId: AtomicInteger,
+    private[spark] val initialPartitionToRpIdAndTaskIndex: Map[Int, (Int, Int)]) {
+  // scalastyle:off
+  // This is mirroring the existing constructor, disabling scalastyle.
+  def this(
+      stageId: Int,
+      attemptId: Int,
+      name: String,
+      numTasks: Int,
+      rddInfos: Seq[RDDInfo],
+      parentIds: Seq[Int],
+      details: String,
+      taskMetrics: TaskMetrics = null,
+      taskLocalityPreferences: Seq[Seq[TaskLocation]] = Seq.empty,
+      shuffleDepId: Option[Int] = None,
+      resourceProfileId: Int,
+      isShufflePushEnabled: Boolean = false,
+      shuffleMergerCount: Int = 0,
+      initialPartitionToRpIdAndTaskIndex: Map[Int, (Int, Int)] = Map.empty) = {
+    this(stageId, attemptId, name, numTasks, rddInfos, parentIds, details, taskMetrics,
+      taskLocalityPreferences, shuffleDepId, isShufflePushEnabled, shuffleMergerCount,
+      new AtomicInteger(resourceProfileId), initialPartitionToRpIdAndTaskIndex)
+  }
+  // scalastyle:on
+
   /** When this stage was submitted from the DAGScheduler to a TaskScheduler. */
   var submissionTime: Option[Long] = None
   /** Time when the stage completed or when the stage was cancelled. */
@@ -63,6 +90,8 @@ class StageInfo(
   // This would just be the second constructor arg, except we need to maintain this method
   // with parentheses for compatibility
   def attemptNumber(): Int = attemptId
+
+  def resourceProfileId: Int = defaultResourceProfileId.get()
 
   private[spark] def getStatusString: String = {
     if (completionTime.isDefined) {

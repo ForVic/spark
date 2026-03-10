@@ -39,7 +39,7 @@ import org.apache.spark.internal.Logging
 import org.apache.spark.internal.config
 import org.apache.spark.internal.config.Tests.{SKIP_VALIDATE_CORES_TESTING, TEST_DYNAMIC_ALLOCATION_SCHEDULE_ENABLED}
 import org.apache.spark.resource.ResourceAmountUtils.ONE_ENTIRE_RESOURCE
-import org.apache.spark.resource.ResourceProfile
+import org.apache.spark.resource.{ExecutorResourceRequests, ResourceProfile, ResourceProfileBuilder, TaskResourceRequests}
 import org.apache.spark.resource.ResourceUtils._
 import org.apache.spark.resource.TestResourceIDs._
 import org.apache.spark.scheduler.cluster.CoarseGrainedSchedulerBackend
@@ -2759,6 +2759,73 @@ class TaskSetManagerSuite
     assert(taskSetManager.taskSetExcludelistHelperOpt.get.isDryRun)
   }
 
+  test("task set manager initializes task-level resource profile state") {
+    sc = new SparkContext("local", "test")
+    sched = new FakeTaskScheduler(sc, ("exec1", "host1"))
+
+    val rp = TaskSetManagerSuite.createCustomResourceProfile(sc)
+    val tasks = Array.tabulate[Task[_]](4)(i => new FakeTask(stageId = 0, partitionId = i))
+    val taskSet = new TaskSet(tasks, 0, 0, 0, null, ResourceProfile.DEFAULT_RESOURCE_PROFILE_ID,
+      None, Map(1 -> rp.id, 3 -> rp.id))
+
+    val manager = new TaskSetManager(sched, taskSet, MAX_TASK_FAILURES)
+
+    assert(manager.defaultResourceProfileId === ResourceProfile.DEFAULT_RESOURCE_PROFILE_ID)
+    assert(manager.hasTasksForResourceProfile(ResourceProfile.DEFAULT_RESOURCE_PROFILE_ID))
+    assert(manager.hasTasksForResourceProfile(rp.id))
+    assert(manager.tasksForResourceProfile(ResourceProfile.DEFAULT_RESOURCE_PROFILE_ID) ===
+      Set(0, 2))
+    assert(manager.tasksForResourceProfile(rp.id) === Set(1, 3))
+  }
+
+  test("task set manager updates task-level resource profile state") {
+    sc = new SparkContext("local", "test")
+    sched = new FakeTaskScheduler(sc, ("exec1", "host1"))
+
+    val rp1 = TaskSetManagerSuite.createCustomResourceProfile(sc)
+    val rp2 = TaskSetManagerSuite.createCustomResourceProfile(sc)
+    val tasks = Array.tabulate[Task[_]](4)(i => new FakeTask(stageId = 0, partitionId = i))
+    val taskSet = new TaskSet(tasks, 0, 0, 0, null, ResourceProfile.DEFAULT_RESOURCE_PROFILE_ID,
+      None, Map(1 -> rp1.id))
+
+    val manager = new TaskSetManager(sched, taskSet, MAX_TASK_FAILURES)
+    val (defaultRpId, taskToRpId) =
+      manager.updateResourceProfile(Some(rp2.id), Map(1 -> rp2.id, 2 -> rp1.id))
+
+    assert(defaultRpId === rp2.id)
+    assert(taskToRpId === Map(2 -> rp1.id))
+    assert(manager.defaultResourceProfileId === rp2.id)
+    assert(!manager.hasTasksForResourceProfile(ResourceProfile.DEFAULT_RESOURCE_PROFILE_ID))
+    assert(manager.tasksForResourceProfile(rp2.id) === Set(0, 1, 3))
+    assert(manager.tasksForResourceProfile(rp1.id) === Set(2))
+  }
+
+  test("task set manager tracks launched task resource profile id") {
+    sc = new SparkContext("local", "test")
+    sched = new FakeTaskScheduler(sc, ("exec1", "host1"))
+
+    val rp = TaskSetManagerSuite.createCustomResourceProfile(sc)
+    val taskSet = new TaskSet(Array[Task[_]](new FakeTask(stageId = 0, partitionId = 0)),
+      0, 0, 0, null, ResourceProfile.DEFAULT_RESOURCE_PROFILE_ID, None, Map(0 -> rp.id))
+    val manager = new TaskSetManager(sched, taskSet, MAX_TASK_FAILURES)
+
+    val (taskDescOpt, _, _) = manager.resourceOffer("exec1", "host1", ANY)
+
+    assert(taskDescOpt.isDefined)
+    assert(manager.taskInfos(taskDescOpt.get.taskId).resourceProfileId === rp.id)
+  }
+
+}
+
+private object TaskSetManagerSuite {
+  def createCustomResourceProfile(sc: SparkContext): ResourceProfile = {
+    val builder = new ResourceProfileBuilder()
+    builder.require(new ExecutorResourceRequests().cores(4).resource("gpu", 4))
+    builder.require(new TaskResourceRequests().cpus(1).resource("gpu", 1))
+    val rp = builder.build()
+    sc.resourceProfileManager.addResourceProfile(rp)
+    rp
+  }
 }
 
 class FakeLongTasks(stageId: Int, partitionId: Int) extends FakeTask(stageId, partitionId) {

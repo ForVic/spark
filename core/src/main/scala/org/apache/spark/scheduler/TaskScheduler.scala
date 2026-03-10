@@ -70,6 +70,12 @@ private[spark] trait TaskScheduler {
   // and they can skip running tasks for it.
   def notifyPartitionCompletion(stageId: Int, partitionId: Int): Unit
 
+  def updateStageResourceProfile(
+      stageId: Int,
+      stageAttemptId: Int,
+      stageRpId: Option[Int],
+      partitionToRpId: scala.collection.Map[Int, Int]): Unit
+
   // Set the DAG scheduler for upcalls. This is guaranteed to be set before submitTasks is called.
   def setDAGScheduler(dagScheduler: DAGScheduler): Unit
 

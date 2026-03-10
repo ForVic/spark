@@ -35,7 +35,7 @@ import org.scalatestplus.mockito.MockitoSugar
 
 import org.apache.spark._
 import org.apache.spark.internal.config
-import org.apache.spark.resource.{ExecutorResourceRequests, ResourceAmountUtils, ResourceProfile, TaskResourceProfile, TaskResourceRequests}
+import org.apache.spark.resource.{ExecutorResourceRequests, ResourceAmountUtils, ResourceProfile, ResourceProfileBuilder, TaskResourceProfile, TaskResourceRequests}
 import org.apache.spark.resource.ResourceAmountUtils.ONE_ENTIRE_RESOURCE
 import org.apache.spark.resource.ResourceUtils._
 import org.apache.spark.resource.TestResourceIDs._
@@ -2660,6 +2660,34 @@ class TaskSchedulerImplSuite extends SparkFunSuite with LocalSparkContext
     assert(3 === taskDescriptions.length)
   }
 
+  test("update stage resource profile updates task set manager and posts listener event") {
+    val taskScheduler = setupScheduler()
+    val rp = TaskSchedulerImplSuite.createCustomResourceProfile(sc)
+    @volatile var stageUpdate: SparkListenerStageResourceProfileUpdated = null
+    sc.listenerBus.addToSharedQueue(new SparkListener {
+      override def onStageResourceProfileUpdated(
+          event: SparkListenerStageResourceProfileUpdated): Unit = {
+        stageUpdate = event
+      }
+    })
+
+    taskScheduler.submitTasks(FakeTask.createTaskSet(numTasks = 3, stageId = 0, stageAttemptId = 0))
+    taskScheduler.updateStageResourceProfile(0, 0, None, Map(1 -> rp.id))
+    sc.listenerBus.waitUntilEmpty()
+
+    val manager = taskScheduler.taskSetManagerForAttempt(0, 0).get
+    assert(manager.defaultResourceProfileId === ResourceProfile.DEFAULT_RESOURCE_PROFILE_ID)
+    assert(manager.tasksForResourceProfile(ResourceProfile.DEFAULT_RESOURCE_PROFILE_ID) ===
+      Set(0, 2))
+    assert(manager.tasksForResourceProfile(rp.id) === Set(1))
+    assert(stageUpdate != null)
+    assert(stageUpdate.stageId === 0)
+    assert(stageUpdate.stageAttemptId === 0)
+    assert(stageUpdate.stageState === "running")
+    assert(stageUpdate.stageResourceProfileId === ResourceProfile.DEFAULT_RESOURCE_PROFILE_ID)
+    assert(stageUpdate.taskIndexToResourceProfileId === Map(1 -> rp.id))
+  }
+
   // 1 executor with 4 GPUS
   Seq(true, false).foreach { barrierMode =>
     val barrier = if (barrierMode) "in barrier" else ""
@@ -2713,4 +2741,15 @@ class TaskSchedulerImplSuite extends SparkFunSuite with LocalSparkContext
     }
   }
 
+}
+
+private object TaskSchedulerImplSuite {
+  def createCustomResourceProfile(sc: SparkContext): ResourceProfile = {
+    val builder = new ResourceProfileBuilder()
+    builder.require(new ExecutorResourceRequests().cores(4).resource("gpu", 4))
+    builder.require(new TaskResourceRequests().cpus(1).resource("gpu", 1))
+    val rp = builder.build()
+    sc.resourceProfileManager.addResourceProfile(rp)
+    rp
+  }
 }

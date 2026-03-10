@@ -72,10 +72,19 @@ private[spark] class TaskSetManager(
   private val isShuffleMapTasks = tasks(0).isInstanceOf[ShuffleMapTask]
   // shuffleId is only available when isShuffleMapTasks=true
   private val shuffleId = taskSet.shuffleId
+  private type PartitionId = Int
+  private type ResourceProfileId = Int
+  private type TaskIndex = Int
   private[scheduler] val partitionToIndex = tasks.zipWithIndex
     .map { case (t, idx) => t.partitionId -> idx }.toMap
   val numTasks = tasks.length
   val copiesRunning = new Array[Int](numTasks)
+  private var _defaultResourceProfileId = taskSet.initialDefaultResourceProfileId
+  // taskIndex -> rpId for non-default resource profiles only
+  private[scheduler] val (rpToTasks, taskToRpId) =
+    initializeResourceProfileToTasks(taskSet)
+
+  validateResourceProfileState()
 
   val speculationEnabled = conf.get(SPECULATION_ENABLED)
   private val efficientTaskProcessMultiplier =
@@ -98,16 +107,8 @@ private[spark] class TaskSetManager(
   // the worker. Therefore, CPUS_PER_TASK is okay to be greater than 1 without setting #cores.
   // To handle this case, we set slots to 1 when we don't know the executor cores.
   // TODO: use the actual number of slots for standalone mode.
-  val speculationTasksLessEqToSlots = {
-    val rpId = taskSet.resourceProfileId
-    val resourceProfile = sched.sc.resourceProfileManager.resourceProfileFromId(rpId)
-    val slots = if (!resourceProfile.isCoresLimitKnown) {
-      1
-    } else {
-      resourceProfile.maxTasksPerExecutor(conf)
-    }
-    numTasks <= slots
-  }
+  private var speculationTasksLessEqToSlots = false
+  resourceProfileUpdated()
 
   private val executorDecommissionKillInterval =
     conf.get(EXECUTOR_DECOMMISSION_KILL_INTERVAL).map(TimeUnit.SECONDS.toMillis)
@@ -161,6 +162,20 @@ private[spark] class TaskSetManager(
   private[scheduler] val runningTasksSet = new HashSet[Long]
 
   override def runningTasks: Int = runningTasksSet.size
+
+  private[scheduler] def defaultResourceProfileId: Int = _defaultResourceProfileId
+
+  /**
+   * Returns true if there are any tasks for the given resource profile id
+   */
+  private[scheduler] def hasTasksForResourceProfile(resourceProfileId: Int): Boolean = {
+    rpToTasks.contains(resourceProfileId)
+  }
+
+  // exposed for tests, returns the set of task indices for the given resource profile ID
+  private[scheduler] def tasksForResourceProfile(resourceProfileId: Int): Set[Int] = {
+    rpToTasks.get(resourceProfileId).map(_.toSet).getOrElse(Set[Int]())
+  }
 
   def someAttemptSucceeded(tid: Long): Boolean = {
     successful(taskInfos(tid).index)
@@ -241,6 +256,151 @@ private[spark] class TaskSetManager(
       }
     }
     logDebug(s"Adding pending tasks took $duration ms")
+  }
+
+  def resourceProfileUpdated(): Unit = {
+    // TODO: speculationTasksLessEqToSlots should be determined on a per resource profile level.
+    // Otherwise, one task mapped to a custom RP could cause all of the other tasks mapped to the
+    // default RP to become speculatable if the task-duration-threshold config is set.
+    speculationTasksLessEqToSlots = {
+      rpToTasks.exists { case (rpId, tasks) =>
+        val resourceProfile = sched.sc.resourceProfileManager.resourceProfileFromId(rpId)
+        val slots = if (!resourceProfile.isCoresLimitKnown) {
+          1
+        } else {
+          resourceProfile.maxTasksPerExecutor(conf)
+        }
+        tasks.size <= slots
+      }
+    }
+  }
+
+  private def initializeResourceProfileToTasks(
+      taskSet: TaskSet): (HashMap[ResourceProfileId, HashSet[TaskIndex]],
+        HashMap[TaskIndex, ResourceProfileId]) = {
+    val defaultResourceProfileId = taskSet.initialDefaultResourceProfileId
+    val partitionToRpId = taskSet.initialPartitionToRpId
+
+    val taskToRpId = new HashMap[TaskIndex, ResourceProfileId]()
+    val rpToTasks = new HashMap[ResourceProfileId, HashSet[TaskIndex]]()
+
+    partitionToRpId.foreach { case (partition, rpId) =>
+      partitionToIndex.get(partition).foreach { taskIndex =>
+        if (rpId != defaultResourceProfileId) {
+          taskToRpId(taskIndex) = rpId
+        }
+      }
+    }
+
+    taskSet.tasks.indices.foreach { taskIndex =>
+      val partitionId = taskSet.tasks(taskIndex).partitionId
+      if (partitionToRpId.contains(partitionId)) {
+        rpToTasks.getOrElseUpdate(partitionToRpId(partitionId), new HashSet[TaskIndex]) += taskIndex
+      } else {
+        rpToTasks.getOrElseUpdate(defaultResourceProfileId, new HashSet[TaskIndex]) += taskIndex
+      }
+    }
+
+    (rpToTasks, taskToRpId)
+  }
+
+  /**
+   * Update the resource profile details for this TSM.
+   * The updated resource profile will only be leveraged for newer task submissions.
+   *
+   * @param stageRpId TODO add stage-level RP update support
+   * @param partitionToResourceProfileId Explicitly assign resource profile ID to partitions
+   * @return (default resource profile ID, Map(task index -> non-default resource profile ID))
+   */
+  private[scheduler] def updateResourceProfile(
+      stageRpId: Option[Int],
+      partitionToResourceProfileId: scala.collection.Map[PartitionId, ResourceProfileId]):
+      (ResourceProfileId, Map[TaskIndex, ResourceProfileId]) = {
+    stageRpId.foreach { customRpId =>
+      if (customRpId != defaultResourceProfileId) {
+        rpToTasks.remove(defaultResourceProfileId).foreach { defaultRpTasks =>
+          rpToTasks.getOrElseUpdate(customRpId, new HashSet[TaskIndex]) ++= defaultRpTasks
+        }
+        _defaultResourceProfileId = customRpId
+      }
+    }
+
+    partitionToResourceProfileId.foreach { case (partitionId, customRpId) =>
+      partitionToIndex.get(partitionId).foreach { taskIndex =>
+        val prevRpIdOpt = taskToRpId.get(taskIndex).orElse(Some(defaultResourceProfileId))
+        if (customRpId != defaultResourceProfileId) {
+          taskToRpId(taskIndex) = customRpId
+        } else {
+          taskToRpId.remove(taskIndex)
+        }
+
+        if (prevRpIdOpt.exists(_ != customRpId)) {
+          val prevRpId = prevRpIdOpt.get
+          val prevTasksOpt = rpToTasks.get(prevRpId)
+          assert(prevTasksOpt.nonEmpty && prevTasksOpt.exists(_.contains(taskIndex)))
+          prevTasksOpt.foreach { prevTasks =>
+            prevTasks.remove(taskIndex)
+            if (prevTasks.isEmpty) {
+              rpToTasks.remove(prevRpId)
+            }
+          }
+          rpToTasks.getOrElseUpdate(customRpId, new HashSet[TaskIndex]) += taskIndex
+        }
+      }
+    }
+
+    resourceProfileUpdated()
+    validateResourceProfileState()
+
+    (defaultResourceProfileId, taskToRpId.toMap)
+  }
+
+  private def validateResourceProfileState(): Unit = {
+    // Assertions to validate the state of TaskSetManager after each RP update
+    val nonDefaultRpMismatchedTasks = rpToTasks
+      .filter(_._1 != defaultResourceProfileId)
+      .values
+      .flatten
+      .filterNot(taskToRpId.contains)
+      .toSet
+    assert(nonDefaultRpMismatchedTasks.isEmpty,
+      "The following task indices belong to a resource profile other than the default but are " +
+        s"not present in taskToRpId: $nonDefaultRpMismatchedTasks")
+
+    val defaultRpMismatchedTasks = rpToTasks
+      .getOrElse(defaultResourceProfileId, HashSet.empty[TaskIndex])
+      .filter(taskToRpId.contains)
+      .toSet
+    assert(defaultRpMismatchedTasks.isEmpty,
+      "The following task indices belong to the default resource profile but are present in " +
+        s"taskToRpId: $defaultRpMismatchedTasks")
+
+    assert(rpToTasks.values.flatten.toSet == (0 until numTasks).toSet,
+      "Number of tasks in rpToTasks does not match total number of tasks, got " +
+        s"${rpToTasks.values.flatten.toSet.size} but expected $numTasks")
+
+    assert((rpToTasks.values.flatten.toSet --
+      rpToTasks.getOrElse(defaultResourceProfileId, HashSet.empty[TaskIndex]).toSet) ==
+      taskToRpId.keySet,
+      "The set of non-default resource profile tasks in rpToTasks does not match the tasks " +
+        "in taskToRpId")
+
+    assert(rpToTasks.values.flatMap(_.toList).toList.size == numTasks,
+      "rpToTasks contains at least one task that belongs to more than one resource profile: " +
+        s"$rpToTasks")
+
+    val inconsistentMappings = taskToRpId.filter { case (task, rpId) =>
+      !rpToTasks.get(rpId).exists(_.contains(task))
+    }
+    assert(inconsistentMappings.isEmpty,
+      "The following task mappings in taskToRpId do not have the expected reverse " +
+        s"mapping in rpToTasks: $inconsistentMappings")
+
+    val rpWithNoTasks = rpToTasks
+      .filter(_._2.isEmpty)
+      .keys
+      .toSet
+    assert(rpWithNoTasks.isEmpty, s"The following RPs in rpToTasks are empty: $rpWithNoTasks")
   }
 
   /**
@@ -535,7 +695,8 @@ private[spark] class TaskSetManager(
     val attemptNum = taskAttempts(index).size
     val info = new TaskInfo(
       taskId, index, attemptNum, task.partitionId, launchTime,
-      execId, host, taskLocality, speculative)
+      execId, host, taskLocality, speculative,
+      taskToRpId.getOrElse(index, defaultResourceProfileId))
     taskInfos(taskId) = info
     taskAttempts(index) = info :: taskAttempts(index)
     // Serialize and return the task
@@ -566,6 +727,7 @@ private[spark] class TaskSetManager(
     val tName = taskName(taskId)
     logInfo(log"Starting ${MDC(TASK_NAME, tName)} (${MDC(HOST, host)}," +
       log"executor ${MDC(LogKeys.EXECUTOR_ID, info.executorId)}, " +
+      log"resource profile id ${MDC(LogKeys.RESOURCE_PROFILE_ID, info.resourceProfileId)}, " +
       log"partition ${MDC(PARTITION_ID, task.partitionId)}, " +
       log"${MDC(TASK_LOCALITY, taskLocality)}, " +
       log"${MDC(SIZE, serializedTask.limit())} bytes) " +
@@ -860,7 +1022,8 @@ private[spark] class TaskSetManager(
       tasksSuccessful += 1
       logInfo(log"Finished ${MDC(TASK_NAME, taskName(info.taskId))} in " +
         log"${MDC(DURATION, info.duration)} ms on ${MDC(HOST, info.host)} " +
-        log"(executor ${MDC(LogKeys.EXECUTOR_ID, info.executorId)}) " +
+        log"(executor ${MDC(LogKeys.EXECUTOR_ID, info.executorId)}, resource profile id " +
+        log"${MDC(LogKeys.RESOURCE_PROFILE_ID, info.resourceProfileId)}) " +
         log"(${MDC(NUM_SUCCESSFUL_TASKS, tasksSuccessful)}/${MDC(NUM_TASKS, numTasks)})")
       // Mark successful and stop if all the tasks have succeeded.
       successful(index) = true

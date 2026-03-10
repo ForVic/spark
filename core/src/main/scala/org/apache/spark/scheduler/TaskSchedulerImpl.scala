@@ -244,7 +244,7 @@ private[spark] class TaskSchedulerImpl(
     val tasks = taskSet.tasks
     logInfo(log"Adding task set " + taskSet.logId +
       log" with ${MDC(LogKeys.NUM_TASKS, tasks.length)} tasks resource profile " +
-      log"${MDC(LogKeys.RESOURCE_PROFILE_ID, taskSet.resourceProfileId)}")
+      log"${MDC(LogKeys.RESOURCE_PROFILE_ID, taskSet.initialDefaultResourceProfileId)}")
     this.synchronized {
       val manager = createTaskSetManager(taskSet, maxTaskFailures)
       val stage = taskSet.stageId
@@ -342,6 +342,23 @@ private[spark] class TaskSchedulerImpl(
     taskResultGetter.enqueuePartitionCompletionNotification(stageId, partitionId)
   }
 
+  override def updateStageResourceProfile(
+      stageId: Int,
+      stageAttemptId: Int,
+      stageRpId: Option[Int],
+      partitionToRpId: scala.collection.Map[Int, Int]): Unit = synchronized {
+    taskSetManagerForAttempt(stageId, stageAttemptId).foreach { manager =>
+      val (defaultResourceProfileId, taskToRpId) =
+        manager.updateResourceProfile(stageRpId, partitionToRpId)
+      sc.listenerBus.post(SparkListenerStageResourceProfileUpdated(
+        stageId,
+        stageAttemptId,
+        "running",
+        defaultResourceProfileId,
+        taskToRpId))
+    }
+  }
+
   /**
    * Called to indicate that all task attempts (including speculated tasks) associated with the
    * given TaskSetManager have completed, so state associated with the TaskSetManager should be
@@ -390,7 +407,7 @@ private[spark] class TaskSchedulerImpl(
     for (i <- shuffledOffers.indices) {
       val execId = shuffledOffers(i).executorId
       val host = shuffledOffers(i).host
-      val taskSetRpID = taskSet.taskSet.resourceProfileId
+      val taskSetRpID = taskSet.taskSet.initialDefaultResourceProfileId
 
       // check whether the task can be scheduled to the executor base on resource profile.
       if (sc.resourceProfileManager
@@ -457,7 +474,7 @@ private[spark] class TaskSchedulerImpl(
       taskSet: TaskSetManager,
       availCpus: Int,
       availWorkerResources: ExecutorResourcesAmounts): Option[Map[String, Map[String, Long]]] = {
-    val rpId = taskSet.taskSet.resourceProfileId
+    val rpId = taskSet.taskSet.initialDefaultResourceProfileId
     val taskSetProf = sc.resourceProfileManager.resourceProfileFromId(rpId)
     val taskCpus = ResourceProfile.getTaskCpusOrDefaultForProfile(taskSetProf, conf)
     // check if the ResourceProfile has cpus first since that is common case
@@ -544,7 +561,7 @@ private[spark] class TaskSchedulerImpl(
       // we only need to calculate available slots if using barrier scheduling, otherwise the
       // value is -1
       val numBarrierSlotsAvailable = if (taskSet.isBarrier) {
-        val rpId = taskSet.taskSet.resourceProfileId
+        val rpId = taskSet.taskSet.initialDefaultResourceProfileId
         val resAmounts = availableResources.map(_.resourceAddressAmount)
         calculateAvailableSlots(this, conf, rpId, resourceProfileIds, availableCpus, resAmounts)
       } else {
