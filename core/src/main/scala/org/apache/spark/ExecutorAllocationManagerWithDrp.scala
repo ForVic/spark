@@ -115,8 +115,12 @@ private[spark] class ExecutorAllocationManagerWithDrp(
 
   // Lower and upper bounds on the number of executors.
   private val minNumExecutors = conf.get(DYN_ALLOCATION_MIN_EXECUTORS)
+  private val minNumExecutorsNonDefaultRp =
+    conf.get(DYN_ALLOCATION_MIN_EXECUTORS_NON_DEFAULT_RESOURCE_PROFILE)
   private val maxNumExecutors = conf.get(DYN_ALLOCATION_MAX_EXECUTORS)
   private val initialNumExecutors = Utils.getDynamicAllocationInitialExecutors(conf)
+  private val initialNumExecutorsNonDefaultRp =
+    conf.get(DYN_ALLOCATION_INITIAL_EXECUTORS_NON_DEFAULT_RESOURCE_PROFILE)
 
   // How long there must be backlogged tasks for before an addition is triggered (seconds)
   private val schedulerBacklogTimeoutS = conf.get(DYN_ALLOCATION_SCHEDULER_BACKLOG_TIMEOUT)
@@ -153,6 +157,9 @@ private[spark] class ExecutorAllocationManagerWithDrp(
   // A timestamp of when an addition should be triggered, or NOT_SET if it is not set
   // This is set when pending tasks are added but not scheduled yet
   private var addTime: Long = NOT_SET
+
+  // Track periodic DRP allocation logs without spamming the driver.
+  private val logUpdates = new mutable.HashMap[Int, Long]
 
   // Polling loop interval (ms)
   private val intervalMillis: Long = 100
@@ -194,10 +201,11 @@ private[spark] class ExecutorAllocationManagerWithDrp(
    * If not, throw an appropriate exception.
    */
   private def validateSettings(): Unit = {
-    if (minNumExecutors < 0 || maxNumExecutors < 0) {
+    if (minNumExecutors < 0 || minNumExecutorsNonDefaultRp < 0 || maxNumExecutors < 0) {
       throw new SparkException(
-        s"${DYN_ALLOCATION_MIN_EXECUTORS.key} and ${DYN_ALLOCATION_MAX_EXECUTORS.key} must be " +
-          "positive!")
+        s"${DYN_ALLOCATION_MIN_EXECUTORS.key}, " +
+          s"${DYN_ALLOCATION_MIN_EXECUTORS_NON_DEFAULT_RESOURCE_PROFILE.key} and " +
+          s"${DYN_ALLOCATION_MAX_EXECUTORS.key} must be positive!")
     }
     if (maxNumExecutors == 0) {
       throw new SparkException(s"${DYN_ALLOCATION_MAX_EXECUTORS.key} cannot be 0!")
@@ -205,6 +213,12 @@ private[spark] class ExecutorAllocationManagerWithDrp(
     if (minNumExecutors > maxNumExecutors) {
       throw new SparkException(s"${DYN_ALLOCATION_MIN_EXECUTORS.key} ($minNumExecutors) must " +
         s"be less than or equal to ${DYN_ALLOCATION_MAX_EXECUTORS.key} ($maxNumExecutors)!")
+    }
+    if (minNumExecutorsNonDefaultRp > maxNumExecutors) {
+      throw new SparkException(
+        s"${DYN_ALLOCATION_MIN_EXECUTORS_NON_DEFAULT_RESOURCE_PROFILE.key} " +
+          s"($minNumExecutorsNonDefaultRp) must be less than or equal to " +
+          s"${DYN_ALLOCATION_MAX_EXECUTORS.key} ($maxNumExecutors)!")
     }
     if (schedulerBacklogTimeoutS <= 0) {
       throw new SparkException(s"${DYN_ALLOCATION_SCHEDULER_BACKLOG_TIMEOUT.key} must be > 0!")
@@ -288,11 +302,11 @@ private[spark] class ExecutorAllocationManagerWithDrp(
    */
   override def reset(): Unit = synchronized {
     addTime = 0L
-    numExecutorsTargetPerResourceProfileId.keys.foreach { rpId =>
-      numExecutorsTargetPerResourceProfileId(rpId) = initialNumExecutors
+    numExecutorsTargetPerResourceProfileId.mapValuesInPlace { case (rpId, _) =>
+      getInitialNumExecutors(rpId)
     }
-    numExecutorsToAddPerResourceProfileId.keys.foreach { rpId =>
-      numExecutorsToAddPerResourceProfileId(rpId) = 1
+    numExecutorsToAddPerResourceProfileId.mapValuesInPlace { case (rpId, _) =>
+      getInitialNumExecutorsToAdd(rpId)
     }
     executorMonitor.reset()
   }
@@ -309,6 +323,11 @@ private[spark] class ExecutorAllocationManagerWithDrp(
     val numRunningOrPendingTasks = pendingTask + pendingSpeculative + running
     val rp = resourceProfileManager.resourceProfileFromId(rpId)
     val tasksPerExecutor = rp.maxTasksPerExecutor(conf)
+    if (rpId != defaultProfileId && System.nanoTime() > logUpdates.getOrElse(rpId, 0L)) {
+      logInfo(s"max needed for rpId: $rpId numpending: $numRunningOrPendingTasks, " +
+        s"tasksperexecutor: $tasksPerExecutor")
+      logUpdates(rpId) = System.nanoTime() + TimeUnit.SECONDS.toNanos(60)
+    }
     logDebug(s"max needed for rpId: $rpId numpending: $numRunningOrPendingTasks," +
       s" tasksperexecutor: $tasksPerExecutor")
     val maxNeeded = math.ceil(numRunningOrPendingTasks * executorAllocationRatio /
@@ -496,8 +515,8 @@ private[spark] class ExecutorAllocationManagerWithDrp(
 
   private def decrementExecutors(maxNeeded: Int, rpId: Int): Int = {
     val oldNumExecutorsTarget = numExecutorsTargetPerResourceProfileId(rpId)
-    numExecutorsTargetPerResourceProfileId(rpId) = math.max(maxNeeded, minNumExecutors)
-    numExecutorsToAddPerResourceProfileId(rpId) = 1
+    numExecutorsTargetPerResourceProfileId(rpId) = math.max(maxNeeded, getMinNumExecutors(rpId))
+    numExecutorsToAddPerResourceProfileId(rpId) = getInitialNumExecutorsToAdd(rpId)
     numExecutorsTargetPerResourceProfileId(rpId) - oldNumExecutorsTarget
   }
 
@@ -530,7 +549,8 @@ private[spark] class ExecutorAllocationManagerWithDrp(
     // Ensure that our target doesn't exceed what we need at the present moment:
     numExecutorsTarget = math.min(numExecutorsTarget, maxNumExecutorsNeeded)
     // Ensure that our target fits within configured bounds:
-    numExecutorsTarget = math.max(math.min(numExecutorsTarget, maxNumExecutors), minNumExecutors)
+    numExecutorsTarget =
+      math.max(math.min(numExecutorsTarget, maxNumExecutors), getMinNumExecutors(rpId))
     val delta = numExecutorsTarget - oldNumExecutorsTarget
     numExecutorsTargetPerResourceProfileId(rpId) = numExecutorsTarget
 
@@ -564,10 +584,10 @@ private[spark] class ExecutorAllocationManagerWithDrp(
             executorMonitor.pendingRemovalCountPerResourceProfileId(rpId) -
             executorMonitor.decommissioningPerResourceProfileId(rpId)
           ))
-        if (newExecutorTotal - 1 < minNumExecutors) {
+        if (newExecutorTotal - 1 < getMinNumExecutors(rpId)) {
           logDebug(s"Not removing idle executor $executorIdToBeRemoved because there " +
             s"are only $newExecutorTotal executor(s) left (minimum number of executor limit " +
-            s"$minNumExecutors)")
+            s"${getMinNumExecutors(rpId)})")
         } else if (newExecutorTotal - 1 < numExecutorsTargetPerResourceProfileId(rpId)) {
           logDebug(s"Not removing idle executor $executorIdToBeRemoved because there " +
             s"are only $newExecutorTotal executor(s) left (number of executor " +
@@ -647,7 +667,22 @@ private[spark] class ExecutorAllocationManagerWithDrp(
   private def onSchedulerQueueEmpty(): Unit = synchronized {
     logDebug("Clearing timer to add executors because there are no more pending tasks")
     addTime = NOT_SET
-    numExecutorsToAddPerResourceProfileId.mapValuesInPlace { case (_, _) => 1 }
+    numExecutorsToAddPerResourceProfileId.mapValuesInPlace { case (rpId, _) =>
+      getInitialNumExecutorsToAdd(rpId)
+    }
+  }
+
+  private def getInitialNumExecutorsToAdd(rpId: Int): Int = {
+    if (rpId == defaultProfileId) 1 else 0
+  }
+
+  private def getInitialNumExecutors(rpId: Int): Int = {
+    if (rpId == defaultProfileId) initialNumExecutors
+    else math.max(initialNumExecutorsNonDefaultRp, minNumExecutorsNonDefaultRp)
+  }
+
+  private def getMinNumExecutors(rpId: Int): Int = {
+    if (rpId == defaultProfileId) minNumExecutors else minNumExecutorsNonDefaultRp
   }
 
   private case class StageAttempt(stageId: Int, stageAttemptId: Int) {
@@ -706,7 +741,8 @@ private[spark] class ExecutorAllocationManagerWithDrp(
         logDebug(s"Stage resource profile id is: $profId with numTasks: $numTasks")
         resourceProfileIdToStageAttempt.getOrElseUpdate(
           profId, new mutable.HashSet[StageAttempt]) += stageAttempt
-        numExecutorsToAddPerResourceProfileId.getOrElseUpdate(profId, 1)
+        numExecutorsToAddPerResourceProfileId.getOrElseUpdate(
+          profId, getInitialNumExecutorsToAdd(profId))
 
         // Compute the number of tasks requested by the stage on each host
         var numTasksPending = 0
@@ -726,9 +762,11 @@ private[spark] class ExecutorAllocationManagerWithDrp(
         updateExecutorPlacementHints()
 
         if (!numExecutorsTargetPerResourceProfileId.contains(profId)) {
+          val initialNumExecutors = getInitialNumExecutors(profId)
           numExecutorsTargetPerResourceProfileId.put(profId, initialNumExecutors)
           if (initialNumExecutors > 0) {
-            logDebug(s"requesting executors, rpId: $profId, initial number is $initialNumExecutors")
+            logDebug(s"requesting executors, rpId: $profId, initial number is " +
+              s"$initialNumExecutors")
             // we need to trigger a schedule since we add an initial number here.
             client.requestTotalExecutors(
               numExecutorsTargetPerResourceProfileId.toMap,
