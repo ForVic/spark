@@ -735,10 +735,24 @@ package object config {
       .intConf
       .createWithDefault(0)
 
+  private[spark] val DYN_ALLOCATION_MIN_EXECUTORS_NON_DEFAULT_RESOURCE_PROFILE =
+    ConfigBuilder("spark.dynamicAllocation.minExecutorsNonDefaultResourceProfile")
+      .doc(s"Configure this to override ${DYN_ALLOCATION_MIN_EXECUTORS.key} for all non-default " +
+        "resource profiles.")
+      .version("3.5.8")
+      .fallbackConf(DYN_ALLOCATION_MIN_EXECUTORS)
+
   private[spark] val DYN_ALLOCATION_INITIAL_EXECUTORS =
     ConfigBuilder("spark.dynamicAllocation.initialExecutors")
       .version("1.3.0")
       .fallbackConf(DYN_ALLOCATION_MIN_EXECUTORS)
+
+  private[spark] val DYN_ALLOCATION_INITIAL_EXECUTORS_NON_DEFAULT_RESOURCE_PROFILE =
+    ConfigBuilder("spark.dynamicAllocation.initialExecutorsNonDefaultResourceProfile")
+      .doc(s"Configure this to override ${DYN_ALLOCATION_INITIAL_EXECUTORS.key} for all " +
+        "non-default resource profiles.")
+      .version("3.5.8")
+      .fallbackConf(DYN_ALLOCATION_INITIAL_EXECUTORS)
 
   private[spark] val DYN_ALLOCATION_MAX_EXECUTORS =
     ConfigBuilder("spark.dynamicAllocation.maxExecutors")
