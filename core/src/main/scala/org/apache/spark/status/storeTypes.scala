@@ -124,6 +124,7 @@ private[spark] object TaskIndexNames {
   final val OUTPUT_RECORDS = "or"
   final val OUTPUT_SIZE = "os"
   final val PEAK_MEM = "pem"
+  final val RESOURCE_PROFILE_ID = "rpid"
   final val RESULT_SIZE = "rs"
   final val SCHEDULER_DELAY = "dly"
   final val SER_TIME = "rst"
@@ -189,6 +190,8 @@ private[spark] class TaskDataWrapper(
     val status: String,
     @KVIndexParam(value = TaskIndexNames.LOCALITY, parent = TaskIndexNames.STAGE)
     val taskLocality: String,
+    @KVIndexParam(value = TaskIndexNames.RESOURCE_PROFILE_ID, parent = TaskIndexNames.STAGE)
+    val resourceProfileId: Int,
     val speculative: Boolean,
     val accumulatorUpdates: collection.Seq[AccumulableInfo],
     val errorMessage: Option[String],
@@ -352,6 +355,7 @@ private[spark] class TaskDataWrapper(
       host,
       status,
       taskLocality,
+      resourceProfileId,
       speculative,
       accumulatorUpdates,
       errorMessage,

@@ -70,6 +70,7 @@ private[protobuf] class TaskDataWrapperSerializer extends ProtobufSerDe[TaskData
       .setShuffleRecordsWritten(input.shuffleRecordsWritten)
       .setStageId(input.stageId)
       .setStageAttemptId(input.stageAttemptId)
+      .setResourceProfileId(input.resourceProfileId)
     setStringField(input.executorId, builder.setExecutorId)
     setStringField(input.host, builder.setHost)
     setStringField(input.status, builder.setStatus)
@@ -97,6 +98,7 @@ private[protobuf] class TaskDataWrapperSerializer extends ProtobufSerDe[TaskData
       status = getStringField(binary.hasStatus, () => weakIntern(binary.getStatus)),
       taskLocality =
         getStringField(binary.hasTaskLocality, () => weakIntern(binary.getTaskLocality)),
+      resourceProfileId = binary.getResourceProfileId,
       speculative = binary.getSpeculative,
       accumulatorUpdates = accumulatorUpdates,
       errorMessage = getOptional(binary.hasErrorMessage, binary.getErrorMessage),

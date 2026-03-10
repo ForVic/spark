@@ -149,6 +149,7 @@ private[protobuf] class StageDataWrapperSerializer extends ProtobufSerDe[StageDa
       .setAttempt(t.attempt)
       .setPartitionId(t.partitionId)
       .setLaunchTime(t.launchTime.getTime)
+      .setResourceProfileId(t.resourceProfileId)
       .setSpeculative(t.speculative)
       .setSchedulerDelay(t.schedulerDelay)
       .setGettingResultTime(t.gettingResultTime)
@@ -642,6 +643,7 @@ private[protobuf] class StageDataWrapperSerializer extends ProtobufSerDe[StageDa
       status = getStringField(binary.hasStatus, () => weakIntern(binary.getStatus)),
       taskLocality =
         getStringField(binary.hasTaskLocality, () => weakIntern(binary.getTaskLocality)),
+      resourceProfileId = binary.getResourceProfileId,
       speculative = binary.getSpeculative,
       accumulatorUpdates = accumulatorUpdates,
       errorMessage = getOptional(binary.hasErrorMessage, binary.getErrorMessage),

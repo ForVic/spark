@@ -716,6 +716,34 @@ class JsonProtocolSuite extends SparkFunSuite {
     assert(JsonProtocol.taskInfoFromJson(oldJson).partitionId === -1)
   }
 
+  test("TaskInfo backward compatibility: handle missing resource profile id field") {
+    val newJson =
+      """
+        |{
+        |  "Task ID": 222,
+        |  "Index": 333,
+        |  "Attempt": 1,
+        |  "Partition ID": 333,
+        |  "Launch Time": 444,
+        |  "Executor ID": "executor",
+        |  "Host": "your kind sir",
+        |  "Locality": "NODE_LOCAL",
+        |  "Resource Profile Id": 7,
+        |  "Speculative": false,
+        |  "Getting Result Time": 0,
+        |  "Finish Time": 0,
+        |  "Failed": false,
+        |  "Killed": false,
+        |  "Accumulables": []
+        |}
+      """.stripMargin
+    val parsed = JsonProtocol.taskInfoFromJson(newJson)
+    assert(parsed.resourceProfileId === 7)
+
+    val oldJson = newJson.removeField("Resource Profile Id")
+    assert(JsonProtocol.taskInfoFromJson(oldJson).resourceProfileId === DEFAULT_RESOURCE_PROFILE_ID)
+  }
+
   test("AccumulableInfo value de/serialization") {
     import InternalAccumulator._
     val blocks = Seq[(BlockId, BlockStatus)](
@@ -1737,6 +1765,7 @@ private[spark] object JsonProtocolSuite extends Assertions {
       |    "Executor ID": "executor",
       |    "Host": "your kind sir",
       |    "Locality": "NODE_LOCAL",
+      |    "Resource Profile Id": 0,
       |    "Speculative": false,
       |    "Getting Result Time": 0,
       |    "Finish Time": 0,
@@ -1760,6 +1789,7 @@ private[spark] object JsonProtocolSuite extends Assertions {
       |    "Executor ID": "executor",
       |    "Host": "your kind sir",
       |    "Locality": "NODE_LOCAL",
+      |    "Resource Profile Id": 0,
       |    "Speculative": true,
       |    "Getting Result Time": 0,
       |    "Finish Time": 0,
@@ -1789,6 +1819,7 @@ private[spark] object JsonProtocolSuite extends Assertions {
       |    "Executor ID": "executor",
       |    "Host": "your kind sir",
       |    "Locality": "NODE_LOCAL",
+      |    "Resource Profile Id": 0,
       |    "Speculative": false,
       |    "Getting Result Time": 0,
       |    "Finish Time": 0,
@@ -1932,6 +1963,7 @@ private[spark] object JsonProtocolSuite extends Assertions {
       |    "Executor ID": "executor",
       |    "Host": "your kind sir",
       |    "Locality": "NODE_LOCAL",
+      |    "Resource Profile Id": 0,
       |    "Speculative": false,
       |    "Getting Result Time": 0,
       |    "Finish Time": 0,
@@ -2075,6 +2107,7 @@ private[spark] object JsonProtocolSuite extends Assertions {
       |    "Executor ID": "executor",
       |    "Host": "your kind sir",
       |    "Locality": "NODE_LOCAL",
+      |    "Resource Profile Id": 0,
       |    "Speculative": false,
       |    "Getting Result Time": 0,
       |    "Finish Time": 0,

@@ -128,6 +128,7 @@ message TaskDataWrapper {
   int64 shuffle_merged_local_bytes_read = 49;
   int64 shuffle_remote_reqs_duration = 50;
   int64 shuffle_merged_remote_req_duration = 51;
+  int32 resource_profile_id = 52;
 }
 
 message ExecutorMetrics {
@@ -531,6 +532,7 @@ message TaskData {
   map<string, string> executor_logs = 16;
   int64 scheduler_delay = 17;
   int64 getting_result_time = 18;
+  int32 resource_profile_id = 19;
 }
 
 enum StageStatus {

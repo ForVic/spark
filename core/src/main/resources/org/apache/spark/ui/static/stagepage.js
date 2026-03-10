@@ -293,7 +293,11 @@ function reselectCheckboxesBasedOnTaskTableState() {
       if (taskTableSelector.column(optionalColumns[k]).visible()) {
         taskSummaryHasSelected = true;
         $("#box-"+optionalColumns[k]).prop('checked', true);
-        taskSummaryMetricsTableCurrentStateArray.push(taskSummaryMetricsTableArray.filter(row => (row.checkboxId).toString() == optionalColumns[k])[0]);
+        var taskSummaryRow =
+          taskSummaryMetricsTableArray.filter(row => (row.checkboxId).toString() == optionalColumns[k])[0];
+        if (typeof taskSummaryRow !== 'undefined') {
+          taskSummaryMetricsTableCurrentStateArray.push(taskSummaryRow);
+        }
         taskSummaryMetricsTableCurrentFilteredArray = taskSummaryMetricsTableCurrentStateArray.slice();
       } else {
         allTaskSummaryChecked = false;
@@ -331,7 +335,7 @@ function getStageAttemptId() {
 var taskSummaryMetricsTableArray = [];
 var taskSummaryMetricsTableCurrentStateArray = [];
 var taskSummaryMetricsDataTable;
-var optionalColumns = [11, 12, 13, 14, 15, 16, 17, 21];
+var optionalColumns = [12, 13, 14, 15, 16, 17, 18, 19, 22];
 var taskTableSelector;
 
 var executorOptionalColumns = [15, 16, 17, 18];
@@ -347,14 +351,15 @@ $(document).ready(function () {
     "</a></div>" +
     "<div class='container-fluid-div ml-4 d-none' id='toggle-metrics'>" +
     "<div id='select_all' class='select-all-checkbox-div'><input type='checkbox' class='toggle-vis' id='box-0' data-column='0'> Select All</div>" +
-    "<div id='scheduler_delay' class='scheduler-delay-checkbox-div'><input type='checkbox' class='toggle-vis' id='box-11' data-column='11' data-metrics-type='task'> Scheduler Delay</div>" +
-    "<div id='task_deserialization_time' class='task-deserialization-time-checkbox-div'><input type='checkbox' class='toggle-vis' id='box-12' data-column='12' data-metrics-type='task'> Task Deserialization Time</div>" +
-    "<div id='shuffle_read_fetch_wait_time' class='shuffle-read-fetch-wait-time-checkbox-div'><input type='checkbox' class='toggle-vis' id='box-13' data-column='13' data-metrics-type='task'> Shuffle Read Fetch Wait Time</div>" +
-    "<div id='shuffle_remote_reads' class='shuffle-remote-reads-checkbox-div'><input type='checkbox' class='toggle-vis' id='box-14' data-column='14' data-metrics-type='task'> Shuffle Remote Reads</div>" +
-    "<div id='shuffle_write_time' class='shuffle-write-time-checkbox-div'><input type='checkbox' class='toggle-vis' id='box-21' data-column='21' data-metrics-type='task'> Shuffle Write Time</div>" +
-    "<div id='result_serialization_time' class='result-serialization-time-checkbox-div'><input type='checkbox' class='toggle-vis' id='box-15' data-column='15' data-metrics-type='task'> Result Serialization Time</div>" +
-    "<div id='getting_result_time' class='getting-result-time-checkbox-div'><input type='checkbox' class='toggle-vis' id='box-16' data-column='16' data-metrics-type='task'> Getting Result Time</div>" +
-    "<div id='peak_execution_memory' class='peak-execution-memory-checkbox-div'><input type='checkbox' class='toggle-vis' id='box-17' data-column='17' data-metrics-type='task'> Peak Execution Memory</div>" +
+    "<div id='scheduler_delay' class='scheduler-delay-checkbox-div'><input type='checkbox' class='toggle-vis' id='box-12' data-column='12' data-metrics-type='task'> Scheduler Delay</div>" +
+    "<div id='task_deserialization_time' class='task-deserialization-time-checkbox-div'><input type='checkbox' class='toggle-vis' id='box-13' data-column='13' data-metrics-type='task'> Task Deserialization Time</div>" +
+    "<div id='shuffle_read_fetch_wait_time' class='shuffle-read-fetch-wait-time-checkbox-div'><input type='checkbox' class='toggle-vis' id='box-14' data-column='14' data-metrics-type='task'> Shuffle Read Fetch Wait Time</div>" +
+    "<div id='shuffle_remote_reads' class='shuffle-remote-reads-checkbox-div'><input type='checkbox' class='toggle-vis' id='box-15' data-column='15' data-metrics-type='task'> Shuffle Remote Reads</div>" +
+    "<div id='shuffle_write_time' class='shuffle-write-time-checkbox-div'><input type='checkbox' class='toggle-vis' id='box-22' data-column='22' data-metrics-type='task'> Shuffle Write Time</div>" +
+    "<div id='result_serialization_time' class='result-serialization-time-checkbox-div'><input type='checkbox' class='toggle-vis' id='box-16' data-column='16' data-metrics-type='task'> Result Serialization Time</div>" +
+    "<div id='getting_result_time' class='getting-result-time-checkbox-div'><input type='checkbox' class='toggle-vis' id='box-17' data-column='17' data-metrics-type='task'> Getting Result Time</div>" +
+    "<div id='peak_execution_memory' class='peak-execution-memory-checkbox-div'><input type='checkbox' class='toggle-vis' id='box-18' data-column='18' data-metrics-type='task'> Peak Execution Memory</div>" +
+    "<div id='resource_prof_id' class='resource-prof-id-checkbox-div'><input type='checkbox' class='toggle-vis' id='box-19' data-column='19' data-metrics-type='task'> Resource Profile Id</div>" +
     "<div id='executor_jvm_on_off_heap_memory' class='executor-jvm-metrics-checkbox-div'><input type='checkbox' class='toggle-vis' id='executor-box-15'  data-column='15' data-metrics-type='executor'> Peak JVM Memory OnHeap / OffHeap</div>" +
     "<div id='executor_on_off_heap_execution_memory' class='executor-jvm-metrics-checkbox-div'><input type='checkbox' class='toggle-vis' id='executor-box-16' data-column='16' data-metrics-type='executor'> Peak Execution Memory OnHeap / OffHeap</div>" +
     "<div id='executor_on_off_heap_storage_memory' class='executor-jvm-metrics-checkbox-div'><input type='checkbox' class='toggle-vis' id='executor-box-17' data-column='17' data-metrics-type='executor'> Peak Storage Memory OnHeap / OffHeap</div>" +
@@ -682,9 +687,9 @@ $(document).ready(function () {
                   row1 = createRowMetadataForColumn(
                     columnKey, taskMetricsResponse[columnKey], 3);
                   row2 = createRowMetadataForColumn(
-                    "shuffleReadFetchWaitTime", taskMetricsResponse[columnKey], 13);
+                    "shuffleReadFetchWaitTime", taskMetricsResponse[columnKey], 14);
                   row3 = createRowMetadataForColumn(
-                    "shuffleRemoteReads", taskMetricsResponse[columnKey], 14);
+                    "shuffleRemoteReads", taskMetricsResponse[columnKey], 15);
                   if (dataToShow.showShuffleReadData) {
                     taskSummaryMetricsTableArray.push(row1);
                     taskSummaryMetricsTableArray.push(row2);
@@ -694,31 +699,31 @@ $(document).ready(function () {
 
                 case "schedulerDelay":
                   row = createRowMetadataForColumn(
-                    columnKey, taskMetricsResponse[columnKey], 11);
+                    columnKey, taskMetricsResponse[columnKey], 12);
                   taskSummaryMetricsTableArray.push(row);
                   break;
 
                 case "executorDeserializeTime":
                   row = createRowMetadataForColumn(
-                    columnKey, taskMetricsResponse[columnKey], 12);
+                    columnKey, taskMetricsResponse[columnKey], 13);
                   taskSummaryMetricsTableArray.push(row);
                   break;
 
                 case "resultSerializationTime":
                   row = createRowMetadataForColumn(
-                    columnKey, taskMetricsResponse[columnKey], 15);
+                    columnKey, taskMetricsResponse[columnKey], 16);
                   taskSummaryMetricsTableArray.push(row);
                   break;
 
                 case "gettingResultTime":
                   row = createRowMetadataForColumn(
-                    columnKey, taskMetricsResponse[columnKey], 16);
+                    columnKey, taskMetricsResponse[columnKey], 17);
                   taskSummaryMetricsTableArray.push(row);
                   break;
 
                 case "peakExecutionMemory":
                   row = createRowMetadataForColumn(
-                    columnKey, taskMetricsResponse[columnKey], 17);
+                    columnKey, taskMetricsResponse[columnKey], 18);
                   taskSummaryMetricsTableArray.push(row);
                   break;
 
@@ -742,7 +747,7 @@ $(document).ready(function () {
                   row1 = createRowMetadataForColumn(
                     columnKey, taskMetricsResponse[columnKey], 4);
                   row2 = createRowMetadataForColumn(
-                    "shuffleWriteTime", taskMetricsResponse[columnKey], 21);
+                    "shuffleWriteTime", taskMetricsResponse[columnKey], 22);
                   if (dataToShow.showShuffleWriteData) {
                     taskSummaryMetricsTableArray.push(row1);
                     taskSummaryMetricsTableArray.push(row2);
@@ -848,6 +853,7 @@ $(document).ready(function () {
               name: "Status"
             },
             {data : "taskLocality", name: "Locality Level"},
+            {data : "resourceProfileId", name: "Resource Profile Id"},
             {data : "executorId", name: "Executor ID"},
             {data : "host", name: "Host"},
             {data : "executorLogs", name: "Logs", render: formatLogsCells},
@@ -1058,7 +1064,7 @@ $(document).ready(function () {
           ],
           "columnDefs": [
             { "visible": false, "targets": optionalColumns },
-            { "visible": false, "targets": 18 }, // accumulators
+            { "visible": false, "targets": 19 }, // accumulators
           ],
           "deferRender": true
         };
@@ -1105,7 +1111,11 @@ $(document).ready(function () {
               column.visible(!column.visible());
               taskSummaryMetricsTableFilteredArray = [];
               if ($(this).is(":checked")) {
-                taskSummaryMetricsTableCurrentStateArray.push(taskSummaryMetricsTableArray.filter(row => (row.checkboxId).toString() == para)[0]);
+                var row = taskSummaryMetricsTableArray.filter(
+                  row => (row.checkboxId).toString() == para)[0];
+                if (typeof row !== 'undefined') {
+                  taskSummaryMetricsTableCurrentStateArray.push(row);
+                }
                 taskSummaryMetricsTableFilteredArray = taskSummaryMetricsTableCurrentStateArray.slice();
               } else {
                 taskSummaryMetricsTableFilteredArray =

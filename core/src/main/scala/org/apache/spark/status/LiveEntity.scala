@@ -221,6 +221,7 @@ private class LiveTask(
       weakIntern(info.host),
       weakIntern(info.status),
       weakIntern(info.taskLocality.toString()),
+      info.resourceProfileId,
       info.speculative,
       newAccumulatorInfos(info.accumulables),
       errorMessage,

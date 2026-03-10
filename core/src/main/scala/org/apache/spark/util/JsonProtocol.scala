@@ -496,6 +496,7 @@ private[spark] object JsonProtocol extends JsonUtils {
     g.writeStringField("Executor ID", taskInfo.executorId)
     g.writeStringField("Host", taskInfo.host)
     g.writeStringField("Locality", taskInfo.taskLocality.toString)
+    g.writeNumberField("Resource Profile Id", taskInfo.resourceProfileId)
     g.writeBooleanField("Speculative", taskInfo.speculative)
     g.writeNumberField("Getting Result Time", taskInfo.gettingResultTime)
     g.writeNumberField("Finish Time", taskInfo.finishTime)
@@ -1287,6 +1288,9 @@ private[spark] object JsonProtocol extends JsonUtils {
     val executorId = weakIntern(json.get("Executor ID").extractString)
     val host = weakIntern(json.get("Host").extractString)
     val taskLocality = TaskLocality.withName(json.get("Locality").extractString)
+    val resourceProfileId = jsonOption(json.get("Resource Profile Id"))
+      .map(_.extractInt)
+      .getOrElse(ResourceProfile.DEFAULT_RESOURCE_PROFILE_ID)
     val speculative = jsonOption(json.get("Speculative")).exists(_.extractBoolean)
     val gettingResultTime = json.get("Getting Result Time").extractLong
     val finishTime = json.get("Finish Time").extractLong
@@ -1299,7 +1303,7 @@ private[spark] object JsonProtocol extends JsonUtils {
 
     val taskInfo = new TaskInfo(
       taskId, index, attempt, partitionId, launchTime,
-      executorId, host, taskLocality, speculative)
+      executorId, host, taskLocality, speculative, resourceProfileId)
     taskInfo.gettingResultTime = gettingResultTime
     taskInfo.finishTime = finishTime
     taskInfo.failed = failed

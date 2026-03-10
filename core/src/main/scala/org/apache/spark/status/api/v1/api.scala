@@ -30,7 +30,12 @@ import com.fasterxml.jackson.databind.annotation.{JsonDeserialize, JsonSerialize
 import org.apache.spark.JobExecutionStatus
 import org.apache.spark.executor.ExecutorMetrics
 import org.apache.spark.metrics.ExecutorMetricType
-import org.apache.spark.resource.{ExecutorResourceRequest, ResourceInformation, TaskResourceRequest}
+import org.apache.spark.resource.{
+  ExecutorResourceRequest,
+  ResourceInformation,
+  ResourceProfile,
+  TaskResourceRequest
+}
 import org.apache.spark.status.AppStatusUtils.getQuantilesValue
 
 case class ApplicationInfo private[spark](
@@ -333,6 +338,7 @@ class TaskData private[spark](
     val host: String,
     val status: String,
     val taskLocality: String,
+    val resourceProfileId: Int = ResourceProfile.DEFAULT_RESOURCE_PROFILE_ID,
     val speculative: Boolean,
     val accumulatorUpdates: collection.Seq[AccumulableInfo],
     val errorMessage: Option[String] = None,

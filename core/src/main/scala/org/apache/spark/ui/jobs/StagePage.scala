@@ -462,6 +462,7 @@ private[spark] object ApiHelper {
   val HEADER_ATTEMPT = "Attempt"
   val HEADER_STATUS = "Status"
   val HEADER_LOCALITY = "Locality Level"
+  val HEADER_RESOURCE_PROFILE_ID = "Resource Profile Id"
   val HEADER_EXECUTOR = "Executor ID"
   val HEADER_HOST = "Host"
   val HEADER_LAUNCH_TIME = "Launch Time"
@@ -490,6 +491,7 @@ private[spark] object ApiHelper {
     HEADER_ATTEMPT -> TaskIndexNames.ATTEMPT,
     HEADER_STATUS -> TaskIndexNames.STATUS,
     HEADER_LOCALITY -> TaskIndexNames.LOCALITY,
+    HEADER_RESOURCE_PROFILE_ID -> TaskIndexNames.RESOURCE_PROFILE_ID,
     HEADER_EXECUTOR -> TaskIndexNames.EXECUTOR,
     HEADER_HOST -> TaskIndexNames.HOST,
     HEADER_LAUNCH_TIME -> TaskIndexNames.LAUNCH_TIME,

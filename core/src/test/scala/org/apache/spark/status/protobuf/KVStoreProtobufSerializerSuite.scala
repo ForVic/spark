@@ -144,6 +144,7 @@ class KVStoreProtobufSerializerSuite extends SparkFunSuite {
         host = host,
         status = status,
         taskLocality = taskLocality,
+        resourceProfileId = 41,
         speculative = true,
         accumulatorUpdates = accumulatorUpdates,
         errorMessage = Some("error"),
@@ -199,6 +200,7 @@ class KVStoreProtobufSerializerSuite extends SparkFunSuite {
       assert(result.host == input.host)
       assert(result.status == input.status)
       assert(result.taskLocality == input.taskLocality)
+      assert(result.resourceProfileId == input.resourceProfileId)
       assert(result.speculative == input.speculative)
       assert(result.errorMessage == input.errorMessage)
       assert(result.hasMetrics == input.hasMetrics)
@@ -1081,6 +1083,7 @@ class KVStoreProtobufSerializerSuite extends SparkFunSuite {
       host = "host_name_1",
       status = "SUCCESS",
       taskLocality = "LOCAL",
+      resourceProfileId = 17,
       speculative = true,
       accumulatorUpdates = accumulatorUpdates,
       errorMessage = Some("error_1"),
@@ -1101,6 +1104,7 @@ class KVStoreProtobufSerializerSuite extends SparkFunSuite {
       host = null,
       status = null,
       taskLocality = null,
+      resourceProfileId = 27,
       speculative = false,
       accumulatorUpdates = accumulatorUpdates,
       errorMessage = Some("error_2"),
@@ -1541,6 +1545,7 @@ class KVStoreProtobufSerializerSuite extends SparkFunSuite {
     assert(result.host == expected.host)
     assert(result.status == expected.status)
     assert(result.taskLocality == expected.taskLocality)
+    assert(result.resourceProfileId == expected.resourceProfileId)
     assert(result.speculative == expected.speculative)
     checkAnswer(result.accumulatorUpdates, expected.accumulatorUpdates)
     assert(result.errorMessage == expected.errorMessage)

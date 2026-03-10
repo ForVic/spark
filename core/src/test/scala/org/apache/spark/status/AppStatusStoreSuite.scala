@@ -17,6 +17,8 @@
 
 package org.apache.spark.status
 
+import java.util.Properties
+
 import scala.util.Random
 
 import org.apache.spark.{SparkConf, SparkFunSuite}
@@ -82,6 +84,19 @@ class AppStatusStoreSuite extends SparkFunSuite {
     }
 
     assert(store.count(classOf[CachedQuantile]) === 2)
+  }
+
+  test("task list preserves task resource profile id") {
+    val store = createAppStore(disk = false, live = true)
+    val stage = new StageInfo(stageId, attemptId, "stage", 1, Seq.empty, Seq.empty, "",
+      resourceProfileId = ResourceProfile.DEFAULT_RESOURCE_PROFILE_ID)
+    store.listener.get.onStageSubmitted(SparkListenerStageSubmitted(stage, new Properties()))
+
+    val taskInfo = new TaskInfo(1L, 2, 3, 4, 5L, "exec-1", "host-1", TaskLocality.ANY, false, 9)
+    store.listener.get.onTaskStart(SparkListenerTaskStart(stageId, attemptId, taskInfo))
+
+    val task = store.taskList(stageId, attemptId, 1).head
+    assert(task.resourceProfileId === 9)
   }
 
   private def createAppStore(disk: Boolean, diskStoreType: HybridStoreDiskBackend.Value = null,
@@ -278,7 +293,7 @@ class AppStatusStoreSuite extends SparkFunSuite {
   private def newTaskData(i: Int, status: String = "SUCCESS"): TaskDataWrapper = {
     new TaskDataWrapper(
       i.toLong, i, i, i, i, i, i,
-      i.toString, i.toString, status, i.toString, false, Nil, None, true,
+      i.toString, i.toString, status, i.toString, i, false, Nil, None, true,
       i, i, i, i, i, i, i, i, i, i,
       i, i, i, i, i, i, i, i, i, i,
       i, i, i, i, i, i, i, i, i, i,
