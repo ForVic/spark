@@ -40,7 +40,7 @@ private[spark] class ExecutorMonitor(
     client: ExecutorAllocationClient,
     listenerBus: LiveListenerBus,
     clock: Clock,
-    metrics: ExecutorAllocationManagerSource = null)
+    metrics: ExecutorAllocationManagerSourceShared = null)
   extends SparkListener with CleanerListener with Logging {
 
   private val idleTimeoutNs = TimeUnit.SECONDS.toNanos(

@@ -22,21 +22,34 @@ import org.apache.spark.internal.Logging
 import org.apache.spark.resource.ResourceProfileManager
 import org.apache.spark.scheduler.{DAGScheduler, LiveListenerBus, SparkListener}
 
+/**
+ * A module to dynamically scale executor requirements at a per-partition level based on memory
+ * related signals. These signals are collected via various events in the SparkListener
+ * interface (e.g. SparkListenerTaskEnd). The ResourceProfile class is used to describe the memory
+ * requirements of a partition. The [[DAGScheduler.updateResourceProfileForPartition]] is used
+ * to update the resource profile for a partition.
+ */
 private[spark] class ExecutorAutoScaleManager(
     listenerBus: LiveListenerBus,
     sparkConf: SparkConf,
     dagScheduler: DAGScheduler,
     resourceProfileManager: ResourceProfileManager) extends Logging {
 
-  private val executorAutoScaleListener = new ExecutorAutoScaleListener()
+  private val listener = new ExecutorAutoScaleListener()
 
   def start(): Unit = {
-    listenerBus.addToManagementQueue(executorAutoScaleListener)
+    listenerBus.addToManagementQueue(listener)
   }
 
   def stop(): Unit = {
-    listenerBus.removeListener(executorAutoScaleListener)
+    listenerBus.removeListener(listener)
   }
 
-  private class ExecutorAutoScaleListener extends SparkListener
+  /**
+   * A listener that processes TaskEnd events and collects memory related signals.
+   * If necessary it updates the resource profile of the task/stage.
+   */
+  private class ExecutorAutoScaleListener extends SparkListener {
+
+  }
 }

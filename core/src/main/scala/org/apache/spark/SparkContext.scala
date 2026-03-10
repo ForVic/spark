@@ -232,7 +232,7 @@ class SparkContext(config: SparkConf) extends Logging {
   private var _applicationAttemptId: Option[String] = None
   private var _eventLogger: Option[EventLoggingListener] = None
   private var _driverLogger: Option[DriverLogger] = None
-  private var _executorAllocationManager: Option[ExecutorAllocationManager] = None
+  private var _executorAllocationManager: Option[ExecutorAllocationManagerShared] = None
   private var _executorAutoScaleManager: Option[ExecutorAutoScaleManager] = None
   private var _cleaner: Option[ContextCleaner] = None
   private var _listenerBusStarted: Boolean = false
@@ -367,7 +367,7 @@ class SparkContext(config: SparkConf) extends Logging {
 
   private[spark] def eventLogger: Option[EventLoggingListener] = _eventLogger
 
-  private[spark] def executorAllocationManager: Option[ExecutorAllocationManager] =
+  private[spark] def executorAllocationManager: Option[ExecutorAllocationManagerShared] =
     _executorAllocationManager
 
   private[spark] def executorAutoScaleManager: Option[ExecutorAutoScaleManager] =
@@ -685,10 +685,17 @@ class SparkContext(config: SparkConf) extends Logging {
       if (dynamicAllocationEnabled) {
         schedulerBackend match {
           case b: ExecutorAllocationClient =>
-            Some(new ExecutorAllocationManager(
-              schedulerBackend.asInstanceOf[ExecutorAllocationClient], listenerBus, _conf,
-              cleaner = cleaner, resourceProfileManager = resourceProfileManager,
-              reliableShuffleStorage = _shuffleDriverComponents.supportsReliableStorage()))
+            if (Utils.isExecutorAutScalingEnabled(_conf)) {
+              Some(new ExecutorAllocationManagerWithDrp(
+                schedulerBackend.asInstanceOf[ExecutorAllocationClient], listenerBus, _conf,
+                cleaner = cleaner, resourceProfileManager = resourceProfileManager,
+                reliableShuffleStorage = _shuffleDriverComponents.supportsReliableStorage()))
+            } else {
+              Some(new ExecutorAllocationManager(
+                schedulerBackend.asInstanceOf[ExecutorAllocationClient], listenerBus, _conf,
+                cleaner = cleaner, resourceProfileManager = resourceProfileManager,
+                reliableShuffleStorage = _shuffleDriverComponents.supportsReliableStorage()))
+            }
           case _ =>
             None
         }
