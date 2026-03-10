@@ -136,6 +136,31 @@ class ResourceProfileSuite extends SparkFunSuite with MockitoSugar {
     assert(rprof.taskResources.contains("gpu"), "Task resources should have gpu")
   }
 
+  test("update resource profile preserves unspecified resources") {
+    val baseProfile = new ResourceProfileBuilder()
+      .require(new ExecutorResourceRequests()
+        .cores(2)
+        .memory("2g")
+        .memoryOverhead("512m")
+        .resource("gpu", 1, "discover.sh", "nvidia"))
+      .require(new TaskResourceRequests().cpus(1).resource("gpu", 0.5))
+      .build()
+
+    val updatedProfile = ResourceProfile.updateResourceProfile(
+      baseProfile,
+      memoryOpt = Some("4g"),
+      memoryOverheadOpt = Some("1024m"),
+      coresOpt = Some(4),
+      cpusOpt = Some(2.0))
+
+    assert(updatedProfile.getExecutorMemory.contains(4096L))
+    assert(updatedProfile.getOverheadMemory.contains(1024L))
+    assert(updatedProfile.getExecutorCores.contains(4))
+    assert(updatedProfile.getTaskCpus.contains(2))
+    assert(updatedProfile.executorResources("gpu") === baseProfile.executorResources("gpu"))
+    assert(updatedProfile.taskResources("gpu") === baseProfile.taskResources("gpu"))
+  }
+
   test("test default profile task gpus fractional") {
     val sparkConf = new SparkConf()
       .set(EXECUTOR_GPU_ID.amountConf, "2")

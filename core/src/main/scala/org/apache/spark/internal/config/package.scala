@@ -932,6 +932,35 @@ package object config {
       .booleanConf
       .createWithDefault(false)
 
+  private[spark] val EXECUTOR_AUTOSCALING_MIN_NUM_PARTITIONS_SCALE_UP =
+    ConfigBuilder("spark.executor.autoscaling.minNumPartitionsScaleUp")
+      .version("3.5.8")
+      .intConf
+      .checkValue(_ > 0, "The minimum number of partitions to scale up must be positive.")
+      .createWithDefault(1)
+
+  private[spark] val EXECUTOR_AUTOSCALING_MAX_OOM_RATIO =
+    ConfigBuilder("spark.executor.autoscaling.maxOOMRatio")
+      .version("3.5.8")
+      .doubleConf
+      .checkValue(v => v > 0.0 && v <= 1.0,
+        "The maximum OOM ratio must be in the range (0, 1].")
+      .createWithDefault(0.2)
+
+  private[spark] val EXECUTOR_AUTOSCALING_MEMORY_SCALE_UP_FACTOR =
+    ConfigBuilder("spark.executor.autoscaling.memoryScaleUpFactor")
+      .version("3.5.8")
+      .doubleConf
+      .checkValue(_ >= 1.0, "The memory scale up factor must be at least 1.0.")
+      .createWithDefault(1.2)
+
+  private[spark] val EXECUTOR_AUTOSCALING_MEMORY_MAX_SCALE_UP_FACTOR =
+    ConfigBuilder("spark.executor.autoscaling.memoryMaxScaleUpFactor")
+      .version("3.5.8")
+      .doubleConf
+      .checkValue(_ >= 1.0, "The maximum memory scale up factor must be at least 1.0.")
+      .createWithDefault(4.0)
+
   private[spark] val PY_FILES = ConfigBuilder("spark.yarn.dist.pyFiles")
     .internal()
     .version("2.2.1")
