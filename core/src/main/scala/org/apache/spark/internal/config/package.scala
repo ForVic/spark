@@ -935,6 +935,8 @@ package object config {
   private[spark] val EXECUTOR_AUTOSCALING_MIN_NUM_PARTITIONS_SCALE_UP =
     ConfigBuilder("spark.executor.autoscaling.minNumPartitionsScaleUp")
       .version("3.5.8")
+      .doc("The minimum number of individual partitions per stage attempt to scale up the " +
+        "resource profile for on out-of-memory errors before executor auto-scaling is disabled.")
       .intConf
       .checkValue(_ > 0, "The minimum number of partitions to scale up must be positive.")
       .createWithDefault(1)
@@ -942,6 +944,9 @@ package object config {
   private[spark] val EXECUTOR_AUTOSCALING_MAX_OOM_RATIO =
     ConfigBuilder("spark.executor.autoscaling.maxOOMRatio")
       .version("3.5.8")
+      .doc("The maximum ratio of partitions that run out of memory before executor auto-scaling " +
+        "is disabled, provided the number of individual partitions that OOM meets the " +
+        s"${EXECUTOR_AUTOSCALING_MIN_NUM_PARTITIONS_SCALE_UP.key} requirement.")
       .doubleConf
       .checkValue(v => v > 0.0 && v <= 1.0,
         "The maximum OOM ratio must be in the range (0, 1].")

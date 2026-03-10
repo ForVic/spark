@@ -121,9 +121,10 @@ private[spark] class ExecutorAutoScaleManager(
       val numPartitions = stageAttemptToNumPartitions.getOrElse(stageAttempt, 0)
 
       oomPartitions += partitionId
+      val oomPartitionsCount = oomPartitions.size
       val shouldScaleUp = numPartitions > 0 &&
-        (oomPartitions.size <= minNumPartitionsScaleUp ||
-          oomPartitions.size.toDouble / numPartitions <= maxOomRatio)
+        (oomPartitionsCount < minNumPartitionsScaleUp ||
+          oomPartitionsCount.toDouble / numPartitions < maxOomRatio)
 
       if (!shouldScaleUp) {
         logInfo(

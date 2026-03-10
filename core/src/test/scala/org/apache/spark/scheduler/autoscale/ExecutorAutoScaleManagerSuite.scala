@@ -75,15 +75,29 @@ class ExecutorAutoScaleManagerSuite extends SparkFunSuite with TempLocalSparkCon
     listenerBus.waitUntilEmpty()
   }
 
-  private def createConf(): SparkConf = {
+  private def createConf(
+      minNumPartitionsScaleUp: Int = 1,
+      maxOomRatio: Double = 0.2,
+      scaleUpFactor: Double = 1.2,
+      maxScaleUpFactor: Double = 4.0): SparkConf = {
     new SparkConf()
       .setMaster("local-cluster[1,1,1024]")
       .setAppName(getClass().getName())
       .set(DYN_ALLOCATION_ENABLED, true)
       .set(DYN_ALLOCATION_TESTING, true)
       .set(EXECUTOR_AUTOSCALING_ENABLED, true)
+      .set(EXECUTOR_AUTOSCALING_MIN_NUM_PARTITIONS_SCALE_UP, minNumPartitionsScaleUp)
+      .set(EXECUTOR_AUTOSCALING_MAX_OOM_RATIO, maxOomRatio)
+      .set(EXECUTOR_AUTOSCALING_MEMORY_SCALE_UP_FACTOR, scaleUpFactor)
+      .set(EXECUTOR_AUTOSCALING_MEMORY_MAX_SCALE_UP_FACTOR, maxScaleUpFactor)
       .set(MEMORY_OFFHEAP_ENABLED, false)
       .set(EXECUTOR_CORES, 1)
+  }
+
+  private def createManager(
+      conf: SparkConf,
+      dagScheduler: DAGScheduler = mock(classOf[DAGScheduler])): ExecutorAutoScaleManager = {
+    new ExecutorAutoScaleManager(listenerBus, conf, dagScheduler, resourceProfileManager)
   }
 
   test("initialize executor autoscaler") {
@@ -94,6 +108,15 @@ class ExecutorAutoScaleManagerSuite extends SparkFunSuite with TempLocalSparkCon
       assert(sc.executorAutoScaleManager.isDefined)
     } finally {
       sc.stop()
+    }
+  }
+
+  test("invalid executor autoscaling configs") {
+    intercept[IllegalArgumentException] {
+      createManager(createConf(minNumPartitionsScaleUp = 0))
+    }
+    intercept[IllegalArgumentException] {
+      createManager(createConf(maxOomRatio = 0.0))
     }
   }
 
@@ -158,9 +181,7 @@ class ExecutorAutoScaleManagerSuite extends SparkFunSuite with TempLocalSparkCon
   }
 
   test("do not keep scaling after oom threshold is exceeded") {
-    val conf = createConf()
-      .set(EXECUTOR_AUTOSCALING_MIN_NUM_PARTITIONS_SCALE_UP, 1)
-      .set(EXECUTOR_AUTOSCALING_MAX_OOM_RATIO, 0.1)
+    val conf = createConf(minNumPartitionsScaleUp = 2, maxOomRatio = 0.1)
     listenerBus.stop()
     sparkConf = conf
     ResourceProfile.reInitDefaultProfile(sparkConf)
