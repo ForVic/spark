@@ -21,6 +21,7 @@ import org.apache.spark.TaskState
 import org.apache.spark.TaskState.TaskState
 import org.apache.spark.annotation.DeveloperApi
 import org.apache.spark.errors.SparkCoreErrors
+import org.apache.spark.resource.ResourceProfile
 
 /**
  * :: DeveloperApi ::
@@ -45,7 +46,8 @@ class TaskInfo(
     val executorId: String,
     val host: String,
     val taskLocality: TaskLocality.TaskLocality,
-    val speculative: Boolean) extends Cloneable {
+    val speculative: Boolean,
+    val resourceProfileId: Int = ResourceProfile.DEFAULT_RESOURCE_PROFILE_ID) extends Cloneable {
 
   /**
    * This api doesn't contains partitionId, please use the new api.
@@ -60,7 +62,8 @@ class TaskInfo(
       host: String,
       taskLocality: TaskLocality.TaskLocality,
       speculative: Boolean) = {
-    this(taskId, index, attemptNumber, -1, launchTime, executorId, host, taskLocality, speculative)
+    this(taskId, index, attemptNumber, -1, launchTime, executorId, host, taskLocality,
+      speculative, ResourceProfile.DEFAULT_RESOURCE_PROFILE_ID)
   }
 
   /**

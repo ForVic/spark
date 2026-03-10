@@ -1130,7 +1130,7 @@ private[spark] class DAGScheduler(
       log"attempt ${MDC(STAGE_ATTEMPT_ID, stageAttemptId)} with stage resource profile id " +
       log"${MDC(RESOURCE_PROFILE_ID, stageRpId.getOrElse(-1))} and " +
       log"${MDC(NUM_PARTITIONS, partitionToRpId.size)} partition updates")
-    throw new UnsupportedOperationException("Updating stage resource profiles is not supported")
+    taskScheduler.updateStageResourceProfile(stageId, stageAttemptId, stageRpId, partitionToRpId)
   }
 
   /**

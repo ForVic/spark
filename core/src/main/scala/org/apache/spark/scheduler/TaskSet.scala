@@ -19,6 +19,8 @@ package org.apache.spark.scheduler
 
 import java.util.Properties
 
+import scala.collection.Map
+
 import org.apache.spark.internal.LogKeys.{STAGE_ATTEMPT_ID, STAGE_ID}
 import org.apache.spark.internal.MessageWithContext
 
@@ -32,9 +34,12 @@ private[spark] class TaskSet(
     val stageAttemptId: Int,
     val priority: Int,
     val properties: Properties,
-    val resourceProfileId: Int,
-    val shuffleId: Option[Int]) {
+    private[scheduler] val initialDefaultResourceProfileId: Int,
+    val shuffleId: Option[Int],
+    private[scheduler] val initialPartitionToRpId: Map[Int, Int] = Map.empty) {
   val id: String = s"$stageId.$stageAttemptId"
+
+  def resourceProfileId: Int = initialDefaultResourceProfileId
 
   override def toString: String = "TaskSet " + id
 
