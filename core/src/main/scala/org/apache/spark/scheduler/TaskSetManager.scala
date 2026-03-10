@@ -177,6 +177,29 @@ private[spark] class TaskSetManager(
     rpToTasks.get(resourceProfileId).map(_.toSet).getOrElse(Set[Int]())
   }
 
+  private def taskResourceProfileIdForTask(index: Int): Int = {
+    taskToRpId.getOrElse(index, defaultResourceProfileId)
+  }
+
+  private[scheduler] def resourceProfileIdForTask(index: Int): Int = {
+    taskResourceProfileIdForTask(index)
+  }
+
+  private[scheduler] def resourceProfileIdsForOffer(executorRpId: Int): Seq[Int] = {
+    rpToTasks.keysIterator
+      .filter(sched.sc.resourceProfileManager.canBeScheduled(_, executorRpId))
+      .toSeq
+      .sortBy { taskRpId =>
+        if (taskRpId == executorRpId) {
+          0
+        } else if (taskRpId == defaultResourceProfileId) {
+          1
+        } else {
+          2
+        }
+      }
+  }
+
   def someAttemptSucceeded(tid: Long): Boolean = {
     successful(taskInfos(tid).index)
   }
@@ -483,12 +506,14 @@ private[spark] class TaskSetManager(
       execId: String,
       host: String,
       list: ArrayBuffer[Int],
+      taskRpId: Int = -1,
       speculative: Boolean = false): Option[Int] = {
     var indexOffset = list.size
     while (indexOffset > 0) {
       indexOffset -= 1
       val index = list(indexOffset)
       if (!isTaskExcludededOnExecOrNode(index, execId, host) &&
+          (taskRpId < 0 || taskResourceProfileIdForTask(index) == taskRpId) &&
           !(speculative && hasAttemptOnHost(index, host))) {
         // This should almost always be list.trimEnd(1) to remove tail
         list.remove(indexOffset)
@@ -527,24 +552,26 @@ private[spark] class TaskSetManager(
   private def dequeueTask(
       execId: String,
       host: String,
-      maxLocality: TaskLocality.Value): Option[(Int, TaskLocality.Value, Boolean)] = {
+      maxLocality: TaskLocality.Value,
+      taskRpId: Int = -1): Option[(Int, TaskLocality.Value, Boolean)] = {
     // Tries to schedule a regular task first; if it returns None, then schedules
     // a speculative task
-    dequeueTaskHelper(execId, host, maxLocality, false).orElse(
-      dequeueTaskHelper(execId, host, maxLocality, true))
+    dequeueTaskHelper(execId, host, maxLocality, taskRpId, false).orElse(
+      dequeueTaskHelper(execId, host, maxLocality, taskRpId, true))
   }
 
   protected def dequeueTaskHelper(
       execId: String,
       host: String,
       maxLocality: TaskLocality.Value,
+      taskRpId: Int,
       speculative: Boolean): Option[(Int, TaskLocality.Value, Boolean)] = {
     if (speculative && speculatableTasks.isEmpty) {
       return None
     }
     val pendingTaskSetToUse = if (speculative) pendingSpeculatableTasks else pendingTasks
     def dequeue(list: ArrayBuffer[Int]): Option[Int] = {
-      val task = dequeueTaskFromList(execId, host, list, speculative)
+      val task = dequeueTaskFromList(execId, host, list, taskRpId, speculative)
       if (speculative && task.isDefined) {
         speculatableTasks -= task.get
       }
@@ -616,6 +643,7 @@ private[spark] class TaskSetManager(
       execId: String,
       host: String,
       maxLocality: TaskLocality.TaskLocality,
+      taskRpId: Int = -1,
       taskCpus: Int = sched.CPUS_PER_TASK,
       taskResourceAssignments: Map[String, Map[String, Long]] = Map.empty)
     : (Option[TaskDescription], Boolean, Int) =
@@ -639,7 +667,7 @@ private[spark] class TaskSetManager(
 
       var dequeuedTaskIndex: Option[Int] = None
       val taskDescription =
-        dequeueTask(execId, host, allowedLocality)
+        dequeueTask(execId, host, allowedLocality, taskRpId)
           .map { case (index, taskLocality, speculative) =>
             dequeuedTaskIndex = Some(index)
             if (legacyLocalityWaitReset && maxLocality != TaskLocality.NO_PREF) {
@@ -660,6 +688,7 @@ private[spark] class TaskSetManager(
                 execId,
                 host,
                 index,
+                taskResourceProfileIdForTask(index),
                 taskLocality,
                 speculative,
                 taskCpus,
@@ -682,6 +711,7 @@ private[spark] class TaskSetManager(
       execId: String,
       host: String,
       index: Int,
+      taskRpId: Int,
       taskLocality: TaskLocality.Value,
       speculative: Boolean,
       taskCpus: Int,
@@ -696,7 +726,7 @@ private[spark] class TaskSetManager(
     val info = new TaskInfo(
       taskId, index, attemptNum, task.partitionId, launchTime,
       execId, host, taskLocality, speculative,
-      taskToRpId.getOrElse(index, defaultResourceProfileId))
+      taskRpId)
     taskInfos(taskId) = info
     taskAttempts(index) = info :: taskAttempts(index)
     // Serialize and return the task

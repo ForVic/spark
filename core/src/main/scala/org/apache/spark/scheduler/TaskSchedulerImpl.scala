@@ -401,48 +401,45 @@ private[spark] class TaskSchedulerImpl(
     for (i <- shuffledOffers.indices) {
       val execId = shuffledOffers(i).executorId
       val host = shuffledOffers(i).host
-      val taskSetRpID = taskSet.taskSet.initialDefaultResourceProfileId
 
-      // check whether the task can be scheduled to the executor base on resource profile.
-      if (sc.resourceProfileManager
-        .canBeScheduled(taskSetRpID, shuffledOffers(i).resourceProfileId)) {
-        val taskResAssignmentsOpt = resourcesMeetTaskRequirements(taskSet, availableCpus(i),
-          availableResources(i))
-        taskResAssignmentsOpt.foreach { taskResAssignments =>
-          try {
-            val prof = sc.resourceProfileManager.resourceProfileFromId(taskSetRpID)
-            val taskCpus = ResourceProfile.getTaskCpusOrDefaultForProfile(prof, conf)
-            val (taskDescOption, didReject, index) =
-              taskSet.resourceOffer(execId, host, maxLocality, taskCpus, taskResAssignments)
-            noDelayScheduleRejects &= !didReject
-            for (task <- taskDescOption) {
-              val (locality, resources) = if (task != null) {
-                tasks(i) += task
-                addRunningTask(task.taskId, execId, taskSet)
-                (taskSet.taskInfos(task.taskId).taskLocality, task.resources)
-              } else {
-                assert(taskSet.isBarrier, "TaskDescription can only be null for barrier task")
-                val barrierTask = taskSet.barrierPendingLaunchTasks(index)
-                barrierTask.assignedOfferIndex = i
-                barrierTask.assignedCores = taskCpus
-                (barrierTask.taskLocality, barrierTask.assignedResources)
-              }
-
-              minLaunchedLocality = minTaskLocality(minLaunchedLocality, Some(locality))
-              availableCpus(i) -= taskCpus
-              assert(availableCpus(i) >= 0)
-              availableResources(i).acquire(resources)
+      val offerRpId = shuffledOffers(i).resourceProfileId
+      val taskResAssignmentsOpt =
+        resourcesMeetTaskRequirements(taskSet, offerRpId, availableCpus(i), availableResources(i))
+      taskResAssignmentsOpt.foreach { case (taskRpId, taskResAssignments) =>
+        try {
+          val prof = sc.resourceProfileManager.resourceProfileFromId(taskRpId)
+          val taskCpus = ResourceProfile.getTaskCpusOrDefaultForProfile(prof, conf)
+          val (taskDescOption, didReject, index) =
+            taskSet.resourceOffer(execId, host, maxLocality, taskRpId, taskCpus,
+              taskResAssignments)
+          noDelayScheduleRejects &= !didReject
+          for (task <- taskDescOption) {
+            val (locality, resources) = if (task != null) {
+              tasks(i) += task
+              addRunningTask(task.taskId, execId, taskSet)
+              (taskSet.taskInfos(task.taskId).taskLocality, task.resources)
+            } else {
+              assert(taskSet.isBarrier, "TaskDescription can only be null for barrier task")
+              val barrierTask = taskSet.barrierPendingLaunchTasks(index)
+              barrierTask.assignedOfferIndex = i
+              barrierTask.assignedCores = taskCpus
+              (barrierTask.taskLocality, barrierTask.assignedResources)
             }
-          } catch {
-            case e: TaskNotSerializableException =>
-              // scalastyle:off line.size.limit
-              logError(log"Resource offer failed, task set " +
-                log"${MDC(LogKeys.TASK_SET_NAME, taskSet.name)} was not serializable")
-              // scalastyle:on
-              // Do not offer resources for this task, but don't throw an error to allow other
-              // task sets to be submitted.
-              return (noDelayScheduleRejects, minLaunchedLocality)
+
+            minLaunchedLocality = minTaskLocality(minLaunchedLocality, Some(locality))
+            availableCpus(i) -= taskCpus
+            assert(availableCpus(i) >= 0)
+            availableResources(i).acquire(resources)
           }
+        } catch {
+          case e: TaskNotSerializableException =>
+            // scalastyle:off line.size.limit
+            logError(log"Resource offer failed, task set " +
+              log"${MDC(LogKeys.TASK_SET_NAME, taskSet.name)} was not serializable")
+            // scalastyle:on
+            // Do not offer resources for this task, but don't throw an error to allow other
+            // task sets to be submitted.
+            return (noDelayScheduleRejects, minLaunchedLocality)
         }
       }
     }
@@ -466,15 +463,20 @@ private[spark] class TaskSchedulerImpl(
    */
   private def resourcesMeetTaskRequirements(
       taskSet: TaskSetManager,
+      executorRpId: Int,
       availCpus: Int,
-      availWorkerResources: ExecutorResourcesAmounts): Option[Map[String, Map[String, Long]]] = {
-    val rpId = taskSet.taskSet.initialDefaultResourceProfileId
-    val taskSetProf = sc.resourceProfileManager.resourceProfileFromId(rpId)
-    val taskCpus = ResourceProfile.getTaskCpusOrDefaultForProfile(taskSetProf, conf)
-    // check if the ResourceProfile has cpus first since that is common case
-    if (availCpus < taskCpus) return None
-    // only look at the resource other than cpus
-    availWorkerResources.assignAddressesCustomResources(taskSetProf)
+      availWorkerResources: ExecutorResourcesAmounts):
+      Option[(Int, Map[String, Map[String, Long]])] = {
+    taskSet.resourceProfileIdsForOffer(executorRpId).iterator.flatMap { taskRpId =>
+      val taskRp = sc.resourceProfileManager.resourceProfileFromId(taskRpId)
+      val taskCpus = ResourceProfile.getTaskCpusOrDefaultForProfile(taskRp, conf)
+      if (availCpus < taskCpus) {
+        None
+      } else {
+        availWorkerResources.assignAddressesCustomResources(taskRp)
+          .map(taskRpId -> _)
+      }
+    }.toSeq.headOption
   }
 
   private def minTaskLocality(
@@ -709,6 +711,7 @@ private[spark] class TaskSchedulerImpl(
                 task.execId,
                 task.host,
                 task.index,
+                taskSet.resourceProfileIdForTask(task.index),
                 task.taskLocality,
                 false,
                 task.assignedCores,

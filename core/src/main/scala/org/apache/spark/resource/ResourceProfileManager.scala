@@ -108,21 +108,24 @@ private[spark] class ResourceProfileManager(sparkConf: SparkConf,
    * with executorRpId.
    *
    * Here are the rules:
-   * 1. When dynamic allocation is disabled, only [[TaskResourceProfile]] is supported,
-   *    and tasks with [[TaskResourceProfile]] can be scheduled to executors with default
-   *    resource profile.
-   * 2. For other scenarios(when dynamic allocation is enabled), tasks can be scheduled to
-   *    executors where resource profile exactly matches.
+   * 1. Tasks using the default resource profile can be scheduled on all executors.
+   * 2. When dynamic allocation is disabled, tasks with [[TaskResourceProfile]] can also be
+   *    scheduled to executors with the default resource profile.
+   * 3. For all other scenarios, tasks can be scheduled to executors where the resource profile
+   *    exactly matches.
    */
   private[spark] def canBeScheduled(taskRpId: Int, executorRpId: Int): Boolean = {
     assert(resourceProfileIdToResourceProfile.contains(taskRpId) &&
       resourceProfileIdToResourceProfile.contains(executorRpId),
       "Tasks and executors must have valid resource profile id")
     val taskRp = resourceProfileFromId(taskRpId)
+    val defaultRpId = ResourceProfile.DEFAULT_RESOURCE_PROFILE_ID
 
-    // When dynamic allocation disabled, tasks with TaskResourceProfile can always reuse
-    // all the executors with default resource profile.
-    taskRpId == executorRpId || (!dynamicEnabled && taskRp.isInstanceOf[TaskResourceProfile])
+    taskRpId == defaultRpId ||
+      taskRpId == executorRpId ||
+      (!dynamicEnabled &&
+        executorRpId == defaultRpId &&
+        taskRp.isInstanceOf[TaskResourceProfile])
   }
 
   def addResourceProfile(rp: ResourceProfile): Unit = {

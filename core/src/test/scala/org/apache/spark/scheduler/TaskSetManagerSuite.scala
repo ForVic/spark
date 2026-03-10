@@ -1881,7 +1881,8 @@ class TaskSetManagerSuite
     val taskResourceAssignments = Map(
       GPU -> Map("0" -> ONE_ENTIRE_RESOURCE, "1" -> ONE_ENTIRE_RESOURCE))
     val taskOption =
-      manager.resourceOffer("exec1", "host1", NO_PREF, 2, taskResourceAssignments)._1
+      manager.resourceOffer("exec1", "host1", NO_PREF,
+        taskCpus = 2, taskResourceAssignments = taskResourceAssignments)._1
     assert(taskOption.isDefined)
     val allocatedCpus = taskOption.get.cpus
     val allocatedResources = taskOption.get.resources
@@ -2813,6 +2814,36 @@ class TaskSetManagerSuite
 
     assert(taskDescOpt.isDefined)
     assert(manager.taskInfos(taskDescOpt.get.taskId).resourceProfileId === rp.id)
+  }
+
+  test("task set manager uses task resource profile mapping when scheduling") {
+    sc = new SparkContext("local", "test")
+    sched = new FakeTaskScheduler(sc, ("exec1", "host1"))
+
+    val rp = TaskSetManagerSuite.createCustomResourceProfile(sc)
+    val taskSet = new TaskSet(
+      Array.tabulate[Task[_]](3)(i => new FakeTask(stageId = 0, partitionId = i)),
+      0,
+      0,
+      0,
+      null,
+      ResourceProfile.DEFAULT_RESOURCE_PROFILE_ID,
+      None,
+      Map(1 -> rp.id))
+    val manager = new TaskSetManager(sched, taskSet, MAX_TASK_FAILURES)
+
+    val (customTaskDescOpt, _, _) =
+      manager.resourceOffer("exec1", "host1", ANY, rp.id)
+    val (defaultTaskDescOpt, _, _) =
+      manager.resourceOffer("exec1", "host1", ANY, ResourceProfile.DEFAULT_RESOURCE_PROFILE_ID)
+
+    assert(customTaskDescOpt.isDefined)
+    assert(customTaskDescOpt.get.index === 1)
+    assert(manager.taskInfos(customTaskDescOpt.get.taskId).resourceProfileId === rp.id)
+    assert(defaultTaskDescOpt.isDefined)
+    assert(Set(0, 2).contains(defaultTaskDescOpt.get.index))
+    assert(manager.taskInfos(defaultTaskDescOpt.get.taskId).resourceProfileId ===
+      ResourceProfile.DEFAULT_RESOURCE_PROFILE_ID)
   }
 
 }

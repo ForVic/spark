@@ -1753,7 +1753,8 @@ class TaskSchedulerImplSuite extends SparkFunSuite with LocalSparkContext
       new WorkerOffer("executor1", "host1", 6, None, resources, rp.id))
     taskScheduler.submitTasks(taskSet)
     taskScheduler.submitTasks(rpTaskSet)
-    // should have 2 for default profile and 2 for additional resource profile
+    // Default-profile tasks can also use the non-default executor offer, so the first scheduling
+    // round launches 3 default-profile tasks and 2 additional-resource-profile tasks.
     var taskDescriptions = taskScheduler.resourceOffers(workerOffers).flatten
     assert(5 === taskDescriptions.length)
     var has2Gpus = 0
@@ -1767,8 +1768,8 @@ class TaskSchedulerImplSuite extends SparkFunSuite with LocalSparkContext
         has1Gpu += 1
       }
     }
-    assert(has2Gpus == 3)
-    assert(has1Gpu == 2)
+    assert(has2Gpus == 2)
+    assert(has1Gpu == 3)
 
     val resources3 = Map(GPU -> ArrayBuffer("14", "15", "16", "17", "18", "19"))
 
@@ -1779,9 +1780,11 @@ class TaskSchedulerImplSuite extends SparkFunSuite with LocalSparkContext
       new WorkerOffer("executor1", "host1", 0, None, ExecutorResourcesAmounts.empty, rp.id),
       new WorkerOffer("executor2", "host2", 6, None, resources3, rp.id))
     taskDescriptions = taskScheduler.resourceOffers(workerOffers3).flatten
-    assert(2 === taskDescriptions.length)
-    assert(taskDescriptions.head.resources.contains(GPU))
-    assert(2 == taskDescriptions.head.resources(GPU).keys.size)
+    assert(3 === taskDescriptions.length)
+    taskDescriptions.foreach { taskDescription =>
+      assert(taskDescription.resources.contains(GPU))
+      assert(2 == taskDescription.resources(GPU).keys.size)
+    }
   }
 
   test("Scheduler works with task resource profiles") {
@@ -2675,6 +2678,36 @@ class TaskSchedulerImplSuite extends SparkFunSuite with LocalSparkContext
     assert(manager.tasksForResourceProfile(ResourceProfile.DEFAULT_RESOURCE_PROFILE_ID) ===
       Set(0, 2))
     assert(manager.tasksForResourceProfile(rp.id) === Set(1))
+  }
+
+  test("use task to resource profile mapping when scheduling tasks") {
+    val taskScheduler = setupSchedulerWithMaster("local[2]")
+    val execReqs = new ExecutorResourceRequests().cores(2).resource("gpu", 2)
+    val taskReqs = new TaskResourceRequests().cpus(1).resource("gpu", 1)
+    val rp = new ResourceProfile(execReqs.requests, taskReqs.requests)
+    taskScheduler.sc.resourceProfileManager.addResourceProfile(rp)
+
+    val tasks = Array.tabulate[Task[_]](2)(i => new FakeTask(stageId = 0, partitionId = i))
+    val taskSet = new TaskSet(
+      tasks,
+      0,
+      0,
+      0,
+      null,
+      ResourceProfile.DEFAULT_RESOURCE_PROFILE_ID,
+      None,
+      Map(1 -> rp.id))
+    val workerOffers = IndexedSeq(
+      new WorkerOffer("executor0", "host0", 2, Some("192.168.0.101:49625"),
+        Map("gpu" -> Seq("0", "1").toBuffer), rp.id))
+
+    taskScheduler.submitTasks(taskSet)
+    val taskDescriptions = taskScheduler.resourceOffers(workerOffers).flatten
+
+    assert(taskDescriptions.length === 1)
+    assert(taskDescriptions.head.index === 1)
+    val manager = taskScheduler.taskSetManagerForAttempt(0, 0).get
+    assert(manager.taskInfos(taskDescriptions.head.taskId).resourceProfileId === rp.id)
   }
 
   // 1 executor with 4 GPUS
