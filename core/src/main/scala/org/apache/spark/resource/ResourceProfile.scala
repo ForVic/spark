@@ -469,6 +469,35 @@ object ResourceProfile extends Logging {
     rp.getTaskCpus.getOrElse(conf.get(CPUS_PER_TASK))
   }
 
+  private[spark] def updateResourceProfile(
+      rp: ResourceProfile,
+      memoryOpt: Option[String] = None,
+      memoryOverheadOpt: Option[String] = None,
+      coresOpt: Option[Int] = None,
+      cpusOpt: Option[Double] = None): ResourceProfile = {
+    val updatedExecutorResources = new mutable.HashMap[String, ExecutorResourceRequest]
+    updatedExecutorResources ++= rp.executorResources
+    val updatedTaskResources = new mutable.HashMap[String, TaskResourceRequest]
+    updatedTaskResources ++= rp.taskResources
+
+    memoryOpt.foreach { memory =>
+      updatedExecutorResources(MEMORY) =
+        new ExecutorResourceRequest(MEMORY, Utils.byteStringAsMb(memory))
+    }
+    memoryOverheadOpt.foreach { memoryOverhead =>
+      updatedExecutorResources(OVERHEAD_MEM) =
+        new ExecutorResourceRequest(OVERHEAD_MEM, Utils.byteStringAsMb(memoryOverhead))
+    }
+    coresOpt.foreach { cores =>
+      updatedExecutorResources(CORES) = new ExecutorResourceRequest(CORES, cores)
+    }
+    cpusOpt.foreach { cpus =>
+      updatedTaskResources(CPUS) = new TaskResourceRequest(CPUS, cpus)
+    }
+
+    new ResourceProfile(updatedExecutorResources.toMap, updatedTaskResources.toMap)
+  }
+
   /**
    * Get offHeap memory size from [[ExecutorResourceRequest]]
    * return 0 if MEMORY_OFFHEAP_ENABLED is false.

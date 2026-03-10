@@ -681,11 +681,13 @@ class SparkContext(config: SparkConf) extends Logging {
     _cleaner.foreach(_.start())
 
     val dynamicAllocationEnabled = Utils.isDynamicAllocationEnabled(_conf)
+    val executorAutoscalingEnabled =
+      Utils.isExecutorAutScalingEnabled(_conf, resourceProfileManager)
     _executorAllocationManager =
       if (dynamicAllocationEnabled) {
         schedulerBackend match {
           case b: ExecutorAllocationClient =>
-            if (Utils.isExecutorAutScalingEnabled(_conf)) {
+            if (executorAutoscalingEnabled) {
               Some(new ExecutorAllocationManagerWithDrp(
                 schedulerBackend.asInstanceOf[ExecutorAllocationClient], listenerBus, _conf,
                 cleaner = cleaner, resourceProfileManager = resourceProfileManager,
@@ -2948,8 +2950,11 @@ class SparkContext(config: SparkConf) extends Logging {
   }
 
   private def setupAutoScaler(): Unit = {
+    val executorAutoscalingEnabled =
+      Utils.isExecutorAutScalingEnabled(_conf, _resourceProfileManager)
     _executorAutoScaleManager =
-      if (Utils.isExecutorAutScalingEnabled(_conf)) {
+      if (executorAutoscalingEnabled) {
+        logInfo("Executor autoscaling is enabled.")
         Some(new ExecutorAutoScaleManager(
           listenerBus, _conf, _dagScheduler, _resourceProfileManager))
       } else {

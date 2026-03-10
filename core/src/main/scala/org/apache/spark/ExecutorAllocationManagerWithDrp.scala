@@ -685,10 +685,6 @@ private[spark] class ExecutorAllocationManagerWithDrp(
     if (rpId == defaultProfileId) minNumExecutors else minNumExecutorsNonDefaultRp
   }
 
-  private case class StageAttempt(stageId: Int, stageAttemptId: Int) {
-    override def toString: String = s"Stage $stageId (Attempt $stageAttemptId)"
-  }
-
   /**
    * A listener that notifies the given allocation manager of when to add and remove executors.
    *
@@ -1028,4 +1024,8 @@ private object ExecutorAllocationManagerWithDrp {
   val NOT_SET = Long.MaxValue
 
   private[spark] case class TargetNumUpdates(delta: Int, oldNumExecutorsTarget: Int)
+
+  private[spark] case class StageAttempt(stageId: Int, stageAttemptId: Int) {
+    override def toString: String = s"Stage $stageId (Attempt $stageAttemptId)"
+  }
 }

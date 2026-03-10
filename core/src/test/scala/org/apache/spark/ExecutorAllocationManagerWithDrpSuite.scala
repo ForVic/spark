@@ -154,6 +154,7 @@ class ExecutorAllocationManagerWithDrpSuite extends SparkFunSuite {
       .set(config.DYN_ALLOCATION_SUSTAINED_SCHEDULER_BACKLOG_TIMEOUT.key,
         s"${sustainedSchedulerBacklogTimeout.toString}s")
       .set(config.DYN_ALLOCATION_EXECUTOR_IDLE_TIMEOUT.key, s"${executorIdleTimeout.toString}s")
+      .set(config.EXECUTOR_CORES, 1)
       .set(config.SHUFFLE_SERVICE_ENABLED, true)
       .set(config.DYN_ALLOCATION_TESTING, true)
       .set(TEST_DYNAMIC_ALLOCATION_SCHEDULE_ENABLED, false)

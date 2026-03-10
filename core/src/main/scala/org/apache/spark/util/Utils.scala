@@ -76,6 +76,7 @@ import org.apache.spark.internal.config.UI._
 import org.apache.spark.internal.config.Worker._
 import org.apache.spark.launcher.SparkLauncher
 import org.apache.spark.network.util.JavaUtils
+import org.apache.spark.resource.ResourceProfileManager
 import org.apache.spark.serializer.{DeserializationStream, SerializationStream, Serializer, SerializerInstance}
 import org.apache.spark.status.api.v1.{StackTrace, ThreadStackTrace}
 import org.apache.spark.util.ArrayImplicits._
@@ -2634,13 +2635,18 @@ private[spark] object Utils
   /**
    * Return whether executor autoscaling is enabled in the given conf.
    */
-  def isExecutorAutScalingEnabled(conf: ReadOnlySparkConf): Boolean = {
+  def isExecutorAutScalingEnabled(
+      conf: ReadOnlySparkConf,
+      resourceProfileManager: ResourceProfileManager): Boolean = {
     val autoscalingEnabled = conf.get(EXECUTOR_AUTOSCALING_ENABLED)
     val noPySparkExecutorMemory = conf.get(PYSPARK_EXECUTOR_MEMORY).isEmpty
     val memoryOffHeapEnabled = conf.get(MEMORY_OFFHEAP_ENABLED)
     val dynamicAllocationEnabled = isDynamicAllocationEnabled(conf)
+    val defaultCoresKnown =
+      resourceProfileManager.defaultResourceProfile.getExecutorCores.isDefined
 
-    autoscalingEnabled && noPySparkExecutorMemory && !memoryOffHeapEnabled && dynamicAllocationEnabled
+    autoscalingEnabled && noPySparkExecutorMemory && !memoryOffHeapEnabled &&
+      dynamicAllocationEnabled && defaultCoresKnown
   }
 
   /**
