@@ -99,7 +99,7 @@ import org.apache.spark.util.{Clock, SystemClock, ThreadUtils, Utils}
  *     the executor will be removed
  *
  */
-private[spark] class ExecutorAllocationManager(
+private[spark] class ExecutorAllocationManagerWithDrp(
     client: ExecutorAllocationClient,
     listenerBus: LiveListenerBus,
     conf: SparkConf,
@@ -111,7 +111,7 @@ private[spark] class ExecutorAllocationManager(
 
   allocationManager =>
 
-  import ExecutorAllocationManager._
+  import ExecutorAllocationManagerWithDrp._
 
   // Lower and upper bounds on the number of executors.
   private val minNumExecutors = conf.get(DYN_ALLOCATION_MIN_EXECUTORS)
@@ -377,7 +377,7 @@ private[spark] class ExecutorAllocationManager(
       // Otherwise the first job may have to ramp up unnecessarily
       0
     } else {
-      val updatesNeeded = new mutable.HashMap[Int, ExecutorAllocationManager.TargetNumUpdates]
+      val updatesNeeded = new mutable.HashMap[Int, ExecutorAllocationManagerWithDrp.TargetNumUpdates]
 
       // Update targets for all ResourceProfiles then do a single request to the cluster manager
       numExecutorsTargetPerResourceProfileId.foreach { case (rpId, targetExecs) =>
@@ -403,14 +403,14 @@ private[spark] class ExecutorAllocationManager(
   private def addExecutorsToTarget(
       maxNeeded: Int,
       rpId: Int,
-      updatesNeeded: mutable.HashMap[Int, ExecutorAllocationManager.TargetNumUpdates]): Int = {
+      updatesNeeded: mutable.HashMap[Int, ExecutorAllocationManagerWithDrp.TargetNumUpdates]): Int = {
     updateTargetExecs(addExecutors, maxNeeded, rpId, updatesNeeded)
   }
 
   private def decrementExecutorsFromTarget(
       maxNeeded: Int,
       rpId: Int,
-      updatesNeeded: mutable.HashMap[Int, ExecutorAllocationManager.TargetNumUpdates]): Int = {
+      updatesNeeded: mutable.HashMap[Int, ExecutorAllocationManagerWithDrp.TargetNumUpdates]): Int = {
     updateTargetExecs(decrementExecutors, maxNeeded, rpId, updatesNeeded)
   }
 
@@ -418,18 +418,19 @@ private[spark] class ExecutorAllocationManager(
       updateTargetFn: (Int, Int) => Int,
       maxNeeded: Int,
       rpId: Int,
-      updatesNeeded: mutable.HashMap[Int, ExecutorAllocationManager.TargetNumUpdates]): Int = {
+      updatesNeeded: mutable.HashMap[Int, ExecutorAllocationManagerWithDrp.TargetNumUpdates]): Int = {
     val oldNumExecutorsTarget = numExecutorsTargetPerResourceProfileId(rpId)
     // update the target number (add or remove)
     val delta = updateTargetFn(maxNeeded, rpId)
     if (delta != 0) {
-      updatesNeeded(rpId) = ExecutorAllocationManager.TargetNumUpdates(delta, oldNumExecutorsTarget)
+      updatesNeeded(rpId) =
+        ExecutorAllocationManagerWithDrp.TargetNumUpdates(delta, oldNumExecutorsTarget)
     }
     delta
   }
 
   private def doUpdateRequest(
-      updates: Map[Int, ExecutorAllocationManager.TargetNumUpdates],
+      updates: Map[Int, ExecutorAllocationManagerWithDrp.TargetNumUpdates],
       now: Long): Int = {
     // Only call cluster manager if target has changed.
     if (updates.size > 0) {
@@ -985,49 +986,8 @@ private[spark] class ExecutorAllocationManager(
   }
 }
 
-/**
- * Metric source for ExecutorAllocationManager to expose its internal executor allocation
- * status to MetricsSystem.
- * Note: These metrics heavily rely on the internal implementation of
- * ExecutorAllocationManager, metrics or value of metrics will be changed when internal
- * implementation is changed, so these metrics are not stable across Spark version.
- */
-private[spark] class ExecutorAllocationManagerSource(
-    executorMonitor: ExecutorMonitor,
-    numExecutorsToAdd: => Int,
-    numTargetExecutors: => Int,
-    numMaxNeededExecutors: => Int) extends Source with ExecutorAllocationManagerSourceShared {
-  val sourceName = "ExecutorAllocationManager"
-  val metricRegistry = new MetricRegistry()
-
-  private def registerGauge[T](name: String, value: => T, defaultValue: T): Unit = {
-    metricRegistry.register(MetricRegistry.name("executors", name), new Gauge[T] {
-      override def getValue: T = synchronized { Option(value).getOrElse(defaultValue) }
-    })
-  }
-
-  private def getCounter(name: String): Counter = {
-    metricRegistry.counter(MetricRegistry.name("executors", name))
-  }
-
-  val gracefullyDecommissioned: Counter = getCounter("numberExecutorsGracefullyDecommissioned")
-  val decommissionUnfinished: Counter = getCounter("numberExecutorsDecommissionUnfinished")
-  val driverKilled: Counter = getCounter("numberExecutorsKilledByDriver")
-  val exitedUnexpectedly: Counter = getCounter("numberExecutorsExitedUnexpectedly")
-
-  // The metrics are going to return the sum for all the different ResourceProfiles.
-  registerGauge("numberExecutorsToAdd", numExecutorsToAdd, 0)
-  registerGauge("numberExecutorsPendingToRemove", executorMonitor.pendingRemovalCount, 0)
-  registerGauge("numberAllExecutors", executorMonitor.executorCount, 0)
-  registerGauge("numberTargetExecutors", numTargetExecutors, 0)
-  registerGauge("numberMaxNeededExecutors", numMaxNeededExecutors, 0)
-  registerGauge("numberDecommissioningExecutors", executorMonitor.decommissioningCount, 0)
-}
-
-private object ExecutorAllocationManager {
+private object ExecutorAllocationManagerWithDrp {
   val NOT_SET = Long.MaxValue
 
-  // helper case class for requesting executors, here to be visible for testing
   private[spark] case class TargetNumUpdates(delta: Int, oldNumExecutorsTarget: Int)
-
 }

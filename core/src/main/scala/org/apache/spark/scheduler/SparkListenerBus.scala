@@ -97,6 +97,8 @@ private[spark] trait SparkListenerBus
         listener.onUnschedulableTaskSetRemoved(unschedulableTaskSetRemoved)
       case resourceProfileAdded: SparkListenerResourceProfileAdded =>
         listener.onResourceProfileAdded(resourceProfileAdded)
+      case stageResourceProfileUpdated: SparkListenerStageResourceProfileUpdated =>
+        listener.onStageResourceProfileUpdated(stageResourceProfileUpdated)
       case _ => listener.onOtherEvent(event)
     }
   }

@@ -912,6 +912,12 @@ package object config {
     .intConf
     .createOptional
 
+  private[spark] val EXECUTOR_AUTOSCALING_ENABLED =
+    ConfigBuilder("spark.executor.autoscaling.enabled")
+      .version("3.5.8")
+      .booleanConf
+      .createWithDefault(false)
+
   private[spark] val PY_FILES = ConfigBuilder("spark.yarn.dist.pyFiles")
     .internal()
     .version("2.2.1")

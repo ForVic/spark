@@ -1113,6 +1113,27 @@ private[spark] class DAGScheduler(
   }
 
   /**
+   * Update the resource profile assignments for a stage attempt.
+   *
+   * This is the entrypoint into the Spark scheduler for updating the stage-level resource profile
+   * and/or per-partition resource profile assignments for a given stage attempt. All referenced
+   * resource profile ids are expected to already exist in the ResourceProfileManager. The
+   * partition-to-resource-profile mapping is incremental, so existing assignments that are not
+   * being changed do not need to be included.
+   */
+  def updateStageResourceProfile(
+      stageId: Int,
+      stageAttemptId: Int,
+      stageRpId: Option[Int] = None,
+      partitionToRpId: Map[Int, Int]): Unit = {
+    logInfo(log"Asked to update resource profile for stage ${MDC(STAGE_ID, stageId)} " +
+      log"attempt ${MDC(STAGE_ATTEMPT_ID, stageAttemptId)} with stage resource profile id " +
+      log"${MDC(RESOURCE_PROFILE_ID, stageRpId.getOrElse(-1))} and " +
+      log"${MDC(NUM_PARTITIONS, partitionToRpId.size)} partition updates")
+    throw new UnsupportedOperationException("Updating stage resource profiles is not supported")
+  }
+
+  /**
    * Cancel a job that is running or waiting in the queue.
    */
   def cancelJob(jobId: Int, reason: Option[String]): Unit = {

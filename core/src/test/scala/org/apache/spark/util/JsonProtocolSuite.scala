@@ -168,6 +168,8 @@ class JsonProtocolSuite extends SparkFunSuite {
     val resourceProfile = rprofBuilder.build()
     resourceProfile.setResourceProfileId(21)
     val resourceProfileAdded = SparkListenerResourceProfileAdded(resourceProfile)
+    val stageResourceProfileUpdated =
+      SparkListenerStageResourceProfileUpdated(1, 2, "running", 21, Map(0 -> 21, 3 -> 22))
     testEvent(stageSubmitted, stageSubmittedJsonString)
     testEvent(stageSubmittedWithNullProperties, stageSubmittedWithNullPropertiesJsonString)
     testEvent(stageCompleted, stageCompletedJsonString)
@@ -201,6 +203,7 @@ class JsonProtocolSuite extends SparkFunSuite {
     testEvent(blockUpdated, blockUpdatedJsonString)
     testEvent(stageExecutorMetrics, stageExecutorMetricsJsonString)
     testEvent(resourceProfileAdded, resourceProfileJsonString)
+    testEvent(stageResourceProfileUpdated, stageResourceProfileUpdatedJsonString)
   }
 
   test("Dependent Classes") {
@@ -3196,6 +3199,21 @@ private[spark] object JsonProtocolSuite extends Assertions {
       |      "Resource Name":"fgpa",
       |      "Amount":0.5
       |    }
+      |  }
+      |}
+    """.stripMargin
+
+  private val stageResourceProfileUpdatedJsonString =
+    """
+      |{
+      |  "Event":"SparkListenerStageResourceProfileUpdated",
+      |  "Stage ID":1,
+      |  "Stage Attempt ID":2,
+      |  "Stage State":"running",
+      |  "Stage Resource Profile Id":21,
+      |  "Task Index to Resource Profile Id Map":{
+      |    "0":21,
+      |    "3":22
       |  }
       |}
     """.stripMargin

@@ -71,6 +71,7 @@ import org.apache.spark.storage._
 import org.apache.spark.storage.BlockManagerMessages.{TriggerHeapHistogram, TriggerThreadDump}
 import org.apache.spark.ui.{ConsoleProgressBar, SparkUI}
 import org.apache.spark.util._
+import org.apache.spark.scheduler.autoscale.ExecutorAutoScaleManager
 import org.apache.spark.util.ArrayImplicits._
 import org.apache.spark.util.logging.DriverLogger
 
@@ -231,7 +232,8 @@ class SparkContext(config: SparkConf) extends Logging {
   private var _applicationAttemptId: Option[String] = None
   private var _eventLogger: Option[EventLoggingListener] = None
   private var _driverLogger: Option[DriverLogger] = None
-  private var _executorAllocationManager: Option[ExecutorAllocationManager] = None
+  private var _executorAllocationManager: Option[ExecutorAllocationManagerShared] = None
+  private var _executorAutoScaleManager: Option[ExecutorAutoScaleManager] = None
   private var _cleaner: Option[ContextCleaner] = None
   private var _listenerBusStarted: Boolean = false
   private var _jars: Seq[String] = _
@@ -365,8 +367,11 @@ class SparkContext(config: SparkConf) extends Logging {
 
   private[spark] def eventLogger: Option[EventLoggingListener] = _eventLogger
 
-  private[spark] def executorAllocationManager: Option[ExecutorAllocationManager] =
+  private[spark] def executorAllocationManager: Option[ExecutorAllocationManagerShared] =
     _executorAllocationManager
+
+  private[spark] def executorAutoScaleManager: Option[ExecutorAutoScaleManager] =
+    _executorAutoScaleManager
 
   private[spark] def resourceProfileManager: ResourceProfileManager = _resourceProfileManager
 
@@ -680,10 +685,17 @@ class SparkContext(config: SparkConf) extends Logging {
       if (dynamicAllocationEnabled) {
         schedulerBackend match {
           case b: ExecutorAllocationClient =>
-            Some(new ExecutorAllocationManager(
-              schedulerBackend.asInstanceOf[ExecutorAllocationClient], listenerBus, _conf,
-              cleaner = cleaner, resourceProfileManager = resourceProfileManager,
-              reliableShuffleStorage = _shuffleDriverComponents.supportsReliableStorage()))
+            if (Utils.isExecutorAutScalingEnabled(_conf)) {
+              Some(new ExecutorAllocationManagerWithDrp(
+                schedulerBackend.asInstanceOf[ExecutorAllocationClient], listenerBus, _conf,
+                cleaner = cleaner, resourceProfileManager = resourceProfileManager,
+                reliableShuffleStorage = _shuffleDriverComponents.supportsReliableStorage()))
+            } else {
+              Some(new ExecutorAllocationManager(
+                schedulerBackend.asInstanceOf[ExecutorAllocationClient], listenerBus, _conf,
+                cleaner = cleaner, resourceProfileManager = resourceProfileManager,
+                reliableShuffleStorage = _shuffleDriverComponents.supportsReliableStorage()))
+            }
           case _ =>
             None
         }
@@ -691,6 +703,7 @@ class SparkContext(config: SparkConf) extends Logging {
         None
       }
     _executorAllocationManager.foreach(_.start())
+    setupAutoScaler()
 
     setupAndStartListenerBus()
     postEnvironmentUpdate()
@@ -2352,6 +2365,9 @@ class SparkContext(config: SparkConf) extends Logging {
     Utils.tryLogNonFatalError {
       _executorAllocationManager.foreach(_.stop())
     }
+    Utils.tryLogNonFatalError {
+      _executorAutoScaleManager.foreach(_.stop())
+    }
     if (_dagScheduler != null) {
       Utils.tryLogNonFatalError {
         _dagScheduler.stop(exitCode)
@@ -2929,6 +2945,18 @@ class SparkContext(config: SparkConf) extends Logging {
 
     listenerBus.start(this, _env.metricsSystem)
     _listenerBusStarted = true
+  }
+
+  private def setupAutoScaler(): Unit = {
+    _executorAutoScaleManager =
+      if (Utils.isExecutorAutScalingEnabled(_conf)) {
+        Some(new ExecutorAutoScaleManager(
+          listenerBus, _conf, _dagScheduler, _resourceProfileManager))
+      } else {
+        None
+      }
+
+    _executorAutoScaleManager.foreach(_.start())
   }
 
   /** Post the application start event */
