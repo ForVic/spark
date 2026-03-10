@@ -134,3 +134,10 @@ private[scheduler] case class ShuffleMergeFinalized(stage: ShuffleMapStage)
 private[scheduler] case class ShufflePushCompleted(
     shuffleId: Int, shuffleMergeId: Int, mapIndex: Int)
   extends DAGSchedulerEvent
+
+private[scheduler] case class UpdateStageResourceProfile(
+    stageId: Int,
+    stageAttemptId: Int,
+    stageRpId: Option[Int],
+    partitionToRpId: scala.collection.Map[Int, Int])
+  extends DAGSchedulerEvent

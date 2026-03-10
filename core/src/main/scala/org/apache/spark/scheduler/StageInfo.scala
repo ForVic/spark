@@ -128,7 +128,8 @@ private[spark] object StageInfo {
       numTasks: Option[Int] = None,
       taskMetrics: TaskMetrics = null,
       taskLocalityPreferences: Seq[Seq[TaskLocation]] = Seq.empty,
-      resourceProfileId: Int
+      resourceProfileId: Int,
+      stageAttemptPartitions: Option[Seq[Int]] = None
     ): StageInfo = {
     val ancestorRddInfos = stage.rdd.getNarrowAncestors.map(RDDInfo.fromRdd)
     val rddInfos = Seq(RDDInfo.fromRdd(stage.rdd)) ++ ancestorRddInfos
@@ -136,6 +137,15 @@ private[spark] object StageInfo {
       case sms: ShuffleMapStage => Option(sms.shuffleDep).map(_.shuffleId)
       case _ => None
     }
+    val partitionToRpId = stage.getPartitionIdToResourceProfileId
+    val partitionToRpIdAndTaskIndex = stageAttemptPartitions
+      .getOrElse(0 until numTasks.getOrElse(stage.numTasks))
+      .zipWithIndex
+      .collect {
+        case (partitionId, taskIndex) if partitionToRpId.contains(partitionId) =>
+          partitionId -> (partitionToRpId(partitionId), taskIndex)
+      }
+      .toMap
     new StageInfo(
       stage.id,
       attemptId,
@@ -149,6 +159,7 @@ private[spark] object StageInfo {
       shuffleDepId,
       resourceProfileId,
       false,
-      0)
+      0,
+      partitionToRpIdAndTaskIndex)
   }
 }

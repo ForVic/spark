@@ -70,11 +70,12 @@ private[spark] trait TaskScheduler {
   // and they can skip running tasks for it.
   def notifyPartitionCompletion(stageId: Int, partitionId: Int): Unit
 
+  // Returns the updated default resource profile id and task index to non-default RP mapping.
   def updateStageResourceProfile(
       stageId: Int,
       stageAttemptId: Int,
       stageRpId: Option[Int],
-      partitionToRpId: scala.collection.Map[Int, Int]): Unit
+      partitionToRpId: scala.collection.Map[Int, Int]): (Int, scala.collection.Map[Int, Int])
 
   // Set the DAG scheduler for upcalls. This is guaranteed to be set before submitTasks is called.
   def setDAGScheduler(dagScheduler: DAGScheduler): Unit

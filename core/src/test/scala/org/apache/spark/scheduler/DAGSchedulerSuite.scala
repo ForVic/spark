@@ -205,6 +205,8 @@ class DAGSchedulerSuite extends SparkFunSuite with TempLocalSparkContext with Ti
 
   val taskScheduler = new TaskScheduler() {
     val executorsPendingDecommission = new HashMap[String, ExecutorDecommissionState]
+    val updatedStageResourceProfiles =
+      new ArrayBuffer[(Int, Int, Option[Int], scala.collection.Map[Int, Int])]()
     override def schedulingMode: SchedulingMode = SchedulingMode.FIFO
     override def rootPool: Pool = new Pool("", schedulingMode, 0, 0)
     override def start() = {}
@@ -238,7 +240,10 @@ class DAGSchedulerSuite extends SparkFunSuite with TempLocalSparkContext with Ti
         stageId: Int,
         stageAttemptId: Int,
         stageRpId: Option[Int],
-        partitionToRpId: scala.collection.Map[Int, Int]): Unit = {}
+        partitionToRpId: scala.collection.Map[Int, Int]): (Int, scala.collection.Map[Int, Int]) = {
+      updatedStageResourceProfiles += ((stageId, stageAttemptId, stageRpId, partitionToRpId))
+      (stageRpId.getOrElse(ResourceProfile.DEFAULT_RESOURCE_PROFILE_ID), partitionToRpId)
+    }
     override def setDAGScheduler(dagScheduler: DAGScheduler) = {}
     override def defaultParallelism() = 2
     override def executorLost(executorId: String, reason: ExecutorLossReason): Unit = {}
@@ -441,6 +446,7 @@ class DAGSchedulerSuite extends SparkFunSuite with TempLocalSparkContext with Ti
     failure = null
     sc.addSparkListener(sparkListener)
     taskSets.clear()
+    taskScheduler.updatedStageResourceProfiles.clear()
     tasksMarkedAsCompleted.clear()
     cancelledStages.clear()
     cacheLocations.clear()
@@ -964,7 +970,8 @@ class DAGSchedulerSuite extends SparkFunSuite with TempLocalSparkContext with Ti
           stageId: Int,
           stageAttemptId: Int,
           stageRpId: Option[Int],
-          partitionToRpId: scala.collection.Map[Int, Int]): Unit = {}
+          partitionToRpId: scala.collection.Map[Int, Int]): (Int, scala.collection.Map[Int, Int]) =
+        (stageRpId.getOrElse(ResourceProfile.DEFAULT_RESOURCE_PROFILE_ID), partitionToRpId)
       override def setDAGScheduler(dagScheduler: DAGScheduler): Unit = {}
       override def defaultParallelism(): Int = 2
       override def executorHeartbeatReceived(
@@ -1013,6 +1020,58 @@ class DAGSchedulerSuite extends SparkFunSuite with TempLocalSparkContext with Ti
       HashSet(makeBlockManagerId("hostA"), makeBlockManagerId("hostB")))
     completeAndCheckAnswer(taskSets(1), Seq((Success, 42)), Map(0 -> 42))
     assertDataStructuresEmpty()
+  }
+
+  test("update stage resource profile updates running stage and posts listener event") {
+    val ereqs = new ExecutorResourceRequests().cores(4).resource(GPU, 1)
+    val treqs = new TaskResourceRequests().cpus(1).resource(GPU, 1)
+    val rp = new ResourceProfileBuilder().require(ereqs).require(treqs).build()
+    sc.resourceProfileManager.addResourceProfile(rp)
+
+    @volatile var stageUpdate: SparkListenerStageResourceProfileUpdated = null
+    sc.listenerBus.addToSharedQueue(new SparkListener {
+      override def onStageResourceProfileUpdated(
+          event: SparkListenerStageResourceProfileUpdated): Unit = {
+        stageUpdate = event
+      }
+    })
+
+    submit(new MyRDD(sc, 2, Nil), Array(0, 1))
+    val stageId = taskSets.head.stageId
+    val stageAttemptId = taskSets.head.stageAttemptId
+
+    scheduler.updateStageResourceProfile(stageId, stageAttemptId, None, Map(1 -> rp.id))
+    dagEventProcessLoopTester.runEvents()
+    sc.listenerBus.waitUntilEmpty()
+
+    assert(taskScheduler.updatedStageResourceProfiles ===
+      Seq((stageId, stageAttemptId, None, Map(1 -> rp.id))))
+    assert(scheduler.stageIdToStage(stageId).getPartitionIdToResourceProfileId === Map(1 -> rp.id))
+    assert(stageUpdate != null)
+    assert(stageUpdate.stageId === stageId)
+    assert(stageUpdate.stageAttemptId === stageAttemptId)
+    assert(stageUpdate.stageState === "running")
+    assert(stageUpdate.stageResourceProfileId === ResourceProfile.DEFAULT_RESOURCE_PROFILE_ID)
+    assert(stageUpdate.taskIndexToResourceProfileId === Map(1 -> rp.id))
+  }
+
+  test("update stage resource profile ignores inactive stage attempts") {
+    val ereqs = new ExecutorResourceRequests().cores(4).resource(GPU, 1)
+    val treqs = new TaskResourceRequests().cpus(1).resource(GPU, 1)
+    val rp = new ResourceProfileBuilder().require(ereqs).require(treqs).build()
+    sc.resourceProfileManager.addResourceProfile(rp)
+
+    submit(new MyRDD(sc, 2, Nil), Array(0, 1))
+    val stageId = taskSets.head.stageId
+    val stageAttemptId = taskSets.head.stageAttemptId
+    completeAndCheckAnswer(taskSets.head, Seq((Success, 42), (Success, 43)), Map(0 -> 42, 1 -> 43))
+
+    scheduler.updateStageResourceProfile(stageId, stageAttemptId, None, Map(1 -> rp.id))
+    dagEventProcessLoopTester.runEvents()
+
+    assert(taskScheduler.updatedStageResourceProfiles.isEmpty)
+    assert(!scheduler.stageIdToStage.contains(stageId) ||
+      scheduler.stageIdToStage(stageId).getPartitionIdToResourceProfileId.isEmpty)
   }
 
   test("run trivial shuffle with fetch failure") {

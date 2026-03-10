@@ -1125,12 +1125,13 @@ private[spark] class DAGScheduler(
       stageId: Int,
       stageAttemptId: Int,
       stageRpId: Option[Int] = None,
-      partitionToRpId: Map[Int, Int]): Unit = {
+      partitionToRpId: scala.collection.Map[Int, Int]): Unit = {
     logInfo(log"Asked to update resource profile for stage ${MDC(STAGE_ID, stageId)} " +
       log"attempt ${MDC(STAGE_ATTEMPT_ID, stageAttemptId)} with stage resource profile id " +
       log"${MDC(RESOURCE_PROFILE_ID, stageRpId.getOrElse(-1))} and " +
       log"${MDC(NUM_PARTITIONS, partitionToRpId.size)} partition updates")
-    taskScheduler.updateStageResourceProfile(stageId, stageAttemptId, stageRpId, partitionToRpId)
+    eventProcessLoop.post(
+      UpdateStageResourceProfile(stageId, stageAttemptId, stageRpId, partitionToRpId))
   }
 
   /**
@@ -1330,6 +1331,45 @@ private[spark] class DAGScheduler(
       stageId: Int,
       stageAttemptId: Int): Unit = {
     listenerBus.post(SparkListenerUnschedulableTaskSetRemoved(stageId, stageAttemptId))
+  }
+
+  private[scheduler] def validateAndUpdateStageResourceProfile(
+      stage: Stage,
+      stageRpId: Option[Int],
+      partitionToRpId: scala.collection.Map[Int, Int]): Unit = {
+    stage.updateResourceProfile(stageRpId, partitionToRpId)
+    val updateResult = taskScheduler.updateStageResourceProfile(
+      stage.id,
+      stage.latestInfo.attemptNumber(),
+      stageRpId,
+      partitionToRpId)
+
+    listenerBus.post(SparkListenerStageResourceProfileUpdated(
+      stage.id,
+      stage.latestInfo.attemptNumber(),
+      stage.latestInfo.getStatusString,
+      updateResult._1,
+      updateResult._2))
+  }
+
+  private[scheduler] def handleUpdateStageResourceProfile(
+      stageId: Int,
+      stageAttemptId: Int,
+      stageRpId: Option[Int],
+      partitionToRpId: scala.collection.Map[Int, Int]): Unit = {
+    stageIdToStage.get(stageId).filter { stage =>
+      if (stage.latestInfo.attemptNumber() == stageAttemptId &&
+          stage.latestInfo.completionTime.isEmpty) {
+        true
+      } else {
+        logInfo(log"Ignoring resource profile update for stage " +
+          log"${MDC(STAGE_ID, stageId)}.${MDC(STAGE_ATTEMPT_ID, stageAttemptId)} because " +
+          log"it is inactive or unknown")
+        false
+      }
+    }.foreach { stage =>
+      validateAndUpdateStageResourceProfile(stage, stageRpId, partitionToRpId)
+    }
   }
 
   private[scheduler] def handleStageFailed(
@@ -1678,6 +1718,19 @@ private[spark] class DAGScheduler(
         outputCommitCoordinator.stageStart(
           stage = s.id, maxPartitionId = s.rdd.partitions.length - 1)
     }
+    val stagePartitions = stage match {
+      case _: ShuffleMapStage =>
+        partitionsToCompute.map { id =>
+          val part = stage.rdd.partitions(id)
+          part.index
+        }
+      case s: ResultStage =>
+        partitionsToCompute.map { id =>
+          val p = s.partitions(id)
+          val part = stage.rdd.partitions(p)
+          part.index
+        }
+    }
     val taskIdToLocations: Map[Int, Seq[TaskLocation]] = try {
       stage match {
         case s: ShuffleMapStage =>
@@ -1690,7 +1743,9 @@ private[spark] class DAGScheduler(
       }
     } catch {
       case NonFatal(e) =>
-        stage.makeNewStageAttempt(partitionsToCompute.size)
+        stage.makeNewStageAttempt(
+          partitionsToCompute.size,
+          stageAttemptPartitions = Some(stagePartitions))
         listenerBus.post(SparkListenerStageSubmitted(stage.latestInfo,
           Utils.cloneProperties(properties)))
         abortStage(stage, s"Task creation failed: $e\n${Utils.exceptionString(e)}", Some(e))
@@ -1698,7 +1753,10 @@ private[spark] class DAGScheduler(
         return
     }
 
-    stage.makeNewStageAttempt(partitionsToCompute.size, taskIdToLocations.values.toSeq)
+    stage.makeNewStageAttempt(
+      partitionsToCompute.size,
+      taskIdToLocations.values.toSeq,
+      Some(stagePartitions))
 
     // If there are tasks to execute, record the submission time of the stage. Otherwise,
     // post the event without the submission time, which indicates that this stage was
@@ -1800,10 +1858,17 @@ private[spark] class DAGScheduler(
         case s: ShuffleMapStage => Some(s.shuffleDep.shuffleId)
         case _: ResultStage => None
       }
+      assert(tasks.zipWithIndex.forall { case (task, idx) => task.partitionId == stagePartitions(idx) },
+        s"task set partition mapping is inconsistent, task set partitions: " +
+          s"${tasks.map(_.partitionId)}, stage partitions: $stagePartitions")
 
       taskScheduler.submitTasks(new TaskSet(
         tasks.toArray, stage.id, stage.latestInfo.attemptNumber(), jobId, properties,
-        stage.resourceProfileId, shuffleId))
+        stage.resourceProfileId,
+        shuffleId,
+        stage.getPartitionIdToResourceProfileId.filter { case (partitionId, _) =>
+          stagePartitions.contains(partitionId)
+        }))
     } else {
       // Because we posted SparkListenerStageSubmitted earlier, we should mark
       // the stage as completed here in case there are no tasks to run
@@ -3607,6 +3672,13 @@ private[scheduler] class DAGSchedulerEventProcessLoop(dagScheduler: DAGScheduler
 
     case ShufflePushCompleted(shuffleId, shuffleMergeId, mapIndex) =>
       dagScheduler.handleShufflePushCompleted(shuffleId, shuffleMergeId, mapIndex)
+
+    case UpdateStageResourceProfile(stageId, stageAttemptId, stageRpId, partitionToRpId) =>
+      dagScheduler.handleUpdateStageResourceProfile(
+        stageId,
+        stageAttemptId,
+        stageRpId,
+        partitionToRpId)
   }
 
   override def onError(e: Throwable): Unit = {

@@ -17,7 +17,7 @@
 
 package org.apache.spark.scheduler
 
-import scala.collection.mutable.HashSet
+import scala.collection.mutable.{HashMap, HashSet}
 
 import org.apache.spark.executor.TaskMetrics
 import org.apache.spark.internal.Logging
@@ -96,13 +96,24 @@ private[scheduler] abstract class Stage(
   val details: String = callSite.longForm
 
   /**
+   * Partition to resource profile mapping is maintained at the stage and not attempt level so
+   * retried tasks of a stage reuse the previously updated values instead of needing to relearn
+   * them.
+   */
+  private val partitionToResourceProfileId = new HashMap[Int, Int]
+
+  /**
    * Pointer to the [[StageInfo]] object for the most recent attempt. This needs to be initialized
    * here, before any attempts have actually been created, because the DAGScheduler uses this
    * StageInfo to tell SparkListeners when a job starts (which happens before any stage attempts
    * have been created).
    */
   private var _latestInfo: StageInfo =
-    StageInfo.fromStage(this, nextAttemptId, resourceProfileId = resourceProfileId)
+    StageInfo.fromStage(
+      this,
+      nextAttemptId,
+      resourceProfileId = resourceProfileId,
+      stageAttemptPartitions = None)
 
   /**
    * Set of stage attempt IDs that have failed. We keep track of these failures in order to avoid
@@ -127,12 +138,18 @@ private[scheduler] abstract class Stage(
   /** Creates a new attempt for this stage by creating a new StageInfo with a new attempt ID. */
   def makeNewStageAttempt(
       numPartitionsToCompute: Int,
-      taskLocalityPreferences: Seq[Seq[TaskLocation]] = Seq.empty): Unit = {
+      taskLocalityPreferences: Seq[Seq[TaskLocation]] = Seq.empty,
+      stageAttemptPartitions: Option[Seq[Int]] = None): Unit = {
     val metrics = new TaskMetrics
     metrics.register(rdd.sparkContext)
     _latestInfo = StageInfo.fromStage(
-      this, nextAttemptId, Some(numPartitionsToCompute), metrics, taskLocalityPreferences,
-      resourceProfileId = resourceProfileId)
+      this,
+      nextAttemptId,
+      Some(numPartitionsToCompute),
+      metrics,
+      taskLocalityPreferences,
+      resourceProfileId = resourceProfileId,
+      stageAttemptPartitions = stageAttemptPartitions)
     nextAttemptId += 1
   }
 
@@ -155,4 +172,23 @@ private[scheduler] abstract class Stage(
 
   /** Returns the sequence of partition ids that are missing (i.e. needs to be computed). */
   def findMissingPartitions(): Seq[Int]
+
+  def getPartitionIdToResourceProfileId: Map[Int, Int] = partitionToResourceProfileId.toMap
+
+  def updateResourceProfile(
+      resourceProfileId: Option[Int],
+      partitionToResourceProfileId: scala.collection.Map[Int, Int]): Unit = {
+    resourceProfileId.foreach { _ =>
+      throw new UnsupportedOperationException(
+        "Updating the stage resource profile is not yet supported")
+    }
+
+    partitionToResourceProfileId.foreach { case (partitionId, rpId) =>
+      if (rpId != this.resourceProfileId) {
+        this.partitionToResourceProfileId.put(partitionId, rpId)
+      } else {
+        this.partitionToResourceProfileId.remove(partitionId)
+      }
+    }
+  }
 }

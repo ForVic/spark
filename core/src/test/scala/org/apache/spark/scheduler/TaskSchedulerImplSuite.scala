@@ -2660,32 +2660,21 @@ class TaskSchedulerImplSuite extends SparkFunSuite with LocalSparkContext
     assert(3 === taskDescriptions.length)
   }
 
-  test("update stage resource profile updates task set manager and posts listener event") {
+  test("update stage resource profile updates task set manager") {
     val taskScheduler = setupScheduler()
     val rp = TaskSchedulerImplSuite.createCustomResourceProfile(sc)
-    @volatile var stageUpdate: SparkListenerStageResourceProfileUpdated = null
-    sc.listenerBus.addToSharedQueue(new SparkListener {
-      override def onStageResourceProfileUpdated(
-          event: SparkListenerStageResourceProfileUpdated): Unit = {
-        stageUpdate = event
-      }
-    })
 
     taskScheduler.submitTasks(FakeTask.createTaskSet(numTasks = 3, stageId = 0, stageAttemptId = 0))
-    taskScheduler.updateStageResourceProfile(0, 0, None, Map(1 -> rp.id))
-    sc.listenerBus.waitUntilEmpty()
+    val (defaultRpId, taskToRpId) =
+      taskScheduler.updateStageResourceProfile(0, 0, None, Map(1 -> rp.id))
 
     val manager = taskScheduler.taskSetManagerForAttempt(0, 0).get
+    assert(defaultRpId === ResourceProfile.DEFAULT_RESOURCE_PROFILE_ID)
+    assert(taskToRpId === Map(1 -> rp.id))
     assert(manager.defaultResourceProfileId === ResourceProfile.DEFAULT_RESOURCE_PROFILE_ID)
     assert(manager.tasksForResourceProfile(ResourceProfile.DEFAULT_RESOURCE_PROFILE_ID) ===
       Set(0, 2))
     assert(manager.tasksForResourceProfile(rp.id) === Set(1))
-    assert(stageUpdate != null)
-    assert(stageUpdate.stageId === 0)
-    assert(stageUpdate.stageAttemptId === 0)
-    assert(stageUpdate.stageState === "running")
-    assert(stageUpdate.stageResourceProfileId === ResourceProfile.DEFAULT_RESOURCE_PROFILE_ID)
-    assert(stageUpdate.taskIndexToResourceProfileId === Map(1 -> rp.id))
   }
 
   // 1 executor with 4 GPUS

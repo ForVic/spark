@@ -242,9 +242,9 @@ private[spark] class TaskSchedulerImpl(
 
   override def submitTasks(taskSet: TaskSet): Unit = {
     val tasks = taskSet.tasks
-    logInfo(log"Adding task set " + taskSet.logId +
-      log" with ${MDC(LogKeys.NUM_TASKS, tasks.length)} tasks resource profile " +
-      log"${MDC(LogKeys.RESOURCE_PROFILE_ID, taskSet.initialDefaultResourceProfileId)}")
+    logInfo(s"Adding task set ${taskSet.id} with ${tasks.length} tasks; " +
+      s"stage level resource profile ${taskSet.initialDefaultResourceProfileId}; " +
+      s"task level resource profile ${taskSet.initialPartitionToRpId}")
     this.synchronized {
       val manager = createTaskSetManager(taskSet, maxTaskFailures)
       val stage = taskSet.stageId
@@ -346,18 +346,12 @@ private[spark] class TaskSchedulerImpl(
       stageId: Int,
       stageAttemptId: Int,
       stageRpId: Option[Int],
-      partitionToRpId: scala.collection.Map[Int, Int]): Unit = synchronized {
-    taskSetManagerForAttempt(stageId, stageAttemptId).foreach { manager =>
-      val (defaultResourceProfileId, taskToRpId) =
-        manager.updateResourceProfile(stageRpId, partitionToRpId)
-      sc.listenerBus.post(SparkListenerStageResourceProfileUpdated(
-        stageId,
-        stageAttemptId,
-        "running",
-        defaultResourceProfileId,
-        taskToRpId))
+      partitionToRpId: scala.collection.Map[Int, Int]): (Int, scala.collection.Map[Int, Int]) =
+    synchronized {
+      taskSetManagerForAttempt(stageId, stageAttemptId)
+        .map(_.updateResourceProfile(stageRpId, partitionToRpId))
+        .getOrElse((ResourceProfile.DEFAULT_RESOURCE_PROFILE_ID, Map.empty))
     }
-  }
 
   /**
    * Called to indicate that all task attempts (including speculated tasks) associated with the

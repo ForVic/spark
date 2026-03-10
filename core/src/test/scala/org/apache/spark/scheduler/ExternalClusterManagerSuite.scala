@@ -94,7 +94,8 @@ private class DummyTaskScheduler extends TaskScheduler {
       stageId: Int,
       stageAttemptId: Int,
       stageRpId: Option[Int],
-      partitionToRpId: scala.collection.Map[Int, Int]): Unit = {}
+      partitionToRpId: scala.collection.Map[Int, Int]): (Int, scala.collection.Map[Int, Int]) =
+    (stageRpId.getOrElse(ResourceProfile.DEFAULT_RESOURCE_PROFILE_ID), partitionToRpId)
   override def setDAGScheduler(dagScheduler: DAGScheduler): Unit = {}
   override def defaultParallelism(): Int = 2
   override def executorLost(executorId: String, reason: ExecutorLossReason): Unit = {}
