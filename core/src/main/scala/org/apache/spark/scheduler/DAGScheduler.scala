@@ -432,8 +432,9 @@ private[spark] class DAGScheduler(
    */
   def unschedulableTaskSetAdded(
       stageId: Int,
-      stageAttemptId: Int): Unit = {
-    eventProcessLoop.post(UnschedulableTaskSetAdded(stageId, stageAttemptId))
+      stageAttemptId: Int,
+      resourceProfileId: Int = DEFAULT_RESOURCE_PROFILE_ID): Unit = {
+    eventProcessLoop.post(UnschedulableTaskSetAdded(stageId, stageAttemptId, resourceProfileId))
   }
 
   /**
@@ -442,8 +443,10 @@ private[spark] class DAGScheduler(
    */
   def unschedulableTaskSetRemoved(
       stageId: Int,
-      stageAttemptId: Int): Unit = {
-    eventProcessLoop.post(UnschedulableTaskSetRemoved(stageId, stageAttemptId))
+      stageAttemptId: Int,
+      resourceProfileId: Int = DEFAULT_RESOURCE_PROFILE_ID): Unit = {
+    eventProcessLoop.post(
+      UnschedulableTaskSetRemoved(stageId, stageAttemptId, resourceProfileId))
   }
 
   private[scheduler]
@@ -1323,14 +1326,18 @@ private[spark] class DAGScheduler(
 
   private[scheduler] def handleUnschedulableTaskSetAdded(
       stageId: Int,
-      stageAttemptId: Int): Unit = {
-    listenerBus.post(SparkListenerUnschedulableTaskSetAdded(stageId, stageAttemptId))
+      stageAttemptId: Int,
+      resourceProfileId: Int = DEFAULT_RESOURCE_PROFILE_ID): Unit = {
+    listenerBus.post(
+      SparkListenerUnschedulableTaskSetAdded(stageId, stageAttemptId, resourceProfileId))
   }
 
   private[scheduler] def handleUnschedulableTaskSetRemoved(
       stageId: Int,
-      stageAttemptId: Int): Unit = {
-    listenerBus.post(SparkListenerUnschedulableTaskSetRemoved(stageId, stageAttemptId))
+      stageAttemptId: Int,
+      resourceProfileId: Int = DEFAULT_RESOURCE_PROFILE_ID): Unit = {
+    listenerBus.post(
+      SparkListenerUnschedulableTaskSetRemoved(stageId, stageAttemptId, resourceProfileId))
   }
 
   private[scheduler] def validateAndUpdateStageResourceProfile(
@@ -3643,11 +3650,11 @@ private[scheduler] class DAGSchedulerEventProcessLoop(dagScheduler: DAGScheduler
     case SpeculativeTaskSubmitted(task, taskIndex) =>
       dagScheduler.handleSpeculativeTaskSubmitted(task, taskIndex)
 
-    case UnschedulableTaskSetAdded(stageId, stageAttemptId) =>
-      dagScheduler.handleUnschedulableTaskSetAdded(stageId, stageAttemptId)
+    case UnschedulableTaskSetAdded(stageId, stageAttemptId, resourceProfileId) =>
+      dagScheduler.handleUnschedulableTaskSetAdded(stageId, stageAttemptId, resourceProfileId)
 
-    case UnschedulableTaskSetRemoved(stageId, stageAttemptId) =>
-      dagScheduler.handleUnschedulableTaskSetRemoved(stageId, stageAttemptId)
+    case UnschedulableTaskSetRemoved(stageId, stageAttemptId, resourceProfileId) =>
+      dagScheduler.handleUnschedulableTaskSetRemoved(stageId, stageAttemptId, resourceProfileId)
 
     case GettingResultEvent(taskInfo) =>
       dagScheduler.handleGetTaskResult(taskInfo)

@@ -1244,7 +1244,8 @@ class TaskSchedulerImplSuite extends SparkFunSuite with LocalSparkContext
     val idx = failedTask.index
     assert(failedTaskSetReason === s"""
       |Aborting $taskSet because task $idx (partition $idx)
-      |cannot run anywhere due to node and executor excludeOnFailure.
+      |cannot run anywhere on resource profile 0 due to node and executor
+      |excludeOnFailure.
       |Most recent failure:
       |${tsm.taskSetExcludelistHelperOpt.get.getLatestFailureReason}
       |
@@ -1282,10 +1283,10 @@ class TaskSchedulerImplSuite extends SparkFunSuite with LocalSparkContext
     }
 
     // Here is the main check of this test -- we have the same offers again, and we schedule it
-    // successfully.  Because the scheduler tries to schedule with locality in mind, at first
-    // it won't schedule anything on executor1.  But despite that, we don't abort the job.
+    // successfully. Depending on locality state, the retry round may either stay empty or may
+    // already launch tasks on executor1. In either case, we should not abort the job.
     val secondTaskAttempts = taskScheduler.resourceOffers(offers).flatten
-    assert(secondTaskAttempts.isEmpty)
+    assert(secondTaskAttempts.isEmpty || secondTaskAttempts.forall(_.executorId === "executor1"))
     assert(!failedTaskSet)
   }
 
@@ -2708,6 +2709,44 @@ class TaskSchedulerImplSuite extends SparkFunSuite with LocalSparkContext
     assert(taskDescriptions.head.index === 1)
     val manager = taskScheduler.taskSetManagerForAttempt(0, 0).get
     assert(manager.taskInfos(taskDescriptions.head.taskId).resourceProfileId === rp.id)
+  }
+
+  test("track unschedulable task set timeout by task resource profile") {
+    taskScheduler = setupSchedulerWithMockTaskSetExcludelist(
+      config.DYN_ALLOCATION_ENABLED.key -> "true",
+      config.UNSCHEDULABLE_TASKSET_TIMEOUT.key -> "10")
+    val rp = TaskSchedulerImplSuite.createCustomResourceProfile(sc)
+    val customExecutorResources = Map(GPU -> ArrayBuffer("0", "1", "2", "3"))
+    val replacementExecutorResources = Map(GPU -> ArrayBuffer("4", "5", "6", "7"))
+
+    taskScheduler.submitTasks(FakeTask.createTaskSet(numTasks = 2, stageId = 0, stageAttemptId = 0))
+    taskScheduler.updateStageResourceProfile(0, 0, None, Map(1 -> rp.id))
+
+    val manager = stageToMockTaskSetManager(0)
+    val defaultTask = taskScheduler.resourceOffers(IndexedSeq(
+      WorkerOffer("executor0", "host0", 1))).flatten
+    assert(defaultTask.length === 1)
+    assert(defaultTask.head.index === 0)
+
+    val customTask = taskScheduler.resourceOffers(IndexedSeq(
+      WorkerOffer("executor1", "host1", 4, None, customExecutorResources, rp.id))).flatten
+    assert(customTask.length === 1)
+    assert(customTask.head.index === 1)
+
+    failTask(customTask.head.taskId, TaskState.FAILED, UnknownReason, manager)
+    when(manager.taskSetExcludelistHelperOpt.get.isExecutorExcludedForTask(
+      "executor1", customTask.head.index)).thenReturn(true)
+
+    assert(taskScheduler.resourceOffers(IndexedSeq(
+      WorkerOffer("executor1", "host1", 4, None, customExecutorResources, rp.id)
+    )).flatten.isEmpty)
+    assert(taskScheduler.unschedulableTaskSetToExpiryTime(manager).keySet === Set(rp.id))
+
+    val retriedTask = taskScheduler.resourceOffers(IndexedSeq(
+      WorkerOffer("executor2", "host2", 4, None, replacementExecutorResources, rp.id))).flatten
+    assert(retriedTask.length === 1)
+    assert(retriedTask.head.index === 1)
+    assert(!taskScheduler.unschedulableTaskSetToExpiryTime.contains(manager))
   }
 
   // 1 executor with 4 GPUS

@@ -719,7 +719,7 @@ private[spark] class ExecutorAllocationManagerWithDrp(
     // failures. This is a Set of StageAttempt's because we'll only take the last unschedulable task
     // in a taskset although there can be more. This is done in order to avoid costly loops in the
     // scheduling. Check TaskSetManager#getCompletelyExcludedTaskIfAny for more details.
-    private val unschedulableTaskSets = new mutable.HashSet[StageAttempt]
+    private val unschedulableTaskSets = new mutable.HashSet[StageAttemptWithResource]
 
     // stageAttempt to tuple (the number of task with locality preferences, a map where each pair
     // is a node and the number of tasks that would like to be scheduled on that node, and
@@ -891,9 +891,11 @@ private[spark] class ExecutorAllocationManagerWithDrp(
         unschedulableTaskSetAdded: SparkListenerUnschedulableTaskSetAdded): Unit = {
       val stageId = unschedulableTaskSetAdded.stageId
       val stageAttemptId = unschedulableTaskSetAdded.stageAttemptId
-      val stageAttempt = StageAttempt(stageId, stageAttemptId)
+      val stageAttemptWithResource = StageAttemptWithResource(
+        StageAttempt(stageId, stageAttemptId),
+        unschedulableTaskSetAdded.resourceProfileId)
       allocationManager.synchronized {
-        unschedulableTaskSets.add(stageAttempt)
+        unschedulableTaskSets.add(stageAttemptWithResource)
         allocationManager.onSchedulerBacklogged()
       }
     }
@@ -902,11 +904,13 @@ private[spark] class ExecutorAllocationManagerWithDrp(
         unschedulableTaskSetRemoved: SparkListenerUnschedulableTaskSetRemoved): Unit = {
       val stageId = unschedulableTaskSetRemoved.stageId
       val stageAttemptId = unschedulableTaskSetRemoved.stageAttemptId
-      val stageAttempt = StageAttempt(stageId, stageAttemptId)
+      val stageAttemptWithResource = StageAttemptWithResource(
+        StageAttempt(stageId, stageAttemptId),
+        unschedulableTaskSetRemoved.resourceProfileId)
       allocationManager.synchronized {
         // Clear unschedulableTaskSets since atleast one task becomes schedulable now
-        unschedulableTaskSets.remove(stageAttempt)
-        removeStageFromResourceProfileIfUnused(stageAttempt)
+        unschedulableTaskSets.remove(stageAttemptWithResource)
+        removeStageFromResourceProfileIfUnused(stageAttemptWithResource.stageAttempt)
       }
     }
 
@@ -917,6 +921,7 @@ private[spark] class ExecutorAllocationManagerWithDrp(
           !stageAttemptToTaskIndices.contains(stageAttempt) &&
           !stageAttemptToSpeculativeTaskIndices.contains(stageAttempt)
       ) {
+        unschedulableTaskSets.filterInPlace(_.stageAttempt != stageAttempt)
         val rpForStage = resourceProfileIdToStageAttempt.filter { case (k, v) =>
           v.contains(stageAttempt)
         }.keys
@@ -976,8 +981,7 @@ private[spark] class ExecutorAllocationManagerWithDrp(
      * we use the number of tasks sets that are unschedulable as a heuristic to add more executors.
      */
     def pendingUnschedulableTaskSetsPerResourceProfile(rp: Int): Int = {
-      val attempts = resourceProfileIdToStageAttempt.getOrElse(rp, Set.empty).toSeq
-      attempts.count(attempt => unschedulableTaskSets.contains(attempt))
+      unschedulableTaskSets.count(_.resourceProfileId == rp)
     }
 
     def hasPendingTasks: Boolean = {
@@ -1034,4 +1038,8 @@ private object ExecutorAllocationManagerWithDrp {
   private[spark] case class StageAttempt(stageId: Int, stageAttemptId: Int) {
     override def toString: String = s"Stage $stageId (Attempt $stageAttemptId)"
   }
+
+  private[spark] case class StageAttemptWithResource(
+      stageAttempt: StageAttempt,
+      resourceProfileId: Int)
 }

@@ -23,6 +23,7 @@ import scala.concurrent.Promise
 
 import org.apache.spark._
 import org.apache.spark.rdd.RDD
+import org.apache.spark.resource.ResourceProfile
 import org.apache.spark.util.{AccumulatorV2, CallSite}
 
 /**
@@ -117,11 +118,17 @@ private[scheduler]
 case class SpeculativeTaskSubmitted(task: Task[_], taskIndex: Int = -1) extends DAGSchedulerEvent
 
 private[scheduler]
-case class UnschedulableTaskSetAdded(stageId: Int, stageAttemptId: Int)
+case class UnschedulableTaskSetAdded(
+    stageId: Int,
+    stageAttemptId: Int,
+    resourceProfileId: Int = ResourceProfile.DEFAULT_RESOURCE_PROFILE_ID)
   extends DAGSchedulerEvent
 
 private[scheduler]
-case class UnschedulableTaskSetRemoved(stageId: Int, stageAttemptId: Int)
+case class UnschedulableTaskSetRemoved(
+    stageId: Int,
+    stageAttemptId: Int,
+    resourceProfileId: Int = ResourceProfile.DEFAULT_RESOURCE_PROFILE_ID)
   extends DAGSchedulerEvent
 
 private[scheduler] case class RegisterMergeStatuses(

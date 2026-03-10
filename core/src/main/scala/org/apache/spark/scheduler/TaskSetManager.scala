@@ -185,6 +185,10 @@ private[spark] class TaskSetManager(
     taskResourceProfileIdForTask(index)
   }
 
+  private[scheduler] def resourceProfileIds: Seq[Int] = {
+    rpToTasks.keys.toSeq
+  }
+
   private[scheduler] def resourceProfileIdsForOffer(executorRpId: Int): Seq[Int] = {
     rpToTasks.keysIterator
       .filter(sched.sc.resourceProfileManager.canBeScheduled(_, executorRpId))
@@ -226,6 +230,7 @@ private[spark] class TaskSetManager(
 
   // Store tasks waiting to be scheduled by locality preferences
   private[scheduler] val pendingTasks = new PendingTasksByLocality()
+  private[scheduler] val pendingTasksPerRp = new HashMap[Int, ArrayBuffer[Int]]()
 
   // Tasks that can be speculated. Since these will be a small fraction of total
   // tasks, we'll just hold them in a HashSet. The HashSet here ensures that we do not add
@@ -368,6 +373,10 @@ private[spark] class TaskSetManager(
             }
           }
           rpToTasks.getOrElseUpdate(customRpId, new HashSet[TaskIndex]) += taskIndex
+          if (isPendingRegularTask(taskIndex)) {
+            removePendingTaskFromRp(prevRpId, taskIndex)
+            pendingTasksPerRp.getOrElseUpdate(customRpId, new ArrayBuffer[Int]) += taskIndex
+          }
         }
       }
     }
@@ -494,6 +503,12 @@ private[spark] class TaskSetManager(
     }
 
     pendingTaskSetToAddTo.all += index
+    if (!speculatable) {
+      val pendingTasksForRp = pendingTasksPerRp.getOrElseUpdate(
+        taskResourceProfileIdForTask(index),
+        new ArrayBuffer[Int])
+      pendingTasksForRp += index
+    }
   }
 
   /**
@@ -506,17 +521,21 @@ private[spark] class TaskSetManager(
       execId: String,
       host: String,
       list: ArrayBuffer[Int],
-      taskRpId: Int = -1,
+      rpId: Option[Int] = None,
       speculative: Boolean = false): Option[Int] = {
     var indexOffset = list.size
     while (indexOffset > 0) {
       indexOffset -= 1
       val index = list(indexOffset)
+      val taskRpId = taskResourceProfileIdForTask(index)
       if (!isTaskExcludededOnExecOrNode(index, execId, host) &&
-          (taskRpId < 0 || taskResourceProfileIdForTask(index) == taskRpId) &&
+          rpId.forall(_ == taskRpId) &&
           !(speculative && hasAttemptOnHost(index, host))) {
         // This should almost always be list.trimEnd(1) to remove tail
         list.remove(indexOffset)
+        if (!speculative) {
+          removePendingTaskFromRp(taskRpId, index)
+        }
         // Speculatable task should only be launched when at most one copy of the
         // original task is running
         if (!successful(index)) {
@@ -571,7 +590,8 @@ private[spark] class TaskSetManager(
     }
     val pendingTaskSetToUse = if (speculative) pendingSpeculatableTasks else pendingTasks
     def dequeue(list: ArrayBuffer[Int]): Option[Int] = {
-      val task = dequeueTaskFromList(execId, host, list, taskRpId, speculative)
+      val requiredRpId = if (taskRpId >= 0) Some(taskRpId) else None
+      val task = dequeueTaskFromList(execId, host, list, requiredRpId, speculative)
       if (speculative && task.isDefined) {
         speculatableTasks -= task.get
       }
@@ -605,7 +625,12 @@ private[spark] class TaskSetManager(
     }
 
     if (TaskLocality.isAllowed(maxLocality, TaskLocality.ANY)) {
-      dequeue(pendingTaskSetToUse.all).foreach { index =>
+      val allPendingTasks = if (taskRpId >= 0 && !speculative) {
+        pendingTasksPerRp.getOrElse(taskRpId, ArrayBuffer.empty[Int])
+      } else {
+        pendingTaskSetToUse.all
+      }
+      dequeue(allPendingTasks).foreach { index =>
         return Some((index, TaskLocality.ANY, speculative))
       }
     }
@@ -897,25 +922,47 @@ private[spark] class TaskSetManager(
    * failures (this is because the method picks one unscheduled task, and then iterates through each
    * executor until it finds one that the task isn't excluded on).
    */
-  private[scheduler] def getCompletelyExcludedTaskIfAny(
-      hostToExecutors: HashMap[String, HashSet[String]]): Option[Int] = {
+  private[scheduler] def getCompletelyExcludedTaskIndex(
+      hostToExecutors: HashMap[String, HashSet[String]],
+      rpIdToHostToExecutors: HashMap[Int, HashMap[String, HashSet[String]]],
+      rpId: Option[Int] = None): Option[Int] = {
     taskSetExcludelistHelperOpt.flatMap { taskSetExcludelist =>
       // Only look for unschedulable tasks when at least one executor has registered. Otherwise,
       // task sets will be (unnecessarily) aborted in cases when no executors have registered yet.
-      if (hostToExecutors.nonEmpty) {
+      val executorsByHost = rpId match {
+        case Some(taskRpId) =>
+          val matchingHosts = new HashMap[String, HashSet[String]]
+          rpIdToHostToExecutors.foreach { case (executorRpId, executorsForRp) =>
+            if (sched.sc.resourceProfileManager.canBeScheduled(taskRpId, executorRpId)) {
+              executorsForRp.foreach { case (host, executorsOnHost) =>
+                matchingHosts.getOrElseUpdate(host, new HashSet[String]) ++= executorsOnHost
+              }
+            }
+          }
+          matchingHosts
+        case None =>
+          hostToExecutors
+      }
+      if (executorsByHost.nonEmpty) {
         // find any task that needs to be scheduled
         val pendingTask: Option[Int] = {
+          val pendingTasksToUse = rpId match {
+            case Some(taskRpId) =>
+              pendingTasksPerRp.getOrElse(taskRpId, ArrayBuffer.empty[Int])
+            case None =>
+              pendingTasks.all
+          }
           // usually this will just take the last pending task, but because of the lazy removal
           // from each list, we may need to go deeper in the list.  We poll from the end because
           // failed tasks are put back at the end of allPendingTasks, so we're more likely to find
           // an unschedulable task this way.
-          val indexOffset = pendingTasks.all.lastIndexWhere { indexInTaskSet =>
+          val indexOffset = pendingTasksToUse.lastIndexWhere { indexInTaskSet =>
             copiesRunning(indexInTaskSet) == 0 && !successful(indexInTaskSet)
           }
           if (indexOffset == -1) {
             None
           } else {
-            Some(pendingTasks.all(indexOffset))
+            Some(pendingTasksToUse(indexOffset))
           }
         }
 
@@ -923,7 +970,7 @@ private[spark] class TaskSetManager(
           // try to find some executor this task can run on.  Its possible that some *other*
           // task isn't schedulable anywhere, but we will discover that in some later call,
           // when that unschedulable task is the last task remaining.
-          hostToExecutors.forall { case (host, execsOnHost) =>
+          executorsByHost.forall { case (host, execsOnHost) =>
             // Check if the task can run on the node
             val nodeExcluded =
               healthTracker.exists(_.isNodeExcluded(host)) ||
@@ -947,17 +994,36 @@ private[spark] class TaskSetManager(
     }
   }
 
-  private[scheduler] def abortSinceCompletelyExcludedOnFailure(indexInTaskSet: Int): Unit = {
+  private[scheduler] def abortSinceCompletelyExcludedOnFailure(
+      indexInTaskSet: Int,
+      resourceProfileId: Int): Unit = {
     taskSetExcludelistHelperOpt.foreach { taskSetExcludelist =>
       val partition = tasks(indexInTaskSet).partitionId
       abort(s"""
          |Aborting $taskSet because task $indexInTaskSet (partition $partition)
-         |cannot run anywhere due to node and executor excludeOnFailure.
+         |cannot run anywhere on resource profile $resourceProfileId due to node and executor
+         |excludeOnFailure.
          |Most recent failure:
          |${taskSetExcludelist.getLatestFailureReason}
          |
          |ExcludeOnFailure behavior can be configured via spark.excludeOnFailure.*.
-         |""".stripMargin)
+      |""".stripMargin)
+    }
+  }
+
+  private def isPendingRegularTask(index: Int): Boolean = {
+    copiesRunning(index) == 0 && !successful(index) && !barrierPendingLaunchTasks.contains(index)
+  }
+
+  private def removePendingTaskFromRp(rpId: Int, index: Int): Unit = {
+    pendingTasksPerRp.get(rpId).foreach { pendingTaskIndexes =>
+      val pendingIndex = pendingTaskIndexes.lastIndexOf(index)
+      if (pendingIndex >= 0) {
+        pendingTaskIndexes.remove(pendingIndex)
+      }
+      if (pendingTaskIndexes.isEmpty) {
+        pendingTasksPerRp.remove(rpId)
+      }
     }
   }
 

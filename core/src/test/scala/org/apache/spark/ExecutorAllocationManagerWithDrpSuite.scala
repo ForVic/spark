@@ -36,7 +36,10 @@ import org.apache.spark.resource.{
 import org.apache.spark.scheduler.{
   LiveListenerBus,
   SparkListenerEvent,
+  SparkListenerStageCompleted,
   SparkListenerStageSubmitted,
+  SparkListenerUnschedulableTaskSetAdded,
+  SparkListenerUnschedulableTaskSetRemoved,
   StageInfo
 }
 import org.apache.spark.util.SystemClock
@@ -152,6 +155,40 @@ class ExecutorAllocationManagerWithDrpSuite extends SparkFunSuite {
     post(SparkListenerStageSubmitted(createStageInfo(0, 100, rp = rp)))
 
     assert(manager.numExecutorsTargetPerResourceProfileId(rp.id) === 4)
+  }
+
+  test("track unschedulable task sets per resource profile") {
+    val manager = createManager(createConf(0, 10, 0))
+    val defaultRp = rpManager.defaultResourceProfile
+    val rp = createNonDefaultResourceProfile()
+
+    post(SparkListenerStageSubmitted(createStageInfo(0, 10, rp = defaultRp)))
+    post(SparkListenerStageSubmitted(createStageInfo(1, 10, rp = rp)))
+    post(SparkListenerUnschedulableTaskSetAdded(0, 0, defaultRp.id))
+    post(SparkListenerUnschedulableTaskSetAdded(1, 0, rp.id))
+
+    assert(manager.listener.pendingUnschedulableTaskSetsPerResourceProfile(defaultRp.id) === 1)
+    assert(manager.listener.pendingUnschedulableTaskSetsPerResourceProfile(rp.id) === 1)
+
+    post(SparkListenerUnschedulableTaskSetRemoved(0, 0, defaultRp.id))
+
+    assert(manager.listener.pendingUnschedulableTaskSetsPerResourceProfile(defaultRp.id) === 0)
+    assert(manager.listener.pendingUnschedulableTaskSetsPerResourceProfile(rp.id) === 1)
+  }
+
+  test("clear unschedulable task sets across resource profiles when stage completes") {
+    val manager = createManager(createConf(0, 10, 0))
+    val defaultRp = rpManager.defaultResourceProfile
+    val rp = createNonDefaultResourceProfile()
+
+    post(SparkListenerStageSubmitted(createStageInfo(0, 10, rp = defaultRp)))
+    post(SparkListenerUnschedulableTaskSetAdded(0, 0, rp.id))
+
+    assert(manager.listener.pendingUnschedulableTaskSetsPerResourceProfile(rp.id) === 1)
+
+    post(SparkListenerStageCompleted(createStageInfo(0, 10, rp = defaultRp)))
+
+    assert(manager.listener.pendingUnschedulableTaskSetsPerResourceProfile(rp.id) === 0)
   }
 
   private def createConf(

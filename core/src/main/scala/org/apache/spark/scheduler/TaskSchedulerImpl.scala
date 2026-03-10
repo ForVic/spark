@@ -163,6 +163,8 @@ private[spark] class TaskSchedulerImpl(
   // The set of executors we have on each host; this is used to compute hostsAlive, which
   // in turn is used to decide when we can attain data locality on a given host
   protected val hostToExecutors = new HashMap[String, HashSet[String]]
+  protected val rpIdToHostToExecutors = new HashMap[Int, HashMap[String, HashSet[String]]]
+  protected val executorIdToRpId = new HashMap[String, Int]
 
   protected val hostsByRack = new HashMap[String, HashSet[String]]
 
@@ -170,7 +172,7 @@ private[spark] class TaskSchedulerImpl(
 
   private val abortTimer = ThreadUtils.newDaemonSingleThreadScheduledExecutor("task-abort-timer")
   // Exposed for testing
-  val unschedulableTaskSetToExpiryTime = new HashMap[TaskSetManager, Long]
+  val unschedulableTaskSetToExpiryTime = new HashMap[TaskSetManager, mutable.HashMap[Int, Long]]
 
   // Listener object to pass upcalls into
   var dagScheduler: DAGScheduler = null
@@ -365,6 +367,7 @@ private[spark] class TaskSchedulerImpl(
         taskSetsByStageIdAndAttempt -= manager.taskSet.stageId
       }
     }
+    unschedulableTaskSetToExpiryTime -= manager
     noRejectsSinceLastReset -= manager.taskSet
     manager.parent.removeSchedulable(manager)
     logInfo(log"Removed TaskSet " + manager.taskSet.logId +
@@ -393,9 +396,10 @@ private[spark] class TaskSchedulerImpl(
       availableCpus: Array[Int],
       availableResources: Array[ExecutorResourcesAmounts],
       tasks: IndexedSeq[ArrayBuffer[TaskDescription]])
-    : (Boolean, Option[TaskLocality]) = {
+    : (Boolean, Option[TaskLocality], Set[Int]) = {
     var noDelayScheduleRejects = true
     var minLaunchedLocality: Option[TaskLocality] = None
+    val launchedTaskRps = new mutable.HashSet[Int]
     // nodes and executors that are excluded for the entire application have already been
     // filtered out by this point
     for (i <- shuffledOffers.indices) {
@@ -427,6 +431,7 @@ private[spark] class TaskSchedulerImpl(
             }
 
             minLaunchedLocality = minTaskLocality(minLaunchedLocality, Some(locality))
+            launchedTaskRps += taskRpId
             availableCpus(i) -= taskCpus
             assert(availableCpus(i) >= 0)
             availableResources(i).acquire(resources)
@@ -439,11 +444,11 @@ private[spark] class TaskSchedulerImpl(
             // scalastyle:on
             // Do not offer resources for this task, but don't throw an error to allow other
             // task sets to be submitted.
-            return (noDelayScheduleRejects, minLaunchedLocality)
+            return (noDelayScheduleRejects, minLaunchedLocality, launchedTaskRps.toSet)
         }
       }
     }
-    (noDelayScheduleRejects, minLaunchedLocality)
+    (noDelayScheduleRejects, minLaunchedLocality, launchedTaskRps.toSet)
   }
 
   /**
@@ -509,7 +514,11 @@ private[spark] class TaskSchedulerImpl(
         hostToExecutors(o.host) = new HashSet[String]()
       }
       if (!executorIdToRunningTaskIds.contains(o.executorId)) {
+        val hostToExecutorsForRp =
+          rpIdToHostToExecutors.getOrElseUpdate(o.resourceProfileId, new HashMap[String, HashSet[String]])
+        hostToExecutorsForRp.getOrElseUpdate(o.host, new HashSet[String]()) += o.executorId
         hostToExecutors(o.host) += o.executorId
+        executorIdToRpId(o.executorId) = o.resourceProfileId
         executorAdded(o.executorId, o.host)
         executorIdToHost(o.executorId) = o.host
         executorIdToRunningTaskIds(o.executorId) = HashSet[Long]()
@@ -576,12 +585,14 @@ private[spark] class TaskSchedulerImpl(
         var launchedAnyTask = false
         var noDelaySchedulingRejects = true
         var globalMinLocality: Option[TaskLocality] = None
+        val rpToLaunchedAnyTask = new mutable.HashMap[Int, Boolean]
         for (currentMaxLocality <- taskSet.myLocalityLevels) {
           var launchedTaskAtCurrentMaxLocality = false
           do {
-            val (noDelayScheduleReject, minLocality) = resourceOfferSingleTaskSet(
+            val (noDelayScheduleReject, minLocality, launchedTaskRps) = resourceOfferSingleTaskSet(
               taskSet, currentMaxLocality, shuffledOffers, availableCpus,
               availableResources, tasks)
+            launchedTaskRps.foreach(rpId => rpToLaunchedAnyTask(rpId) = true)
             launchedTaskAtCurrentMaxLocality = minLocality.isDefined
             launchedAnyTask |= launchedTaskAtCurrentMaxLocality
             noDelaySchedulingRejects &= noDelayScheduleReject
@@ -602,7 +613,11 @@ private[spark] class TaskSchedulerImpl(
         }
 
         if (!launchedAnyTask) {
-          taskSet.getCompletelyExcludedTaskIfAny(hostToExecutors).foreach { taskIndex =>
+          taskSet.resourceProfileIds.foreach { resourceProfileId =>
+            taskSet.getCompletelyExcludedTaskIndex(
+              hostToExecutors,
+              rpIdToHostToExecutors,
+              Some(resourceProfileId)).foreach { taskIndex =>
               // If the taskSet is unschedulable we try to find an existing idle excluded
               // executor and kill the idle executor and kick off an abortTimer which if it doesn't
               // schedule a task within the timeout will abort the taskSet if we were unable to
@@ -620,46 +635,62 @@ private[spark] class TaskSchedulerImpl(
               // unschedulable tasks else we will abort immediately.
               executorIdToRunningTaskIds.find(x => !isExecutorBusy(x._1)) match {
                 case Some ((executorId, _)) =>
-                  if (!unschedulableTaskSetToExpiryTime.contains(taskSet)) {
+                  if (!unschedulableTaskSetToExpiryTime
+                      .get(taskSet)
+                      .exists(_.contains(resourceProfileId))) {
                     healthTrackerOpt.foreach(blt => blt.killExcludedIdleExecutor(executorId))
-                    updateUnschedulableTaskSetTimeoutAndStartAbortTimer(taskSet, taskIndex)
+                    updateUnschedulableTaskSetTimeoutAndStartAbortTimer(
+                      taskSet,
+                      taskIndex,
+                      resourceProfileId)
                   }
                 case None =>
                   //  Notify ExecutorAllocationManager about the unschedulable task set,
                   // in order to provision more executors to make them schedulable
                   if (Utils.isDynamicAllocationEnabled(conf)) {
-                    if (!unschedulableTaskSetToExpiryTime.contains(taskSet)) {
+                    if (!unschedulableTaskSetToExpiryTime
+                        .get(taskSet)
+                        .exists(_.contains(resourceProfileId))) {
                       logInfo(log"Notifying ExecutorAllocationManager to allocate more executors to" +
                         log" schedule the unschedulable task before aborting" +
-                        log" stage ${MDC(LogKeys.STAGE_ID, taskSet.stageId)}.")
+                        log" stage ${MDC(LogKeys.STAGE_ID, taskSet.stageId)} on resource " +
+                        log"profile ${MDC(LogKeys.RESOURCE_PROFILE_ID, resourceProfileId)}.")
                       dagScheduler.unschedulableTaskSetAdded(taskSet.taskSet.stageId,
-                        taskSet.taskSet.stageAttemptId)
-                      updateUnschedulableTaskSetTimeoutAndStartAbortTimer(taskSet, taskIndex)
+                        taskSet.taskSet.stageAttemptId, resourceProfileId)
+                      updateUnschedulableTaskSetTimeoutAndStartAbortTimer(
+                        taskSet,
+                        taskIndex,
+                        resourceProfileId)
                     }
                   } else {
                     // Abort Immediately
                     logInfo(log"Cannot schedule any task because all executors excluded from " +
                       log"failures. No idle executors can be found to kill. Aborting stage " +
-                      log"${MDC(LogKeys.STAGE_ID, taskSet.stageId)}.")
-                    taskSet.abortSinceCompletelyExcludedOnFailure(taskIndex)
+                      log"${MDC(LogKeys.STAGE_ID, taskSet.stageId)} on resource profile " +
+                      log"${MDC(LogKeys.RESOURCE_PROFILE_ID, resourceProfileId)}.")
+                    taskSet.abortSinceCompletelyExcludedOnFailure(taskIndex, resourceProfileId)
                   }
               }
+            }
           }
         } else {
-          // We want to defer killing any taskSets as long as we have a non excluded executor
-          // which can be used to schedule a task from any active taskSets. This ensures that the
-          // job can make progress.
-          // Note: It is theoretically possible that a taskSet never gets scheduled on a
-          // non-excluded executor and the abort timer doesn't kick in because of a constant
-          // submission of new TaskSets. See the PR for more details.
-          if (unschedulableTaskSetToExpiryTime.nonEmpty) {
-            logInfo(log"Clearing the expiry times for all unschedulable taskSets as a task " +
-              log"was recently scheduled.")
-            // Notify ExecutorAllocationManager as well as other subscribers that a task now
-            // recently becomes schedulable
-            dagScheduler.unschedulableTaskSetRemoved(taskSet.taskSet.stageId,
-              taskSet.taskSet.stageAttemptId)
-            unschedulableTaskSetToExpiryTime.clear()
+          rpToLaunchedAnyTask.keys.foreach { launchedTaskRpId =>
+            unschedulableTaskSetToExpiryTime.toSeq.foreach {
+              case (unschedulableTaskSet, rpIdToExpiryTime) =>
+                if (rpIdToExpiryTime.contains(launchedTaskRpId)) {
+                  logInfo(log"Clearing the expiry time for an unschedulable taskSet because a " +
+                    log"task was recently scheduled on resource profile " +
+                    log"${MDC(LogKeys.RESOURCE_PROFILE_ID, launchedTaskRpId)}.")
+                  dagScheduler.unschedulableTaskSetRemoved(
+                    unschedulableTaskSet.taskSet.stageId,
+                    unschedulableTaskSet.taskSet.stageAttemptId,
+                    launchedTaskRpId)
+                  rpIdToExpiryTime -= launchedTaskRpId
+                  if (rpIdToExpiryTime.isEmpty) {
+                    unschedulableTaskSetToExpiryTime -= unschedulableTaskSet
+                  }
+                }
+            }
           }
         }
 
@@ -751,25 +782,48 @@ private[spark] class TaskSchedulerImpl(
 
   private def updateUnschedulableTaskSetTimeoutAndStartAbortTimer(
       taskSet: TaskSetManager,
-      taskIndex: Int): Unit = {
-    val timeout = conf.get(config.UNSCHEDULABLE_TASKSET_TIMEOUT) * 1000
-    unschedulableTaskSetToExpiryTime(taskSet) = clock.getTimeMillis() + timeout
+      taskIndex: Int,
+      resourceProfileId: Int): Unit = {
+    val timeoutConfig =
+      if (resourceProfileId == sc.resourceProfileManager.defaultResourceProfile.id) {
+        config.UNSCHEDULABLE_TASKSET_TIMEOUT
+      } else {
+        config.UNSCHEDULABLE_TASKSET_TIMEOUT_NON_DEFAULT_RESOURCE_PROFILE
+      }
+    val timeout = conf.get(timeoutConfig) * 1000
+    val rpIdToExpiryTime =
+      unschedulableTaskSetToExpiryTime.getOrElseUpdate(taskSet, new mutable.HashMap[Int, Long]())
+    rpIdToExpiryTime(resourceProfileId) = clock.getTimeMillis() + timeout
     logInfo(log"Waiting for ${MDC(LogKeys.TIMEOUT, timeout)} ms for completely " +
-      log"excluded task to be schedulable again before aborting stage ${MDC(LogKeys.STAGE_ID, taskSet.stageId)}.")
+      log"excluded task to be schedulable again before aborting stage " +
+      log"${MDC(LogKeys.STAGE_ID, taskSet.stageId)} on resource profile " +
+      log"${MDC(LogKeys.RESOURCE_PROFILE_ID, resourceProfileId)}.")
     abortTimer.schedule(
-      createUnschedulableTaskSetAbortTimer(taskSet, taskIndex), timeout, TimeUnit.MILLISECONDS)
+      createUnschedulableTaskSetAbortTimer(taskSet, taskIndex, resourceProfileId),
+      timeout,
+      TimeUnit.MILLISECONDS)
   }
 
   private def createUnschedulableTaskSetAbortTimer(
       taskSet: TaskSetManager,
-      taskIndex: Int): TimerTask = {
+      taskIndex: Int,
+      resourceProfileId: Int): TimerTask = {
     new TimerTask() {
       override def run(): Unit = TaskSchedulerImpl.this.synchronized {
-        if (unschedulableTaskSetToExpiryTime.contains(taskSet) &&
-            unschedulableTaskSetToExpiryTime(taskSet) <= clock.getTimeMillis()) {
+        if (unschedulableTaskSetToExpiryTime.get(taskSet)
+            .flatMap(_.get(resourceProfileId))
+            .exists(_ <= clock.getTimeMillis())) {
           logInfo(log"Cannot schedule any task because all executors excluded due to failures. " +
-            log"Wait time for scheduling expired. Aborting stage ${MDC(LogKeys.STAGE_ID, taskSet.stageId)}.")
-          taskSet.abortSinceCompletelyExcludedOnFailure(taskIndex)
+            log"Wait time for scheduling expired. Aborting stage " +
+            log"${MDC(LogKeys.STAGE_ID, taskSet.stageId)} on resource profile " +
+            log"${MDC(LogKeys.RESOURCE_PROFILE_ID, resourceProfileId)}.")
+          unschedulableTaskSetToExpiryTime.get(taskSet).foreach { rpIdToExpiryTime =>
+            rpIdToExpiryTime -= resourceProfileId
+            if (rpIdToExpiryTime.isEmpty) {
+              unschedulableTaskSetToExpiryTime -= taskSet
+            }
+          }
+          taskSet.abortSinceCompletelyExcludedOnFailure(taskIndex, resourceProfileId)
         } else {
           this.cancel()
         }
@@ -1100,6 +1154,20 @@ private[spark] class TaskSchedulerImpl(
 
     executorsPendingDecommission.remove(executorId)
       .foreach(executorsRemovedByDecom.put(executorId, _))
+
+    executorIdToRpId.remove(executorId).foreach { rpId =>
+      rpIdToHostToExecutors.get(rpId).foreach { executorsByHost =>
+        executorsByHost.get(host).foreach { executorsForHost =>
+          executorsForHost -= executorId
+          if (executorsForHost.isEmpty) {
+            executorsByHost -= host
+          }
+        }
+        if (executorsByHost.isEmpty) {
+          rpIdToHostToExecutors -= rpId
+        }
+      }
+    }
 
     if (reason != LossReasonPending) {
       executorIdToHost -= executorId

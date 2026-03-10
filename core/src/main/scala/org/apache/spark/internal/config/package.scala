@@ -1931,6 +1931,15 @@ package object config {
       .checkValue(v => v >= 0, "The value should be a non negative time value.")
       .createWithDefault(120)
 
+  private[spark] val UNSCHEDULABLE_TASKSET_TIMEOUT_NON_DEFAULT_RESOURCE_PROFILE =
+    ConfigBuilder(
+      "spark.scheduler.excludeOnFailure.unschedulableTaskSetTimeoutNonDefaultResourceProfile")
+      .doc("The timeout in seconds to wait to acquire a new executor and schedule a task " +
+        "before aborting a TaskSet for a non-default resource profile which is unschedulable " +
+        "because all executors are excluded due to failures.")
+      .version("3.5.8")
+      .fallbackConf(UNSCHEDULABLE_TASKSET_TIMEOUT)
+
   private[spark] val BARRIER_MAX_CONCURRENT_TASKS_CHECK_INTERVAL =
     ConfigBuilder("spark.scheduler.barrier.maxConcurrentTasksCheck.interval")
       .doc("Time in seconds to wait between a max concurrent tasks check failure and the next " +

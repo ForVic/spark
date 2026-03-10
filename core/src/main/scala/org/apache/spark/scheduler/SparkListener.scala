@@ -222,13 +222,15 @@ case class SparkListenerNodeUnexcluded(time: Long, hostId: String)
 @Since("3.1.0")
 case class SparkListenerUnschedulableTaskSetAdded(
   stageId: Int,
-  stageAttemptId: Int) extends SparkListenerEvent
+  stageAttemptId: Int,
+  resourceProfileId: Int = ResourceProfile.DEFAULT_RESOURCE_PROFILE_ID) extends SparkListenerEvent
 
 @DeveloperApi
 @Since("3.1.0")
 case class SparkListenerUnschedulableTaskSetRemoved(
   stageId: Int,
-  stageAttemptId: Int) extends SparkListenerEvent
+  stageAttemptId: Int,
+  resourceProfileId: Int = ResourceProfile.DEFAULT_RESOURCE_PROFILE_ID) extends SparkListenerEvent
 
 @DeveloperApi
 case class SparkListenerBlockUpdated(blockUpdatedInfo: BlockUpdatedInfo) extends SparkListenerEvent
