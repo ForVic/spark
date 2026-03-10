@@ -234,6 +234,11 @@ class DAGSchedulerSuite extends SparkFunSuite with TempLocalSparkContext with Ti
         tasksMarkedAsCompleted += tasks.head
       }
     }
+    override def updateStageResourceProfile(
+        stageId: Int,
+        stageAttemptId: Int,
+        stageRpId: Option[Int],
+        partitionToRpId: scala.collection.Map[Int, Int]): Unit = {}
     override def setDAGScheduler(dagScheduler: DAGScheduler) = {}
     override def defaultParallelism() = 2
     override def executorLost(executorId: String, reason: ExecutorLossReason): Unit = {}
@@ -955,6 +960,11 @@ class DAGSchedulerSuite extends SparkFunSuite with TempLocalSparkContext with Ti
       override def notifyPartitionCompletion(stageId: Int, partitionId: Int): Unit = {
         throw new UnsupportedOperationException
       }
+      override def updateStageResourceProfile(
+          stageId: Int,
+          stageAttemptId: Int,
+          stageRpId: Option[Int],
+          partitionToRpId: scala.collection.Map[Int, Int]): Unit = {}
       override def setDAGScheduler(dagScheduler: DAGScheduler): Unit = {}
       override def defaultParallelism(): Int = 2
       override def executorHeartbeatReceived(

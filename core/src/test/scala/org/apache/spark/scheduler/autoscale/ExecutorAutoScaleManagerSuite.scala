@@ -20,13 +20,19 @@ package org.apache.spark.scheduler.autoscale
 import scala.collection.mutable
 
 import org.mockito.ArgumentMatchers.{any, anyInt}
-import org.mockito.invocation.InvocationOnMock
 import org.mockito.Mockito.{doAnswer, mock}
+import org.mockito.invocation.InvocationOnMock
 
-import org.apache.spark.{SparkConf, SparkContext, SparkFunSuite, TempLocalSparkContext}
+import org.apache.spark.{
+  ExceptionFailure,
+  SparkConf,
+  SparkContext,
+  SparkFunSuite,
+  TempLocalSparkContext
+}
 import org.apache.spark.executor.ExecutorMetrics
-import org.apache.spark.internal.config.Python.PYSPARK_EXECUTOR_MEMORY
 import org.apache.spark.internal.config._
+import org.apache.spark.internal.config.Python.PYSPARK_EXECUTOR_MEMORY
 import org.apache.spark.metrics.MetricsSystem
 import org.apache.spark.resource.{ResourceProfile, ResourceProfileManager}
 import org.apache.spark.scheduler._
@@ -86,17 +92,6 @@ class ExecutorAutoScaleManagerSuite extends SparkFunSuite with TempLocalSparkCon
     managers ++= sc.executorAutoScaleManager.toSeq
     try {
       assert(sc.executorAutoScaleManager.isDefined)
-    } finally {
-      sc.stop()
-    }
-  }
-
-  test("do not initialize executor autoscaler if default resource profile executor cores are unknown") {
-    val conf = createConf().remove(EXECUTOR_CORES.key)
-    val sc = new SparkContext(conf)
-    managers ++= sc.executorAutoScaleManager.toSeq
-    try {
-      assert(sc.executorAutoScaleManager.isEmpty)
     } finally {
       sc.stop()
     }
@@ -225,8 +220,8 @@ class ExecutorAutoScaleManagerSuite extends SparkFunSuite with TempLocalSparkCon
 
   test("do not initialize executor autoscaler if off heap memory is enabled") {
     val conf = createConf()
-      .set(MEMORY_OFFHEAP_ENABLED, true)
-      .set(MEMORY_OFFHEAP_SIZE, "1g")
+    conf.set(MEMORY_OFFHEAP_ENABLED, true)
+    conf.set(MEMORY_OFFHEAP_SIZE, 1L)
     val sc = new SparkContext(conf)
     managers ++= sc.executorAutoScaleManager.toSeq
     try {

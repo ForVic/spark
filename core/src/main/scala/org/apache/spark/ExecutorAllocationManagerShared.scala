@@ -17,7 +17,8 @@
 
 package org.apache.spark
 
-import org.apache.spark.metrics.source.Source
+import scala.collection.mutable
+
 import org.apache.spark.scheduler.dynalloc.ExecutorMonitor
 
 private[spark] trait ExecutorAllocationManagerShared {
@@ -25,6 +26,10 @@ private[spark] trait ExecutorAllocationManagerShared {
   def stop(): Unit
   def reset(): Unit
 
-  val executorAllocationManagerSource: Source
+  val executorAllocationManagerSource: ExecutorAllocationManagerSourceShared
   val executorMonitor: ExecutorMonitor
+
+  private[spark] val numExecutorsToAddPerResourceProfileId: mutable.HashMap[Int, Int]
+  private[spark] val numExecutorsTargetPerResourceProfileId: mutable.HashMap[Int, Int]
+  private[spark] def maxNumExecutorsNeededPerResourceProfile(rpId: Int): Int
 }

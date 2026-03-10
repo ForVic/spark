@@ -218,6 +218,11 @@ public class SparkFirehoseListener implements SparkListenerInterface {
   }
 
   @Override
+  public void onStageResourceProfileUpdated(SparkListenerStageResourceProfileUpdated event) {
+    onEvent(event);
+  }
+
+  @Override
   public void onOtherEvent(SparkListenerEvent event) {
     onEvent(event);
   }

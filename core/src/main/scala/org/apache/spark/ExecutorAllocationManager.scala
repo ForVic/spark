@@ -166,11 +166,13 @@ private[spark] class ExecutorAllocationManager(
 
   // Metric source for ExecutorAllocationManager to expose internal status to MetricsSystem.
   override val executorAllocationManagerSource = new ExecutorAllocationManagerSource(
-    executorMonitor,
+    executorMonitor.pendingRemovalCount,
+    executorMonitor.executorCount,
     numExecutorsToAddPerResourceProfileId.values.sum,
     numExecutorsTargetPerResourceProfileId.values.sum,
     numExecutorsTargetPerResourceProfileId.keys
-      .map(maxNumExecutorsNeededPerResourceProfile).sum)
+      .map(maxNumExecutorsNeededPerResourceProfile).sum,
+    executorMonitor.decommissioningCount)
 
   override val executorMonitor =
     new ExecutorMonitor(conf, client, listenerBus, clock, executorAllocationManagerSource)
@@ -993,10 +995,13 @@ private[spark] class ExecutorAllocationManager(
  * implementation is changed, so these metrics are not stable across Spark version.
  */
 private[spark] class ExecutorAllocationManagerSource(
-    executorMonitor: ExecutorMonitor,
+    numExecutorsPendingToRemove: => Int,
+    numAllExecutors: => Int,
     numExecutorsToAdd: => Int,
     numTargetExecutors: => Int,
-    numMaxNeededExecutors: => Int) extends Source with ExecutorAllocationManagerSourceShared {
+    numMaxNeededExecutors: => Int,
+    numDecommissioningExecutors: => Int)
+  extends Source with ExecutorAllocationManagerSourceShared {
   val sourceName = "ExecutorAllocationManager"
   val metricRegistry = new MetricRegistry()
 
@@ -1017,11 +1022,11 @@ private[spark] class ExecutorAllocationManagerSource(
 
   // The metrics are going to return the sum for all the different ResourceProfiles.
   registerGauge("numberExecutorsToAdd", numExecutorsToAdd, 0)
-  registerGauge("numberExecutorsPendingToRemove", executorMonitor.pendingRemovalCount, 0)
-  registerGauge("numberAllExecutors", executorMonitor.executorCount, 0)
+  registerGauge("numberExecutorsPendingToRemove", numExecutorsPendingToRemove, 0)
+  registerGauge("numberAllExecutors", numAllExecutors, 0)
   registerGauge("numberTargetExecutors", numTargetExecutors, 0)
   registerGauge("numberMaxNeededExecutors", numMaxNeededExecutors, 0)
-  registerGauge("numberDecommissioningExecutors", executorMonitor.decommissioningCount, 0)
+  registerGauge("numberDecommissioningExecutors", numDecommissioningExecutors, 0)
 }
 
 private object ExecutorAllocationManager {

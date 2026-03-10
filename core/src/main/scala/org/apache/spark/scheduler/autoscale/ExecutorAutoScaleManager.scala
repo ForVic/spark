@@ -17,17 +17,38 @@
 
 package org.apache.spark.scheduler.autoscale
 
+import java.util.Locale
+
 import scala.collection.{immutable, mutable}
-import scala.util.Locale
 import scala.util.matching.Regex
 
-import org.apache.spark.{ExceptionFailure, ExecutorAllocationManagerWithDrp, ExecutorLostFailure, SparkConf}
+import org.apache.spark.{
+  ExceptionFailure,
+  ExecutorAllocationManagerWithDrp,
+  ExecutorLostFailure,
+  SparkConf
+}
 import org.apache.spark.internal.Logging
 import org.apache.spark.internal.config._
 import org.apache.spark.network.util.ByteUnit
-import org.apache.spark.resource.{ExecutorResourceRequest, ResourceProfile, ResourceProfileManager, TaskResourceRequest}
-import org.apache.spark.resource.ResourceProfile.{ExecutorResourcesOrDefaults, getResourcesForClusterManager}
-import org.apache.spark.scheduler.{DAGScheduler, LiveListenerBus, SparkListener, SparkListenerStageCompleted, SparkListenerStageSubmitted, SparkListenerTaskEnd}
+import org.apache.spark.resource.{
+  ExecutorResourceRequest,
+  ResourceProfile,
+  ResourceProfileManager,
+  TaskResourceRequest
+}
+import org.apache.spark.resource.ResourceProfile.{
+  getResourcesForClusterManager,
+  ExecutorResourcesOrDefaults
+}
+import org.apache.spark.scheduler.{
+  DAGScheduler,
+  LiveListenerBus,
+  SparkListener,
+  SparkListenerStageCompleted,
+  SparkListenerStageSubmitted,
+  SparkListenerTaskEnd
+}
 
 /**
  * A module to dynamically scale executor requirements at a per-partition level based on memory
@@ -85,8 +106,11 @@ private[spark] class ExecutorAutoScaleManager(
     }
 
     val stageAttempt = StageAttempt(taskEnd.stageId, taskEnd.stageAttemptId)
-    val partitionId =
-      if (taskEnd.taskInfo.partitionId >= 0) taskEnd.taskInfo.partitionId else taskEnd.taskInfo.index
+    val partitionId = if (taskEnd.taskInfo.partitionId >= 0) {
+      taskEnd.taskInfo.partitionId
+    } else {
+      taskEnd.taskInfo.index
+    }
     val failedTaskRpId = taskEnd.taskInfo.resourceProfileId
 
     synchronized {
@@ -102,8 +126,10 @@ private[spark] class ExecutorAutoScaleManager(
           oomPartitions.size.toDouble / numPartitions <= maxOomRatio)
 
       if (!shouldScaleUp) {
-        logInfo(s"Not scaling stage ${stageAttempt.stageId} attempt ${stageAttempt.stageAttemptId} " +
-          s"after OOM for partition $partitionId because OOM partition threshold was exceeded.")
+        logInfo(
+          s"Not scaling stage ${stageAttempt.stageId} attempt ${stageAttempt.stageAttemptId} " +
+            s"after OOM for partition $partitionId because OOM partition threshold " +
+            "was exceeded.")
         return
       }
 
@@ -130,10 +156,12 @@ private[spark] class ExecutorAutoScaleManager(
     val failedTaskRpTaskCpus = failedTaskRp.getTaskCpus.getOrElse(appDefaultCpusPerTask)
 
     val normalizedFailedTaskRp = failedTaskRp.getExecutorCores match {
-      case Some(executorCores) if executorCores > failedTaskRpTaskCpus && failedTaskRpTaskCpus > 0 =>
+      case Some(executorCores)
+          if executorCores > failedTaskRpTaskCpus && failedTaskRpTaskCpus > 0 =>
         val ratio = failedTaskRpTaskCpus.toDouble / executorCores.toDouble
-        val normalizedHeapMiB =
-          math.max(1L, math.ceil(failedTaskRpResources.executorMemoryMiB.toDouble * ratio).toLong)
+        val normalizedHeapMiB = math.max(
+          1L,
+          math.ceil(failedTaskRpResources.executorMemoryMiB.toDouble * ratio).toLong)
         val normalizedOverheadMiB = math.max(
           minimumOverheadMemory,
           math.ceil(failedTaskRpResources.memoryOverheadMiB.toDouble * ratio).toLong)
@@ -154,7 +182,9 @@ private[spark] class ExecutorAutoScaleManager(
     val initialStageRpHeapRatio = getHeapRatio(initialStageRpResources)
 
     val (rpToScaleUp, rpToScaleUpResources) =
-      if (memoryPerCore(normalizedFailedTaskRpResources) >= memoryPerCore(currentPartitionResources)) {
+      if (
+        memoryPerCore(normalizedFailedTaskRpResources) >=
+          memoryPerCore(currentPartitionResources)) {
         (normalizedFailedTaskRp, normalizedFailedTaskRpResources)
       } else {
         (currentPartitionRp, currentPartitionResources)

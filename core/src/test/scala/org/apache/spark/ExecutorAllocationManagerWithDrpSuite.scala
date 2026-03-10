@@ -26,8 +26,19 @@ import org.apache.spark.internal.config
 import org.apache.spark.internal.config.DECOMMISSION_ENABLED
 import org.apache.spark.internal.config.Tests.TEST_DYNAMIC_ALLOCATION_SCHEDULE_ENABLED
 import org.apache.spark.metrics.MetricsSystem
-import org.apache.spark.resource.{ExecutorResourceRequests, ResourceProfile, ResourceProfileBuilder, ResourceProfileManager, TaskResourceRequests}
-import org.apache.spark.scheduler.{ExecutorAllocationClient, LiveListenerBus, SparkListenerEvent, SparkListenerStageSubmitted, StageInfo}
+import org.apache.spark.resource.{
+  ExecutorResourceRequests,
+  ResourceProfile,
+  ResourceProfileBuilder,
+  ResourceProfileManager,
+  TaskResourceRequests
+}
+import org.apache.spark.scheduler.{
+  LiveListenerBus,
+  SparkListenerEvent,
+  SparkListenerStageSubmitted,
+  StageInfo
+}
 import org.apache.spark.util.SystemClock
 
 class ExecutorAllocationManagerWithDrpSuite extends SparkFunSuite {
@@ -121,8 +132,12 @@ class ExecutorAllocationManagerWithDrpSuite extends SparkFunSuite {
 
     manager.reset()
 
-    assert(manager.numExecutorsTargetPerResourceProfileId(ResourceProfile.DEFAULT_RESOURCE_PROFILE_ID) === 1)
-    assert(manager.numExecutorsToAddPerResourceProfileId(ResourceProfile.DEFAULT_RESOURCE_PROFILE_ID) === 1)
+    assert(
+      manager.numExecutorsTargetPerResourceProfileId(
+        ResourceProfile.DEFAULT_RESOURCE_PROFILE_ID) === 1)
+    assert(
+      manager.numExecutorsToAddPerResourceProfileId(
+        ResourceProfile.DEFAULT_RESOURCE_PROFILE_ID) === 1)
     assert(manager.numExecutorsTargetPerResourceProfileId(rp.id) === 4)
     assert(manager.numExecutorsToAddPerResourceProfileId(rp.id) === 0)
   }

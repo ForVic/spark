@@ -24,14 +24,11 @@ import scala.collection.mutable.ArrayBuffer
 import scala.concurrent.duration.FiniteDuration
 import scala.util.control.NonFatal
 
-import com.codahale.metrics.{Counter, Gauge, MetricRegistry}
-
 import org.apache.spark.internal.{config, Logging}
 import org.apache.spark.internal.LogKeys._
 import org.apache.spark.internal.config._
 import org.apache.spark.internal.config.DECOMMISSION_ENABLED
 import org.apache.spark.internal.config.Tests.TEST_DYNAMIC_ALLOCATION_SCHEDULE_ENABLED
-import org.apache.spark.metrics.source.Source
 import org.apache.spark.resource.ResourceProfile.UNKNOWN_RESOURCE_PROFILE_ID
 import org.apache.spark.resource.ResourceProfileManager
 import org.apache.spark.scheduler._
@@ -173,11 +170,13 @@ private[spark] class ExecutorAllocationManagerWithDrp(
 
   // Metric source for ExecutorAllocationManager to expose internal status to MetricsSystem.
   override val executorAllocationManagerSource = new ExecutorAllocationManagerSource(
-    executorMonitor,
+    executorMonitor.pendingRemovalCount,
+    executorMonitor.executorCount,
     numExecutorsToAddPerResourceProfileId.values.sum,
     numExecutorsTargetPerResourceProfileId.values.sum,
     numExecutorsTargetPerResourceProfileId.keys
-      .map(maxNumExecutorsNeededPerResourceProfile).sum)
+      .map(maxNumExecutorsNeededPerResourceProfile).sum,
+    executorMonitor.decommissioningCount)
 
   override val executorMonitor =
     new ExecutorMonitor(conf, client, listenerBus, clock, executorAllocationManagerSource)
@@ -396,7 +395,8 @@ private[spark] class ExecutorAllocationManagerWithDrp(
       // Otherwise the first job may have to ramp up unnecessarily
       0
     } else {
-      val updatesNeeded = new mutable.HashMap[Int, ExecutorAllocationManagerWithDrp.TargetNumUpdates]
+      val updatesNeeded =
+        new mutable.HashMap[Int, ExecutorAllocationManagerWithDrp.TargetNumUpdates]
 
       // Update targets for all ResourceProfiles then do a single request to the cluster manager
       numExecutorsTargetPerResourceProfileId.foreach { case (rpId, targetExecs) =>
@@ -422,14 +422,18 @@ private[spark] class ExecutorAllocationManagerWithDrp(
   private def addExecutorsToTarget(
       maxNeeded: Int,
       rpId: Int,
-      updatesNeeded: mutable.HashMap[Int, ExecutorAllocationManagerWithDrp.TargetNumUpdates]): Int = {
+      updatesNeeded: mutable.HashMap[
+        Int,
+        ExecutorAllocationManagerWithDrp.TargetNumUpdates]): Int = {
     updateTargetExecs(addExecutors, maxNeeded, rpId, updatesNeeded)
   }
 
   private def decrementExecutorsFromTarget(
       maxNeeded: Int,
       rpId: Int,
-      updatesNeeded: mutable.HashMap[Int, ExecutorAllocationManagerWithDrp.TargetNumUpdates]): Int = {
+      updatesNeeded: mutable.HashMap[
+        Int,
+        ExecutorAllocationManagerWithDrp.TargetNumUpdates]): Int = {
     updateTargetExecs(decrementExecutors, maxNeeded, rpId, updatesNeeded)
   }
 
@@ -437,7 +441,9 @@ private[spark] class ExecutorAllocationManagerWithDrp(
       updateTargetFn: (Int, Int) => Int,
       maxNeeded: Int,
       rpId: Int,
-      updatesNeeded: mutable.HashMap[Int, ExecutorAllocationManagerWithDrp.TargetNumUpdates]): Int = {
+      updatesNeeded: mutable.HashMap[
+        Int,
+        ExecutorAllocationManagerWithDrp.TargetNumUpdates]): Int = {
     val oldNumExecutorsTarget = numExecutorsTargetPerResourceProfileId(rpId)
     // update the target number (add or remove)
     val delta = updateTargetFn(maxNeeded, rpId)
