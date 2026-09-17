@@ -1,0 +1,21 @@
+variant,profiled,query,mode,pairs,median_ms,mean_ms,stdev_ms,median_task_cpu_ms,executor_cpu_samples,checksum_cpu_samples,row_output_buffer_cpu_samples,allocation_sample_weight_MiB,checksum_allocation_sample_weight_MiB,reader_io_thread_starts
+before-checksum,True,aggregation and Top-N,regular,12,268.512,274.22,25.801,252.565,204.0,0,48.0,480.625,0,0
+before-checksum,True,aggregation and Top-N,pipeline,12,233.618,240.561,40.767,398.769,332.0,22.0,72.0,1668.906,485.308,0
+before-checksum,True,shuffled join and aggregate,regular,12,191.898,194.396,25.332,196.551,167.0,0,22.0,877.201,0,0
+before-checksum,True,shuffled join and aggregate,pipeline,12,160.891,161.592,22.051,270.506,225.0,14.0,31.0,1247.301,246.826,0
+checksum,True,aggregation and Top-N,regular,12,258.507,271.822,38.978,251.428,193.0,0,50.0,456.104,0,0
+checksum,True,aggregation and Top-N,pipeline,12,221.451,223.731,26.148,385.155,335.0,1.0,75.0,937.09,0.762,0
+checksum,True,shuffled join and aggregate,regular,12,210.597,213.875,21.654,201.134,169.0,0,21.0,798.714,0,0
+checksum,True,shuffled join and aggregate,pipeline,12,168.716,167.488,15.874,267.065,229.0,0,34.0,895.484,5.343,0
+buffering,True,aggregation and Top-N,regular,12,268.056,277.825,34.926,248.231,204.0,1.0,34.0,482.737,0,0
+buffering,True,aggregation and Top-N,pipeline,12,208.285,210.337,20.978,331.069,258.0,0,0,862.76,0.671,0
+buffering,True,shuffled join and aggregate,regular,12,201.588,210.587,23.266,199.215,153.0,0,24.0,806.338,0,0
+buffering,True,shuffled join and aggregate,pipeline,12,163.561,168.58,22.661,235.054,201.0,0,0,851.017,0,0
+checksum,False,aggregation and Top-N,regular,8,253.075,261.273,21.396,251.067,,,,,,
+checksum,False,aggregation and Top-N,pipeline,8,229.749,235.122,28.817,395.853,,,,,,
+checksum,False,shuffled join and aggregate,regular,8,200.915,204.213,18.797,197.059,,,,,,
+checksum,False,shuffled join and aggregate,pipeline,8,162.039,162.36,24.717,255.665,,,,,,
+buffering,False,aggregation and Top-N,regular,8,258.897,263.765,24.567,248.158,,,,,,
+buffering,False,aggregation and Top-N,pipeline,8,210.831,214.688,34.957,345.096,,,,,,
+buffering,False,shuffled join and aggregate,regular,8,217.607,212.095,18.208,197.4,,,,,,
+buffering,False,shuffled join and aggregate,pipeline,8,184.416,177.171,19.3,239.152,,,,,,
