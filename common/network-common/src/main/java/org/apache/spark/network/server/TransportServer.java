@@ -32,7 +32,10 @@ import io.netty.channel.ChannelFuture;
 import io.netty.channel.ChannelInitializer;
 import io.netty.channel.ChannelOption;
 import io.netty.channel.EventLoopGroup;
+import io.netty.channel.group.ChannelGroup;
+import io.netty.channel.group.DefaultChannelGroup;
 import io.netty.channel.socket.SocketChannel;
+import io.netty.util.concurrent.ImmediateEventExecutor;
 
 import org.apache.spark.internal.SparkLogger;
 import org.apache.spark.internal.SparkLoggerFactory;
@@ -49,6 +52,10 @@ public class TransportServer implements Closeable {
   private final TransportConf conf;
   private final RpcHandler appRpcHandler;
   private final List<TransportServerBootstrap> bootstraps;
+  private final TransportServerFactory factory;
+  // A shared worker group cannot be shut down when one server closes. Track this server's
+  // accepted channels instead; stayClosed also handles an accept racing with close().
+  private final ChannelGroup channels;
 
   private ServerBootstrap bootstrap;
   private ChannelFuture channelFuture;
@@ -66,16 +73,23 @@ public class TransportServer implements Closeable {
       int portToBind,
       RpcHandler appRpcHandler,
       List<TransportServerBootstrap> bootstraps) {
+    this(context, hostToBind, portToBind, appRpcHandler, bootstraps, null);
+  }
+
+  TransportServer(
+      TransportContext context,
+      String hostToBind,
+      int portToBind,
+      RpcHandler appRpcHandler,
+      List<TransportServerBootstrap> bootstraps,
+      TransportServerFactory factory) {
     this.context = context;
     this.conf = context.getConf();
     this.appRpcHandler = appRpcHandler;
-    if (conf.sharedByteBufAllocators()) {
-      this.pooledAllocator = NettyUtils.getSharedPooledByteBufAllocator(
-          conf.preferDirectBufsForSharedByteBufAllocators(), true /* allowCache */);
-    } else {
-      this.pooledAllocator = NettyUtils.createPooledByteBufAllocator(
-          conf.preferDirectBufs(), true /* allowCache */, conf.serverThreads());
-    }
+    this.factory = factory;
+    this.channels = factory == null ? null :
+      new DefaultChannelGroup(ImmediateEventExecutor.INSTANCE, true);
+    this.pooledAllocator = factory == null ? createAllocator(conf) : factory.allocator;
     this.bootstraps = new ArrayList<>(Objects.requireNonNull(bootstraps));
 
     boolean shouldClose = true;
@@ -86,6 +100,16 @@ public class TransportServer implements Closeable {
       if (shouldClose) {
         JavaUtils.closeQuietly(this);
       }
+    }
+  }
+
+  static PooledByteBufAllocator createAllocator(TransportConf conf) {
+    if (conf.sharedByteBufAllocators()) {
+      return NettyUtils.getSharedPooledByteBufAllocator(
+          conf.preferDirectBufsForSharedByteBufAllocators(), true /* allowCache */);
+    } else {
+      return NettyUtils.createPooledByteBufAllocator(
+          conf.preferDirectBufs(), true /* allowCache */, conf.serverThreads());
     }
   }
 
@@ -103,10 +127,10 @@ public class TransportServer implements Closeable {
   private void init(String hostToBind, int portToBind) {
 
     IOMode ioMode = IOMode.valueOf(conf.ioMode());
-    EventLoopGroup bossGroup = NettyUtils.createEventLoop(ioMode, 1,
-      conf.getModuleName() + "-boss");
-    EventLoopGroup workerGroup =  NettyUtils.createEventLoop(ioMode, conf.serverThreads(),
-      conf.getModuleName() + "-server");
+    EventLoopGroup bossGroup = factory == null ? NettyUtils.createEventLoop(ioMode, 1,
+      conf.getModuleName() + "-boss") : factory.bossGroup;
+    EventLoopGroup workerGroup = factory == null ? NettyUtils.createEventLoop(
+      ioMode, conf.serverThreads(), conf.getModuleName() + "-server") : factory.workerGroup;
 
     String name = System.getProperty("os.name");
     boolean isNotWindows = !name.regionMatches(true, 0, "Windows", 0, 7);
@@ -139,6 +163,9 @@ public class TransportServer implements Closeable {
     bootstrap.childHandler(new ChannelInitializer<SocketChannel>() {
       @Override
       protected void initChannel(SocketChannel ch) {
+        if (channels != null) {
+          channels.add(ch);
+        }
         logger.debug("New connection accepted for remote address {}.", ch.remoteAddress());
 
         RpcHandler rpcHandler = appRpcHandler;
@@ -170,10 +197,13 @@ public class TransportServer implements Closeable {
       channelFuture.channel().close().awaitUninterruptibly(10, TimeUnit.SECONDS);
       channelFuture = null;
     }
-    if (bootstrap != null && bootstrap.config().group() != null) {
+    if (channels != null) {
+      channels.close().awaitUninterruptibly(10, TimeUnit.SECONDS);
+    }
+    if (factory == null && bootstrap != null && bootstrap.config().group() != null) {
       bootstrap.config().group().shutdownGracefully();
     }
-    if (bootstrap != null && bootstrap.config().childGroup() != null) {
+    if (factory == null && bootstrap != null && bootstrap.config().childGroup() != null) {
       bootstrap.config().childGroup().shutdownGracefully();
     }
     bootstrap = null;

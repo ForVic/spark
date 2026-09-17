@@ -192,7 +192,9 @@ case class ShuffleExchangeExec(
     child: SparkPlan,
     shuffleOrigin: ShuffleOrigin = ENSURE_REQUIREMENTS,
     advisoryPartitionSize: Option[Long] = None,
-    pipelined: Boolean = false)
+    pipelined: Boolean = false,
+    // Durable edges can execute inside a submitted graph when AQE does not need their statistics.
+    materializeForAdaptivePlanning: Boolean = true)
   extends ShuffleExchangeLike {
 
   private lazy val writeMetrics =
@@ -209,11 +211,15 @@ case class ShuffleExchangeExec(
   // The default arg string is positional, so printing `pipelined` unconditionally would add a bare
   // `false` to every shuffle in every plan. Show it only when set, and name it when shown.
   override def stringArgs: Iterator[Any] = {
-    // `pipelined` is the last field, so drop it positionally rather than by value; argString drops
-    // the child on its own. Exchange's `[plan_id=...]` suffix is re-appended here.
-    val argsWithoutPipelined = productIterator.toSeq.dropRight(1).iterator
+    // Hide default execution settings; argString drops the child on its own.
+    val argsWithoutPipelined = productIterator.toSeq.dropRight(2).iterator
     val pipelinedArg = if (pipelined) Iterator("isPipelined=true") else Iterator.empty
-    argsWithoutPipelined ++ pipelinedArg ++ Iterator(s"[plan_id=$id]")
+    val deferredArg = if (!materializeForAdaptivePlanning) {
+      Iterator("materializeForAdaptivePlanning=false")
+    } else {
+      Iterator.empty
+    }
+    argsWithoutPipelined ++ pipelinedArg ++ deferredArg ++ Iterator(s"[plan_id=$id]")
   }
 
   private lazy val serializer: Serializer =
@@ -235,8 +241,13 @@ case class ShuffleExchangeExec(
 
   override def numPartitions: Int = shuffleDependency.partitioner.numPartitions
 
+  // Finite SQL consumers can stop reading early (for example, an empty hash-join build).
+  // Pass the protocol explicitly to the RDD; enabling a batch flag must not alter RTM readers.
+  private def drainPipelinedInput: Boolean = pipelined && conf.batchPipelinedShuffleEnabled &&
+    !exists(_.logicalLink.exists(_.isStreaming))
+
   override def getShuffleRDD(partitionSpecs: Array[ShufflePartitionSpec]): RDD[InternalRow] = {
-    new ShuffledRowRDD(shuffleDependency, readMetrics, partitionSpecs)
+    new ShuffledRowRDD(shuffleDependency, readMetrics, partitionSpecs, drainPipelinedInput)
   }
 
   override def runtimeStatistics: Statistics = {
@@ -276,7 +287,7 @@ case class ShuffleExchangeExec(
   protected override def doExecute(): RDD[InternalRow] = {
     // The ShuffleRowRDD will be cached in SparkPlan.executeRDD and reused if this plan is used by
     // multiple plans.
-    new ShuffledRowRDD(shuffleDependency, readMetrics)
+    getShuffleRDD(Array.tabulate(numPartitions)(i => CoalescedPartitionSpec(i, i + 1)))
   }
 
   override protected def withNewChildInternal(newChild: SparkPlan): ShuffleExchangeExec =
@@ -370,6 +381,17 @@ object ShuffleExchangeExec {
         // For HashPartitioning, the partitioning key is already a valid partition ID, as we use
         // `HashPartitioning.partitionIdExpression` to produce partitioning key.
         new PartitionIdPassthrough(n)
+      case CoalescedHashPartitioning(from, boundaries) =>
+        require(boundaries.nonEmpty && boundaries.head.startReducerIndex == 0 &&
+          boundaries.last.endReducerIndex == from.numPartitions &&
+          boundaries.forall(b => b.startReducerIndex < b.endReducerIndex) &&
+          boundaries.zip(boundaries.drop(1)).forall { case (left, right) =>
+            left.endReducerIndex == right.startReducerIndex
+          }, "A shuffle output layout must cover every hash bucket exactly once")
+        // Route to physical readers before constructing the dependency. Each reader still owns
+        // one stream; sequentially reading several bounded logical streams could deadlock.
+        new CoalescedPartitioner(new PartitionIdPassthrough(from.numPartitions),
+          boundaries.map(_.startReducerIndex).toArray)
       case NullAwareHashPartitioning(_, n) =>
         // The null-aware extractor below produces partition IDs directly:
         // Pmod(hash, n) for non-NULL keys, and a round-robin counter for NULL keys.
@@ -442,6 +464,10 @@ object ShuffleExchangeExec {
         }
       case h: HashPartitioning =>
         val projection = UnsafeProjection.create(h.partitionIdExpression :: Nil, outputAttributes)
+        row => projection(row).getInt(0)
+      case CoalescedHashPartitioning(from, _) =>
+        val projection = UnsafeProjection.create(
+          from.partitionIdExpression :: Nil, outputAttributes)
         row => projection(row).getInt(0)
       case h: NullAwareHashPartitioning =>
         // Non-NULL keys must produce the same partition id as
@@ -535,7 +561,7 @@ object ShuffleExchangeExec {
               result
             }
           }
-          val pageSize = SparkEnv.get.memoryManager.pageSizeBytes
+          val pageSize = TaskContext.get().taskMemoryManager().pageSizeBytes()
 
           val sorter = UnsafeExternalRowSorter.createWithRecordComparator(
             DataTypeUtils.fromAttributes(outputAttributes),

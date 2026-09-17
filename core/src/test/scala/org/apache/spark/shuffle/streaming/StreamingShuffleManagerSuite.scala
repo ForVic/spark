@@ -94,6 +94,33 @@ class StreamingShuffleManagerSuite
     }
   }
 
+  test("transport I/O resources are reused and cannot restart after manager shutdown") {
+    withSpark(new SparkContext("local", "StreamingShuffleManagerSuite", new SparkConf())) { _ =>
+      val manager = new StreamingShuffleManager()
+      try {
+        val factory = manager.sharedClientFactory
+        val servers = manager.sharedServerFactory
+        val executors = manager.sharedClientExecutors
+        assert(manager.sharedClientFactory eq factory)
+        assert(manager.sharedServerFactory eq servers)
+        assert(manager.sharedClientExecutors eq executors)
+        manager.stop()
+        manager.stop()
+        intercept[IllegalArgumentException] {
+          manager.sharedClientFactory
+        }
+        intercept[IllegalArgumentException] {
+          manager.sharedServerFactory
+        }
+        intercept[IllegalArgumentException] {
+          manager.sharedClientExecutors
+        }
+      } finally {
+        manager.stop()
+      }
+    }
+  }
+
   // ---- SparkEnv tracker initialization gating ----
 
   private def assertTrackerInitialized(

@@ -148,7 +148,9 @@ private[execution] object HashedRelation {
           Runtime.getRuntime.maxMemory,
           Runtime.getRuntime.maxMemory / 2,
           1),
-        0)
+        0,
+        Option(SparkEnv.get).map(_.memoryManager.pageSizeBytes)
+          .getOrElse(new SparkConf().get(BUFFER_PAGESIZE).getOrElse(16L * 1024 * 1024)))
     }
 
     if (!input.hasNext && !allowsNullKey) {
@@ -463,13 +465,11 @@ private[joins] object UnsafeHashedRelation {
     require(!(isNullAware && allowsNullKey),
       "isNullAware and allowsNullKey cannot be enabled at same time")
 
-    val pageSizeBytes = Option(SparkEnv.get).map(_.memoryManager.pageSizeBytes)
-      .getOrElse(new SparkConf().get(BUFFER_PAGESIZE).getOrElse(16L * 1024 * 1024))
     val binaryMap = new BytesToBytesMap(
       taskMemoryManager,
       // Only 70% of the slots can be used before growing, more capacity help to reduce collision
       (sizeEstimate * 1.5 + 1).toInt,
-      pageSizeBytes)
+      taskMemoryManager.pageSizeBytes())
 
     // Create a mapping of buildKeys -> rows
     val keyGenerator = UnsafeProjection.create(key)

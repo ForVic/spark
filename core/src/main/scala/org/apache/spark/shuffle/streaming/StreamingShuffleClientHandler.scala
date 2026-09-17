@@ -81,8 +81,16 @@ class StreamingShuffleClientHandler(
     onTermAckResponse = handler
   }
 
+  // Register ownership before advertising readiness. A connection may activate after its task
+  // has already cleaned up; such a channel must never start receiving buffered shuffle data.
+  private[streaming] var registerClient: TransportClient => Boolean = _ => true
+
   override def channelActive(client: TransportClient): Unit = {
     channel = client.getChannel
+    if (!registerClient(client)) {
+      channel.close()
+      return
+    }
     channel.config.setOption(ChannelOption.SO_RCVBUF, RECVBUF_SIZE)
     channel.config.setOption(ChannelOption.SO_SNDBUF, SENDBUF_SIZE)
     sendCreditControlMessage(client, shuffleWriterId, 1) // Tell upstream writer that we're ready.

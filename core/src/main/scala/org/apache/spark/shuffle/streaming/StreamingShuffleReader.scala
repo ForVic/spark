@@ -17,20 +17,18 @@
 
 package org.apache.spark.shuffle.streaming
 
-import java.util.concurrent.{CompletableFuture, ConcurrentHashMap, ConcurrentLinkedQueue, LinkedBlockingQueue, Semaphore, TimeUnit}
-import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.{CompletableFuture, ConcurrentHashMap, LinkedBlockingQueue, Semaphore, TimeUnit}
+import java.util.concurrent.atomic.{AtomicBoolean, AtomicInteger}
 
 import scala.jdk.CollectionConverters._
 
 import io.netty.buffer.ByteBufInputStream
 
-import org.apache.spark.{ShuffleLocationResponse, SparkContext, SparkEnv, SparkRuntimeException, TaskContext}
+import org.apache.spark.{ShuffleLocationResponse, SparkEnv, SparkRuntimeException, TaskContext}
 import org.apache.spark.internal.LogKeys
-import org.apache.spark.internal.config.{EXECUTOR_ID, STREAMING_SHUFFLE_CHECKSUM_ENABLED, STREAMING_SHUFFLE_READER_MAX_MEMORY}
+import org.apache.spark.internal.config.{STREAMING_SHUFFLE_CHECKSUM_ENABLED, STREAMING_SHUFFLE_READER_MAX_MEMORY}
 import org.apache.spark.memory.{MemoryConsumer, MemoryMode}
-import org.apache.spark.network.TransportContext
 import org.apache.spark.network.client.{TransportClient, TransportClientFactory}
-import org.apache.spark.network.netty.SparkTransportConf
 import org.apache.spark.network.shuffle.streaming.{DataMessage, ShuffleChecksum, StreamingShuffleMessage, TerminationControlMessage}
 import org.apache.spark.shuffle.{ShuffleHandle, ShuffleReader}
 import org.apache.spark.util.{ErrorNotifier, NextIterator, ThreadUtils, Utils}
@@ -81,7 +79,10 @@ class StreamingShuffleReader[K, C](
     handle: ShuffleHandle,
     val context: TaskContext,
     clientHandler: Option[StreamingShuffleClientHandler] = None,
-    private[streaming] val errorNotifier: ErrorNotifier = new ErrorNotifier())
+    private[streaming] val errorNotifier: ErrorNotifier = new ErrorNotifier(),
+    sharedClientFactory: Option[TransportClientFactory] = None,
+    reducePartitionId: Option[Int] = None,
+    sharedClientExecutors: Option[StreamingShuffleClientExecutors] = None)
     extends ShuffleReader[K, C] with TaskContextAwareLogging {
   assert(SparkEnv.get.streamingShuffleOutputTracker.isDefined)
   private val conf = SparkEnv.get.conf
@@ -90,20 +91,16 @@ class StreamingShuffleReader[K, C](
   setShuffleIdForLogging(streamingShuffleHandle.shuffleId)
   // a mapping of mapId and client
   private[spark] val clientMap = new ConcurrentHashMap[Long, TransportClient]()
-  // Track factories so we can close them on shutdown.
-  // TODO: refactor to reuse a single client factory across writers.
-  private val clientFactories = new ConcurrentLinkedQueue[TransportClientFactory]()
-  private val tracker = SparkEnv.get.streamingShuffleOutputTracker.get
-
-  private val role = conf.get(EXECUTOR_ID).map { id =>
-    if (SparkContext.isDriver(id)) "driver" else "executor"
+  // Directly constructed readers own one factory; manager-created readers share executor I/O.
+  // In either case each writer connection gets a distinct handler and is closed by this reader.
+  private val ownedClientContext = if (sharedClientFactory.isDefined) None else {
+    Some(StreamingShuffleManager.createClientContext(conf, 1))
   }
-
-  private val clientConf = SparkTransportConf.fromSparkConf(
-    conf,
-    s"streaming-shuffle-reader-${streamingShuffleHandle.shuffleId}-${context.partitionId()}",
-    1, // a client should only need to use 1 thread
-    role)
+  private[streaming] val clientFactory = sharedClientFactory.getOrElse {
+    ownedClientContext.get.createClientFactory()
+  }
+  private var resourcesClosed = false // guarded by clientMap
+  private val tracker = SparkEnv.get.streamingShuffleOutputTracker.get
 
   private[spark] val taskDiscoveryExecutor =
     ThreadUtils.newDaemonSingleThreadExecutor(
@@ -137,10 +134,14 @@ class StreamingShuffleReader[K, C](
 
   private val allTermAcksSentNotice = new Semaphore(0)
 
-  // thread pool used to perform client creation in parallel
-  private[spark] val clientCreationExecutor = ThreadUtils.newDaemonFixedThreadPool(
-    Runtime.getRuntime.availableProcessors,
-    s"streaming-shuffle-async-client-creation-${context.partitionId()}")
+  // Connection queues are reader-local even when their workers are reused between tasks.
+  private[spark] val clientCreationExecutor = sharedClientExecutors.map(_.borrow()).getOrElse {
+    ThreadUtils.newDaemonFixedThreadPool(
+      Runtime.getRuntime.availableProcessors,
+      s"streaming-shuffle-async-client-creation-${context.partitionId()}")
+  }
+  private val clientExecutorReleased = new AtomicBoolean(false)
+  private val pendingClientCreations = new AtomicInteger(0)
 
   // Signals to other threads that task discovery should stop. For example, we may receive all
   // the termination messages before we actually put the clients in the client map. In that
@@ -175,18 +176,32 @@ class StreamingShuffleReader[K, C](
    */
   private[streaming] def cleanupResources(): Unit = {
     val cleanupStartTime = System.currentTimeMillis()
+    clientMap.synchronized {
+      resourcesClosed = true
+    }
 
     Utils.tryLogNonFatalError {
       stopTaskDiscovery()
     }
     Utils.tryLogNonFatalError {
-      shutdownExecutorService(clientCreationExecutor, "Client Creation Executor")
+      if (clientExecutorReleased.compareAndSet(false, true)) {
+        // Discovery is the only submitter. Never reuse a pool while it could still submit work,
+        // or while a connection callback could still be running for this reader.
+        val reused = sharedClientExecutors.exists(_.release(
+          clientCreationExecutor, taskDiscoveryExecutor.isTerminated, pendingClientCreations.get()))
+        if (!reused) {
+          shutdownExecutorService(clientCreationExecutor, "Client Creation Executor")
+        }
+      }
     }
     Utils.tryLogNonFatalError {
       clientMap.forEach((_, client) => client.close())
     }
     Utils.tryLogNonFatalError {
-      clientFactories.forEach(factory => factory.close())
+      if (ownedClientContext.isDefined) clientFactory.close()
+    }
+    Utils.tryLogNonFatalError {
+      ownedClientContext.foreach(_.close())
     }
     Utils.tryLogNonFatalError {
       if (currentDataMessage != null) {
@@ -255,7 +270,6 @@ class StreamingShuffleReader[K, C](
                   if (!clientFutureMap.containsKey(mapId)) {
                     val future = createClientAsync(mapId.toInt, location.host, location.port)
                       .thenAccept((shuffleClient: TransportClient) => {
-                        clientMap.put(mapId, shuffleClient)
                         logInfo(
                           log"Created shuffle client to shuffle " +
                             log"writer with id ${MDC(LogKeys.MAP_ID, mapId)} and location ${MDC(
@@ -310,7 +324,7 @@ class StreamingShuffleReader[K, C](
         logError(log"Task discovery thread failed.", th)
         errorNotifier.markError(th)
     } finally {
-      clientCreationExecutor.shutdown()
+      if (sharedClientExecutors.isEmpty) clientCreationExecutor.shutdown()
       logInfo(log"Task discovery thread exited. Took ${MDC(LogKeys.DURATION,
         System.currentTimeMillis() - startTime)} ms")
     }
@@ -326,6 +340,7 @@ class StreamingShuffleReader[K, C](
       remoteHost: String,
       remotePort: Int): CompletableFuture[TransportClient] = {
     val future = new CompletableFuture[TransportClient]()
+    pendingClientCreations.incrementAndGet()
     clientCreationExecutor.execute(() => {
       try {
         val shuffleClient = createClient(mapId, remoteHost, remotePort)
@@ -333,6 +348,8 @@ class StreamingShuffleReader[K, C](
       } catch {
         case th: Throwable =>
           future.completeExceptionally(th)
+      } finally {
+        pendingClientCreations.decrementAndGet()
       }
     })
     future
@@ -381,7 +398,7 @@ class StreamingShuffleReader[K, C](
   protected def createClient(mapId: Int, remoteHost: String, remotePort: Int): TransportClient = {
     val handler = clientHandler.getOrElse(new StreamingShuffleClientHandler(
       mapId,
-      context.partitionId(),
+      reducePartitionId.getOrElse(context.partitionId()),
       messageQueue,
       streamingShuffleHandle.shuffleId,
       perWriterByteLimit,
@@ -389,12 +406,19 @@ class StreamingShuffleReader[K, C](
       errorNotifier
     ))
     handler.setOnTermAckResponseHandler(onTermAckResponse)
-    val clientContext =
-      new TransportContext(clientConf, handler)
-
-    val factory = clientContext.createClientFactory()
-    clientFactories.add(factory)
-    factory.createClient(remoteHost, remotePort)
+    handler.registerClient = client => clientMap.synchronized {
+      if (resourcesClosed) {
+        false
+      } else {
+        clientMap.put(mapId.toLong, client)
+        true
+      }
+    }
+    val client = clientFactory.createUnmanagedClient(remoteHost, remotePort, handler)
+    // Netty can complete the connect future before channelActive runs. Discovery completion
+    // must imply registered ownership, too. Registration from either path is idempotent.
+    if (!handler.registerClient(client)) client.close()
+    client
   }
 
   private def checkTaskFailure(): Unit = {

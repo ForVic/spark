@@ -18,10 +18,16 @@
 package org.apache.spark.shuffle.streaming
 
 import java.util.Properties
-import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.{CountDownLatch, LinkedBlockingQueue, TimeUnit}
 
-import io.netty.buffer.Unpooled
+import io.netty.buffer.{ByteBuf, Unpooled}
+import io.netty.channel.embedded.EmbeddedChannel
+import org.mockito.ArgumentMatchers.{any, anyInt, anyString}
+import org.mockito.Mockito.{never, verify, when}
+import org.scalatest.concurrent.Eventually.eventually
+import org.scalatest.concurrent.PatienceConfiguration.Timeout
 import org.scalatest.matchers.should.Matchers
+import org.scalatest.time.SpanSugar._
 import org.scalatestplus.mockito.MockitoSugar
 
 import org.apache.spark._
@@ -29,8 +35,11 @@ import org.apache.spark.LocalSparkContext.withSpark
 import org.apache.spark.internal.config.SHUFFLE_MANAGER_INCREMENTAL
 import org.apache.spark.memory.{TaskMemoryManager, TestMemoryManager}
 import org.apache.spark.metrics.MetricsSystem
+import org.apache.spark.network.client.{TransportClient, TransportClientFactory}
+import org.apache.spark.network.server.RpcHandler
 import org.apache.spark.network.shuffle.streaming.{DataMessage, StreamingShuffleMessage, TerminationControlMessage}
 import org.apache.spark.shuffle.streaming.StreamingShuffleManager.QUERY_ID_PROPERTY_KEY
+import org.apache.spark.util.ErrorNotifier
 
 /**
  * Reader-side unit tests that do not require a shuffle writer. End-to-end writer <-> reader
@@ -73,6 +82,103 @@ class StreamingShuffleReaderSuite
   // The iterator factory drives four collaborators; these tests supply in-memory fakes for all of
   // them so the reader's consumer-loop control flow can be verified without Netty or a SparkEnv.
   private val factory = new StreamingShuffleReaderIteratorFactory()
+
+  test("a connection rejected by its reader closes before advertising readiness") {
+    val messages = new LinkedBlockingQueue[StreamingShuffleMessage]()
+    val handler = new StreamingShuffleClientHandler(
+      0, 0, messages, 0, 1024, createTaskContext(newConf(), 0), new ErrorNotifier())
+    handler.registerClient = _ => false
+    val channel = new EmbeddedChannel()
+    val client = mock[TransportClient]
+    when(client.getChannel).thenReturn(channel)
+    try {
+      handler.channelActive(client)
+      assert(!channel.isActive)
+      verify(client, never()).send(any[ByteBuf]())
+      assert(messages.isEmpty)
+    } finally {
+      channel.finishAndReleaseAll()
+    }
+  }
+
+  test("connect completion owns the client even before channelActive is delivered") {
+    withSpark(new SparkContext("local", "StreamingShuffleReaderSuite", newConf())) { sc =>
+      SparkEnv.get.streamingShuffleOutputTracker.get
+        .asInstanceOf[StreamingShuffleOutputTrackerMaster]
+        .registerShuffle(shuffleId = 0, numMaps = 1, numReduces = 1, jobId = 0)
+      val dep = new ShuffleDependency[Int, Int, Int](
+        sc.parallelize(Seq((1, 1))), new HashPartitioner(1))
+      val handle = new StreamingShuffleHandle(0, dep)
+      val context = createTaskContext(sc.conf, 0)
+      val clients = mock[TransportClientFactory]
+      val client = mock[TransportClient]
+      // A successful connect future need not have delivered the channelActive callback yet.
+      when(clients.createUnmanagedClient(anyString(), anyInt(), any[RpcHandler]()))
+        .thenReturn(client)
+      class TestReader extends StreamingShuffleReader[Int, Int](
+          handle, context, sharedClientFactory = Some(clients)) {
+        def connect(): TransportClient = createClient(0, "localhost", 1234)
+      }
+      val reader = new TestReader
+      try {
+        assert(reader.connect() eq client)
+        assert(reader.clientMap.get(0L) eq client)
+      } finally {
+        context.markTaskCompleted(None)
+      }
+      verify(client).close()
+      verify(clients, never()).close()
+    }
+  }
+
+  test("reader cleanup cannot interrupt workers already borrowed by the next reader") {
+    withSpark(new SparkContext("local", "StreamingShuffleReaderSuite", newConf())) { sc =>
+      val tracker = SparkEnv.get.streamingShuffleOutputTracker.get
+        .asInstanceOf[StreamingShuffleOutputTrackerMaster]
+      tracker.registerShuffle(shuffleId = 0, numMaps = 1, numReduces = 1, jobId = 0)
+      tracker.registerShuffleWriterTask(0, 0, StreamingShuffleTaskLocation("0", "localhost", 1234))
+      val dep = new ShuffleDependency[Int, Int, Int](
+        sc.parallelize(Seq((1, 1))), new HashPartitioner(1))
+      val handle = new StreamingShuffleHandle(0, dep)
+      val pools = new StreamingShuffleClientExecutors(1)
+      val clients = mock[TransportClientFactory]
+      val client = mock[TransportClient]
+      when(clients.createUnmanagedClient(anyString(), anyInt(), any[RpcHandler]()))
+        .thenReturn(client)
+      val firstContext = createTaskContext(sc.conf, 0)
+      val nextContext = createTaskContext(sc.conf, 0)
+      val started = new CountDownLatch(1)
+      val unblock = new CountDownLatch(1)
+      try {
+        val first = new StreamingShuffleReader[Int, Int](handle, firstContext,
+          sharedClientFactory = Some(clients), sharedClientExecutors = Some(pools))
+        eventually(Timeout(10.seconds)) {
+          assert(first.clientMap.size() == 1)
+          assert(first.clientCreationExecutor.getActiveCount == 0)
+        }
+        firstContext.markTaskCompleted(None)
+        when(clients.createUnmanagedClient(anyString(), anyInt(), any[RpcHandler]()))
+          .thenAnswer { _ =>
+            started.countDown()
+            unblock.await()
+            mock[TransportClient]
+          }
+        val next = new StreamingShuffleReader[Int, Int](handle, nextContext,
+          sharedClientFactory = Some(clients), sharedClientExecutors = Some(pools))
+        assert(started.await(10, TimeUnit.SECONDS))
+        assert(first.clientCreationExecutor eq next.clientCreationExecutor)
+        first.cleanupResources()
+        assert(!next.clientCreationExecutor.isShutdown)
+        unblock.countDown()
+        eventually(Timeout(10.seconds)) { assert(next.clientMap.size() == 1) }
+      } finally {
+        unblock.countDown()
+        firstContext.markTaskCompleted(None)
+        nextContext.markTaskCompleted(None)
+        pools.stop()
+      }
+    }
+  }
 
   test("iterator emits all rows from data messages then stops on termination") {
     val queue = new LinkedBlockingQueue[StreamingShuffleMessage]()

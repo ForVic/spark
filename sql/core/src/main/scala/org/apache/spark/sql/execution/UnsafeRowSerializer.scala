@@ -55,10 +55,15 @@ private class UnsafeRowSerializerInstance(
    * Serializes a stream of UnsafeRows. Within the stream, each record consists of a record
    * length (stored as a 4-byte integer, written high byte first), followed by the record's bytes.
    */
-  override def serializeStream(out: OutputStream): SerializationStream = new SerializationStream {
+  override def serializeStream(out: OutputStream): SerializationStream =
+    serializeStream(out, useBuffering = true)
+
+  override private[spark] def serializeStream(
+      out: OutputStream,
+      useBuffering: Boolean): SerializationStream = new SerializationStream {
     private[this] var writeBuffer: Array[Byte] = new Array[Byte](4096)
     private[this] val dOut: DataOutputStream =
-      new DataOutputStream(new BufferedOutputStream(out))
+      new DataOutputStream(if (useBuffering) new BufferedOutputStream(out) else out)
 
     override def writeValue[T: ClassTag](value: T): SerializationStream = {
       val row = value.asInstanceOf[UnsafeRow]

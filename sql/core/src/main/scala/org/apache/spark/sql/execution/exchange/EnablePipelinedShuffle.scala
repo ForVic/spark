@@ -76,6 +76,7 @@ import org.apache.spark.sql.execution.SparkPlan
 object EnablePipelinedShuffle extends Rule[SparkPlan] {
 
   override def apply(plan: SparkPlan): SparkPlan = {
+    if (conf.batchPipelinedShuffleEnabled) return PlanBatchPipelinedShuffle(plan)
     // Shared environment gate (opt-in flag, single-executor local mode, channel manager active),
     // identical to the AQE rule's -- see PipelinedShuffleEligibility for why it is a correctness
     // gate. It also requires AQE off implicitly: under AQE this rule sees no exchanges.

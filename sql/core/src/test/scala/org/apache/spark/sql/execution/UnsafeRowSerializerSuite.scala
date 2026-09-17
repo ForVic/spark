@@ -89,6 +89,32 @@ class UnsafeRowSerializerSuite extends SparkFunSuite with LocalSparkSession {
     assert(input.closed)
   }
 
+  test("already buffered destinations preserve row framing without a second buffer") {
+    val rows = Seq(Row("small", 1), Row("x" * 12000, 2))
+      .map(row => toUnsafeRow(row, Array(StringType, IntegerType)))
+    val serializer = new UnsafeRowSerializer(numFields = 2).newInstance()
+    def write(useBuffering: Boolean): Array[Byte] = {
+      val output = new ByteArrayOutputStream()
+      val stream = serializer.serializeStream(output, useBuffering)
+      rows.foreach { row =>
+        val before = output.size()
+        stream.writeValue(row)
+        if (!useBuffering) {
+          assert(output.size() - before === 4 + row.getSizeInBytes)
+        }
+      }
+      stream.close()
+      output.toByteArray
+    }
+    val bytes = write(useBuffering = false)
+    assert(bytes.toSeq === write(useBuffering = true).toSeq)
+    val input = new ClosableByteArrayInputStream(bytes)
+    val decoded = serializer.deserializeStream(input).asKeyValueIterator
+      .map(_._2.asInstanceOf[UnsafeRow].copy()).toArray
+    assert(decoded.toSeq === rows)
+    assert(input.closed)
+  }
+
   test("close empty input stream") {
     val input = new ClosableByteArrayInputStream(Array.empty)
     val serializer = new UnsafeRowSerializer(numFields = 2).newInstance()

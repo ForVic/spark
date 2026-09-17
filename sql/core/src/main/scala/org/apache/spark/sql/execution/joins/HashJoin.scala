@@ -69,6 +69,8 @@ trait HashJoin extends JoinCodegenSupport {
     }
   }
 
+  override def estimatedPartitionCount: Option[Int] = streamedPlan.estimatedPartitionCount
+
   override def outputPartitioning: Partitioning = buildSide match {
     case BuildLeft =>
       joinType match {

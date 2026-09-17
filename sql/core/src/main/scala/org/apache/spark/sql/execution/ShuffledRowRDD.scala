@@ -130,7 +130,8 @@ class CoalescedPartitioner(val parent: Partitioner, val partitionStartIndices: A
 class ShuffledRowRDD(
     var dependency: ShuffleDependency[Int, InternalRow, InternalRow],
     metrics: Map[String, SQLMetric],
-    partitionSpecs: Array[ShufflePartitionSpec])
+    partitionSpecs: Array[ShufflePartitionSpec],
+    drainPipelinedInput: Boolean)
   extends RDD[InternalRow](dependency.rdd.context, Nil)
   with org.apache.spark.rdd.ShuffleReducePartitionMapping {
 
@@ -157,14 +158,31 @@ class ShuffledRowRDD(
 
   def this(
       dependency: ShuffleDependency[Int, InternalRow, InternalRow],
+      metrics: Map[String, SQLMetric],
+      partitionSpecs: Array[ShufflePartitionSpec]) = {
+    this(dependency, metrics, partitionSpecs, false)
+  }
+
+  def this(
+      dependency: ShuffleDependency[Int, InternalRow, InternalRow],
       metrics: Map[String, SQLMetric]) = {
     this(dependency, metrics,
-      Array.tabulate(dependency.partitioner.numPartitions)(i => CoalescedPartitionSpec(i, i + 1)))
+      Array.tabulate(dependency.partitioner.numPartitions)(i => CoalescedPartitionSpec(i, i + 1)),
+      false)
   }
 
   dependency.rdd.context.setLocalProperty(
     SortShuffleManager.FETCH_SHUFFLE_BLOCKS_IN_BATCH_ENABLED_KEY,
     SQLConf.get.fetchShuffleBlocksInBatch.toString)
+
+  if (drainPipelinedInput) {
+    require(dependency.isInstanceOf[PipelinedShuffleDependency[_, _, _]])
+    require(partitionSpecs.zipWithIndex.forall {
+      case (CoalescedPartitionSpec(start, end, _), index) => start == index && end == index + 1
+      case _ => false
+    } && partitionSpecs.length == dependency.partitioner.numPartitions,
+      "Batch pipelining requires exactly one reader for every complete reduce partition")
+  }
 
   override def getDependencies: Seq[Dependency[_]] = List(dependency)
 
@@ -251,7 +269,22 @@ class ShuffledRowRDD(
           context,
           sqlMetricsReporter)
     }
-    reader.read().asInstanceOf[Iterator[Product2[Int, InternalRow]]].map(_._2)
+    val rows = reader.read().asInstanceOf[Iterator[Product2[Int, InternalRow]]]
+    if (drainPipelinedInput) {
+      // A join may finish without exhausting both inputs. Complete the transport protocol before
+      // the reader's cleanup listener runs (listeners run in reverse registration order).
+      context.addTaskCompletionListener[Unit] { task =>
+        if (!task.isFailed() && !task.isInterrupted()) {
+          while (rows.hasNext) rows.next()
+        }
+      }
+      // Wait for input before downstream operators allocate their sort buffers or aggregation
+      // maps. Even a small allocation registers this task in execution-memory sharing, reducing
+      // the producers' allowance while this consumer cannot yet process a row. hasNext preserves
+      // the first row and uses the reader's existing interruption and failure handling.
+      rows.hasNext
+    }
+    rows.map(_._2)
   }
 
   override def clearDependencies(): Unit = {

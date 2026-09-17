@@ -22,6 +22,7 @@ import java.util.Properties
 import java.util.concurrent.{CountDownLatch, LinkedBlockingQueue, Semaphore, TimeoutException, TimeUnit}
 
 import scala.concurrent.{ExecutionContext, Future}
+import scala.jdk.CollectionConverters._
 import scala.language.reflectiveCalls
 import scala.reflect.ClassTag
 
@@ -129,7 +130,11 @@ class StreamingShuffleSuite
       errorNotifier: ErrorNotifier = new ErrorNotifier())
     extends StreamingShuffleReader[K, C](handle, context, clientHandler, errorNotifier)
 
-  private class ShuffleGroup[T: ClassTag](sc: SparkContext, mappers: Int, reducers: Int) {
+  private class ShuffleGroup[T: ClassTag](
+      sc: SparkContext,
+      mappers: Int,
+      reducers: Int,
+      clientFactory: Option[TransportClientFactory] = None) {
     assert(SparkEnv.get.pipelinedShuffleManager.isInstanceOf[StreamingShuffleManager])
     assert(SparkEnv.get.streamingShuffleOutputTracker.isDefined)
     SparkEnv.get.streamingShuffleOutputTracker.get
@@ -167,7 +172,8 @@ class StreamingShuffleSuite
     }
     val readers: Array[StreamingShuffleReader[T, T]] = Array.tabulate(reducers) { i =>
       val taskContext = createTaskContext(sc.conf, i)
-      new StreamingShuffleReader[T, T](handle, taskContext) {
+      new StreamingShuffleReader[T, T](handle, taskContext,
+          sharedClientFactory = clientFactory) {
         override def read(): Iterator[Product2[T, T]] = {
 
           val it = super.read()
@@ -1340,33 +1346,37 @@ class StreamingShuffleSuite
     }
   }
 
-  test("client factories are closed and EventLoopGroup threads are cleaned up after read") {
-    withSpark(new SparkContext("local", "StreamingShuffleSuite", sparkConf)) { sc =>
-      val g = new ShuffleGroup[Int](sc, 2, 1)
+  test("client connections close per read while I/O workers follow their owner's lifetime") {
+    for (shared <- Seq(false, true)) {
+      withSpark(new SparkContext("local", "StreamingShuffleSuite", sparkConf)) { sc =>
+        val manager = SparkEnv.get.pipelinedShuffleManager.asInstanceOf[StreamingShuffleManager]
+        val factory = if (shared) Some(manager.sharedClientFactory) else None
+        val workerGroupField = classOf[TransportClientFactory].getDeclaredField("workerGroup")
+        workerGroupField.setAccessible(true)
 
-      g.writers(0).write(Iterator((1, 1), (2, 2)))
-      g.writers(1).write(Iterator((3, 3), (4, 4)))
+        for (_ <- 0 until 2) {
+          val g = new ShuffleGroup[Int](sc, 2, 1, factory)
+          g.writers(0).write(Iterator((1, 1), (2, 2)))
+          g.writers(1).write(Iterator((3, 3), (4, 4)))
+          await(g.read(0)._2) should be(Set((1, 1), (2, 2), (3, 3), (4, 4)))
 
-      await(g.read(0)._2) should be(Set((1, 1), (2, 2), (3, 3), (4, 4)))
-
-      val reader = g.readers(0)
-      val factoriesField = classOf[StreamingShuffleReader[_, _]].getDeclaredFields
-        .find(_.getName.endsWith("clientFactories"))
-        .getOrElse(fail("Could not find clientFactories field via reflection"))
-      factoriesField.setAccessible(true)
-      val factories = factoriesField.get(reader)
-        .asInstanceOf[java.util.concurrent.ConcurrentLinkedQueue[TransportClientFactory]]
-      assert(factories.size() > 0, "Expected at least one client factory")
-
-      val workerGroupField = classOf[TransportClientFactory].getDeclaredField("workerGroup")
-      workerGroupField.setAccessible(true)
-
-      eventually(Timeout(10.seconds)) {
-        factories.forEach { factory =>
-          val workerGroup = workerGroupField.get(factory)
+          val reader = g.readers(0)
+          val workerGroup = workerGroupField.get(reader.clientFactory)
             .asInstanceOf[_root_.io.netty.channel.EventLoopGroup]
-          assert(workerGroup.isTerminated,
-            "TransportClientFactory EventLoopGroup was not shut down after read completed.")
+          eventually(Timeout(10.seconds)) {
+            assert(reader.clientMap.values().asScala.forall(!_.isActive))
+            if (shared) assert(!workerGroup.isShuttingDown)
+            else assert(workerGroup.isTerminated)
+          }
+          SparkEnv.get.streamingShuffleOutputTracker.get.unregisterShuffle(shuffleId)
+        }
+
+        factory.foreach { f =>
+          manager.stop()
+          eventually(Timeout(10.seconds)) {
+            assert(workerGroupField.get(f)
+              .asInstanceOf[_root_.io.netty.channel.EventLoopGroup].isTerminated)
+          }
         }
       }
     }

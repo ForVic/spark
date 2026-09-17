@@ -17,6 +17,8 @@
 
 package org.apache.spark.shuffle.local.pipelined
 
+import java.util.concurrent.atomic.AtomicLong
+
 import scala.reflect.ClassTag
 
 import org.mockito.Mockito.{mock, when}
@@ -24,6 +26,7 @@ import org.mockito.Mockito.{mock, when}
 import org.apache.spark.{HashPartitioner, Partitioner, PipelinedShuffleDependency, SparkConf, SparkContext, SparkEnv, SparkFunSuite, TaskContext, TaskKilledException}
 import org.apache.spark.executor.TempShuffleReadMetrics
 import org.apache.spark.rdd.{RDD, ShuffledRDD}
+import org.apache.spark.scheduler.{SparkListener, SparkListenerTaskEnd}
 import org.apache.spark.shuffle.BaseShuffleHandle
 
 /**
@@ -88,6 +91,20 @@ class PipelinedChannelShuffleSuite extends SparkFunSuite {
       out.foreach { case (idx, k, _) =>
         assert(part.getPartition(k) === idx, s"key $k routed to partition $idx")
       }
+    }
+  }
+
+  test("short channel tasks publish their final shuffle read metrics") {
+    withPipelinedSparkContext(cores = 4) { sc =>
+      val readRecords = new AtomicLong
+      sc.addSparkListener(new SparkListener {
+        override def onTaskEnd(e: SparkListenerTaskEnd): Unit = {
+          readRecords.addAndGet(e.taskMetrics.shuffleReadMetrics.recordsRead)
+        }
+      })
+      assert(repartition(sc, 100, numIn = 2, numOut = 2).length == 100)
+      sc.listenerBus.waitUntilEmpty()
+      assert(readRecords.get() == 100)
     }
   }
 
@@ -411,7 +428,7 @@ class PipelinedChannelShuffleSuite extends SparkFunSuite {
       val ex = intercept[org.apache.spark.SparkException] {
         suffix.collect()
       }
-      assert(ex.getMessage.contains("fully-materialized prefix"),
+      assert(ex.getMessage.contains("every input regular shuffle to be fully materialized"),
         s"expected the unmaterialized-prefix rejection, got: ${ex.getMessage}")
     }
   }

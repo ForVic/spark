@@ -117,6 +117,16 @@ abstract class SerializerInstance {
 
   def serializeStream(s: OutputStream): SerializationStream
 
+  /**
+   * A buffering hint for callers whose destination already batches writes in memory. The wire
+   * format and flush/close contract must remain unchanged. Existing serializers may ignore the
+   * hint; callers must still flush before inspecting or transferring their output buffer.
+   */
+  @Private
+  private[spark] def serializeStream(
+      s: OutputStream,
+      useBuffering: Boolean): SerializationStream = serializeStream(s)
+
   def deserializeStream(s: InputStream): DeserializationStream
 }
 

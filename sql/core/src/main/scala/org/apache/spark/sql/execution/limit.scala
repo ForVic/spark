@@ -312,7 +312,8 @@ case class TakeOrderedAndProjectExec(
     sortOrder: Seq[SortOrder],
     projectList: Seq[NamedExpression],
     child: SparkPlan,
-    offset: Int = 0) extends OrderPreservingUnaryExecNode {
+    offset: Int = 0,
+    pipelined: Boolean = false) extends OrderPreservingUnaryExecNode {
 
   override def output: Seq[Attribute] = {
     projectList.map(_.toAttribute)
@@ -368,8 +369,11 @@ case class TakeOrderedAndProjectExec(
             child.output,
             SinglePartition,
             serializer,
-            writeMetrics),
-          readMetrics)
+            writeMetrics,
+            pipelined = pipelined),
+          readMetrics,
+          Array[ShufflePartitionSpec](CoalescedPartitionSpec(0, 1)),
+          drainPipelinedInput = pipelined)
       }
       singlePartitionRDD.mapPartitionsWithIndexInternal { (idx, iter) =>
         val limited = Utils.takeOrdered(iter.map(_.copy()), limit)(ord)
@@ -396,12 +400,14 @@ case class TakeOrderedAndProjectExec(
     val outputString = truncatedString(output, "[", ",", "]", maxFields)
 
     val offsetStr = if (offset > 0) s" offset=$offset," else ""
-    s"TakeOrderedAndProject(limit=$limit,$offsetStr orderBy=$orderByString, output=$outputString)"
+    val pipelineStr = if (pipelined) ", pipelined=true" else ""
+    s"TakeOrderedAndProject(limit=$limit,$offsetStr orderBy=$orderByString, " +
+      s"output=$outputString$pipelineStr)"
   }
 
   override def stringArgs: Iterator[Any] = {
     super.stringArgs.zipWithIndex.filter {
-      case (0, 4) => false
+      case (0, 4) | (false, 5) => false
       case _ => true
     }.map(_._1)
   }

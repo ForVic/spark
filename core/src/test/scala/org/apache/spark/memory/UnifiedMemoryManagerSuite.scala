@@ -24,12 +24,67 @@ import org.apache.spark.internal.config._
 import org.apache.spark.internal.config.Tests._
 import org.apache.spark.storage.TestBlockId
 import org.apache.spark.storage.memory.MemoryStore
+import org.apache.spark.unsafe.Platform
 import org.apache.spark.util.Utils
 
 class UnifiedMemoryManagerSuite extends MemoryManagerSuite with PrivateMethodTester {
   private val dummyBlock = TestBlockId("--")
 
   private val storageFraction: Double = 0.5
+
+  test("page granularity follows each task reservation and is stable as the pool grows") {
+    for (offHeap <- Seq(false, true)) {
+      val conf = new SparkConf(false)
+        .set(MEMORY_OFFHEAP_ENABLED, offHeap)
+        .set(MEMORY_OFFHEAP_SIZE, 2L << 30)
+      val manager = new UnifiedMemoryManager(conf, 2L << 30, 1L << 30, 4)
+      makeMemoryStore(manager)
+      val header = if (!offHeap && (Utils.isG1GC || Utils.isZGC || Utils.isShenandoahGC)) {
+        Platform.LONG_ARRAY_OFFSET
+      } else {
+        0
+      }
+      val quarterCpu = new TaskMemoryManager(manager, 0,
+        manager.pageSizeBytesForTask(BigDecimal("0.25")))
+      val wholeCpu = new TaskMemoryManager(manager, 1,
+        manager.pageSizeBytesForTask(BigDecimal(1)))
+      assert(quarterCpu.pageSizeBytes() == (4L << 20) - header)
+      assert(wholeCpu.pageSizeBytes() == (16L << 20) - header)
+      assert(manager.pageSizeBytesForTask(BigDecimal(3)) == wholeCpu.pageSizeBytes())
+      assert(manager.pageSizeBytesForTask(BigDecimal("0.000000001")) == (1L << 20) - header)
+
+      val mode = manager.tungstenMemoryMode
+      // Borrow storage memory. Newly admitted tasks must retain the initial sizing basis.
+      try {
+        assert(manager.acquireExecutionMemory(3L << 29, 2, mode) == 3L << 29)
+        assert(manager.pageSizeBytesForTask(BigDecimal("0.25")) == quarterCpu.pageSizeBytes())
+      } finally {
+        manager.releaseAllExecutionMemoryForTask(2)
+      }
+
+      val consumer = new TestMemoryConsumer(quarterCpu, mode)
+      val page = quarterCpu.allocatePage(quarterCpu.pageSizeBytes(), consumer)
+      try {
+        assert(page.size() == (4L << 20) - header)
+      } finally {
+        quarterCpu.freePage(page, consumer)
+        quarterCpu.cleanUpAllAllocatedMemory()
+      }
+    }
+  }
+
+  test("global page sizing uses fractional CPUs and explicit page size overrides task profiles") {
+    val conf = new SparkConf(false).set(CPUS_PER_TASK, BigDecimal("0.25"))
+    val manager = new UnifiedMemoryManager(conf, 2L << 30, 1L << 30, 4)
+    assert(manager.pageSizeBytes == manager.pageSizeBytesForTask(BigDecimal("0.25")))
+    assert(manager.pageSizeBytes < manager.pageSizeBytesForTask(BigDecimal(1)))
+
+    conf.set(BUFFER_PAGESIZE, 2L << 20)
+    val explicit = new UnifiedMemoryManager(conf, 2L << 30, 1L << 30, 4)
+    assert(explicit.pageSizeBytes == 2L << 20)
+    assert(explicit.pageSizeBytesForTask(BigDecimal(1)) == 2L << 20)
+    assert(explicit.pageSizeBytesForTask(BigDecimal("0.25")) == 2L << 20)
+  }
 
   /**
    * Make a [[UnifiedMemoryManager]] and a [[MemoryStore]] with limited class dependencies.

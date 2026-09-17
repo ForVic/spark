@@ -1943,6 +1943,16 @@ package object config {
       .intConf
       .createWithDefault(32 << 20) // 32 MB
 
+  private[spark] val STREAMING_SHUFFLE_REUSE_CLIENT_WORKERS =
+    ConfigBuilder("spark.shuffle.streaming.reuseClientWorkers.enabled")
+      .internal()
+      .doc("Reuse drained connection-worker executors between streaming shuffle readers. " +
+        "Each active reader retains its own work queue and cancellation scope.")
+      .version("4.4.0")
+      .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
+      .booleanConf
+      .createWithDefault(false)
+
   private[spark] val STREAMING_SHUFFLE_NETWORK_BUFFER_SIZE =
     ConfigBuilder("spark.shuffle.streaming.networkBufferSize")
       .doc("Target byte size for each network buffer sent from a streaming shuffle writer to a " +
@@ -2132,8 +2142,8 @@ package object config {
       .doc("When true, before co-scheduling a pipelined-shuffle stage group the DAGScheduler " +
         "checks that the group's total task demand fits in the currently free slots of its " +
         "resource profile (total capacity minus the outstanding -- running plus enqueued -- " +
-        "tasks of other work), and fails the job with CONCURRENT_SCHEDULER_INSUFFICIENT_SLOT " +
-        "rather than co-scheduling a group that cannot fit and deadlocking. Set to false for " +
+        "tasks of other work). Groups wait for occupied slots and fail with " +
+        "CONCURRENT_SCHEDULER_INSUFFICIENT_SLOT if they exceed total capacity. Set to false for " +
         "deployments that admit capacity out-of-band (e.g. a slot reservation), which then own " +
         "admission. Only applies to jobs that use a pipelined shuffle dependency.")
       .version("4.3.0")

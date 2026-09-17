@@ -51,6 +51,7 @@ import org.apache.spark.network.server.TransportChannelHandler;
 import org.apache.spark.network.server.TransportRequestHandler;
 import org.apache.spark.network.server.TransportServer;
 import org.apache.spark.network.server.TransportServerBootstrap;
+import org.apache.spark.network.server.TransportServerFactory;
 import org.apache.spark.network.ssl.SSLFactory;
 import org.apache.spark.network.util.IOMode;
 import org.apache.spark.network.util.NettyUtils;
@@ -180,6 +181,11 @@ public class TransportContext implements Closeable {
 
   public TransportServer createServer() {
     return createServer(0, new ArrayList<>());
+  }
+
+  /** Share I/O workers across servers with independent ports and handlers. */
+  public TransportServerFactory createServerFactory() {
+    return new TransportServerFactory(this);
   }
 
   public TransportChannelHandler initializePipeline(SocketChannel channel, boolean isClient) {

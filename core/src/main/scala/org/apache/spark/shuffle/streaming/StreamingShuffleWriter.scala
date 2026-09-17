@@ -41,7 +41,7 @@ import org.apache.spark.memory.{MemoryConsumer, MemoryMode}
 import org.apache.spark.network.TransportContext
 import org.apache.spark.network.client.TransportClient
 import org.apache.spark.network.netty.SparkTransportConf
-import org.apache.spark.network.server.TransportServer
+import org.apache.spark.network.server.{TransportServer, TransportServerFactory}
 import org.apache.spark.network.shuffle.streaming.{DataMessage, ShuffleChecksum, StreamingShuffleMessage, StreamingShuffleMessageType, TerminationControlMessage}
 import org.apache.spark.scheduler.MapStatus
 import org.apache.spark.serializer.{JavaSerializerInstance, SerializationStream}
@@ -53,7 +53,8 @@ class StreamingShuffleWriter[K, V](
     mapId: Long,
     val context: TaskContext,
     serverHandler: Option[StreamingShuffleServerHandler] = None,
-    private[streaming] val errorNotifier: ErrorNotifier = new ErrorNotifier())
+    private[streaming] val errorNotifier: ErrorNotifier = new ErrorNotifier(),
+    sharedServerFactory: Option[TransportServerFactory] = None)
     extends ShuffleWriter[K, V] with TaskContextAwareLogging {
   assert(SparkEnv.get.streamingShuffleOutputTracker.isDefined)
   // Spark params.
@@ -71,6 +72,15 @@ class StreamingShuffleWriter[K, V](
   private val serializerInstance = streamingShuffleHandle.dependency.serializer.newInstance()
   private val partitioner = streamingShuffleHandle.dependency.partitioner
   private val numPartitions = partitioner.numPartitions
+
+  // A partial result job (for example, executeTake) schedules only some reducers. The
+  // scheduler maps that subset through narrow dependencies before stamping this property.
+  // Never send data or wait for acknowledgements from a reader that will not be started.
+  private val livePartitions = Option(context.getLocalProperty(
+    SparkContext.SPARK_PIPELINED_LIVE_REDUCE_PARTITIONS))
+    .map(_.split(",").filter(_.nonEmpty).map(_.toInt).toSet)
+  private val liveMask = Array.tabulate(numPartitions)(p => livePartitions.forall(_.contains(p)))
+  private val numReaders = liveMask.count(identity)
   private val shuffleWriterId = context.partitionId()
   // Total size of TCP buffers. Use Long math to avoid 32-bit overflow when numPartitions
   // is large (numPartitions * buffer sizes can exceed Int.MaxValue).
@@ -115,6 +125,9 @@ class StreamingShuffleWriter[K, V](
         context,
         errorNotifier))
 
+  private val ownedServerContext = if (sharedServerFactory.isDefined) None else {
+    Some(createServerContext())
+  }
   private[streaming] val server: TransportServer = startShuffleServer()
 
   private val memoryConsumer = new MemoryConsumer(
@@ -126,7 +139,7 @@ class StreamingShuffleWriter[K, V](
   // Runtime state.
 
   // Will reach zero when we've received termination acks from all readers. Public for testing.
-  private[streaming] val allAcksReceived = new CountDownLatch(numPartitions)
+  private[streaming] val allAcksReceived = new CountDownLatch(numReaders)
 
   // Holds per-shard state. Public for testing.
   private[streaming] val shards: Array[ShardState] = Array.tabulate(numPartitions)(ShardState(_))
@@ -146,7 +159,7 @@ class StreamingShuffleWriter[K, V](
     cleanupResources()
   }
 
-  private def startShuffleServer(): TransportServer = {
+  private def createServerContext(): TransportContext = {
     val role = conf.get(EXECUTOR_ID).map { id =>
       if (SparkContext.isDriver(id)) "driver" else "executor"
     }
@@ -154,13 +167,19 @@ class StreamingShuffleWriter[K, V](
     val serverConf = SparkTransportConf.fromSparkConf(
       conf,
       s"streaming-shuffle-writer-${streamingShuffleHandle.shuffleId}-${shuffleWriterId}",
-      conf.get(RPC_IO_THREADS).getOrElse(0), // zero will use default number of cores
+      // Each map task owns a server. An executor-sized default pool per task multiplies
+      // thread creation and shutdown costs by the number of concurrent producers.
+      conf.get(RPC_IO_THREADS).getOrElse(1),
       role)
-    val serverContext = new TransportContext(serverConf, transportServerHandler)
+    new TransportContext(serverConf, transportServerHandler)
+  }
+
+  private def startShuffleServer(): TransportServer = {
     logInfo(log"Creating shuffle server for shuffle writer" +
       log" ${MDC(LogKeys.SHUFFLE_WRITER_ID, shuffleWriterId)}" +
       log" for shuffle ${MDC(LogKeys.SHUFFLE_ID, streamingShuffleHandle.shuffleId)}")
-    val server = serverContext.createServer()
+    val server = sharedServerFactory.map(_.createServer(transportServerHandler))
+      .getOrElse(ownedServerContext.get.createServer())
     val hostname = if (SparkEnv.get.rpcEnv.address != null) {
       // used and not null when running in an actual cluster but may be null for running tests
       SparkEnv.get.rpcEnv.address.host
@@ -185,27 +204,24 @@ class StreamingShuffleWriter[K, V](
   @NotThreadSafe
   private[streaming] case class TimestampedBuffer(buffer: ByteBuf) {
     val serializationStream: SerializationStream =
-      serializerInstance.serializeStream(new ByteBufOutputStream(buffer))
+      serializerInstance.serializeStream(new ByteBufOutputStream(buffer), useBuffering = false)
     private val creationTimeNs = System.nanoTime()
-    private val shuffleChecksum = if (CHECKSUM_ENABLED) new ShuffleChecksum() else null
-
-    // Start from beginning to include serialization stream headers
-    private var lastBufferPosition = 0
 
     def totalByteSize(): Long = buffer.readableBytes()
     def ageMs(): Long = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - creationTimeNs)
 
-    /* Checksum calculation for order-dependent per-row checksums. */
-    def updateChecksum(): Unit = {
-      if (shuffleChecksum != null) {
-        val currentPosition = buffer.writerIndex()
-        val newDataLength = currentPosition - lastBufferPosition
-        shuffleChecksum.updateChecksum(buffer, lastBufferPosition, newDataLength)
-        lastBufferPosition = currentPosition
+    // Called after closing the serializer, while the sender exclusively owns the buffer.
+    // Hash the complete payload once, including stream headers and trailers. Per-row updates
+    // compute the same CRC but allocate a direct-buffer view and invoke CRC32C for every row.
+    def computeChecksum(): Long = {
+      if (CHECKSUM_ENABLED) {
+        val checksum = new ShuffleChecksum()
+        checksum.updateChecksum(buffer, 0, buffer.writerIndex())
+        checksum.getValue
+      } else {
+        0L
       }
     }
-
-    def getChecksumValue(): Long = if (shuffleChecksum != null) shuffleChecksum.getValue else 0L
   }
 
   // The state for each shuffle destination.
@@ -296,8 +312,7 @@ class StreamingShuffleWriter[K, V](
       timestampedBuffer.serializationStream.close()
       val rawBuffer = timestampedBuffer.buffer
       val dataSize = rawBuffer.writerIndex()
-      timestampedBuffer.updateChecksum()
-      val checksumValue = timestampedBuffer.getChecksumValue()
+      val checksumValue = timestampedBuffer.computeChecksum()
       val dataMessage = new DataMessage(shuffleWriterId, id, dataSize, rawBuffer, checksumValue)
 
       // We keep a reference to rawBuffer so we can return it to the pool.
@@ -379,6 +394,7 @@ class StreamingShuffleWriter[K, V](
    */
   private[streaming] def onTerminationAckReceived(
       partitionId: Int, lastSeqNumSeenByReader: Long): Unit = {
+    require(liveMask(partitionId), s"Unexpected acknowledgement from inactive reader $partitionId")
     val lastSeqNumSent = shards(partitionId).lastSentSequenceNum.get()
     if (lastSeqNumSent != lastSeqNumSeenByReader) {
       throw StreamingShuffleManager.streamingShuffleIncorrectSequenceNumber(
@@ -391,10 +407,10 @@ class StreamingShuffleWriter[K, V](
     if (shards(partitionId).terminationAckReceived.compareAndSet(false, true)) {
       allAcksReceived.countDown()
     }
-    val receivedAcks = numPartitions - allAcksReceived.getCount.toInt
+    val receivedAcks = numReaders - allAcksReceived.getCount.toInt
     logInfo(log"Received termination ack from reader ${MDC(LogKeys.SHUFFLE_READER_ID,
       partitionId)}. Now have ${MDC(LogKeys.NUM_TERMINATION_ACKS, receivedAcks)} / ${MDC(
-      LogKeys.NUM_SHUFFLE_READERS, numPartitions)} termination acks")
+      LogKeys.NUM_SHUFFLE_READERS, numReaders)} termination acks")
   }
 
   /**
@@ -408,6 +424,9 @@ class StreamingShuffleWriter[K, V](
     }
     Utils.tryLogNonFatalError {
       server.close()
+    }
+    Utils.tryLogNonFatalError {
+      ownedServerContext.foreach(_.close())
     }
     Utils.tryLogNonFatalError {
       val list = new java.util.ArrayList[ByteBuf]()
@@ -471,58 +490,59 @@ class StreamingShuffleWriter[K, V](
       memoryConsumer.acquireMemory(TOTAL_TCPBUF_BYTES + MAX_BUFFER_BYTES)
       flushThread.start()
       records.foreach { record =>
-        val shard = shards(partitioner.getPartition(record._1))
-        var timestampedBuffer = shard.takeBuffer()
-        if (timestampedBuffer == null) {
-          timestampedBuffer = newBuffer()
-        }
-        val dataStartPos = timestampedBuffer.buffer.writerIndex()
-        val partitionSerializationStream = timestampedBuffer.serializationStream
-        // When UnsafeRowSerializer, the key, record._1, is only used for determining
-        // the partition, and it doesn't need to be sent to the shuffle readers.
-        // However, if JavaSerializer is used (for test mainly), we need to serialize
-        // the key since we will be attempting to read it from the shuffle reader
-        //
-        // TODO we are actually not guaranteeing that a buffer used to send data for a
-        // partition does not exceed BUFFER_SIZE. We currently are not implementing spanning rows
-        // across multiple buffers as it requires interface changes in the serializers
-        if (serializerInstance.isInstanceOf[JavaSerializerInstance]) {
-          partitionSerializationStream.writeKey(record._1.asInstanceOf[Any])
-        }
-        partitionSerializationStream.writeValue(record._2.asInstanceOf[Any])
-        partitionSerializationStream.flush()
+        val partitionId = partitioner.getPartition(record._1)
+        if (liveMask(partitionId)) {
+          val shard = shards(partitionId)
+          var timestampedBuffer = shard.takeBuffer()
+          if (timestampedBuffer == null) {
+            timestampedBuffer = newBuffer()
+          }
+          val dataStartPos = timestampedBuffer.buffer.writerIndex()
+          val partitionSerializationStream = timestampedBuffer.serializationStream
+          // When UnsafeRowSerializer, the key, record._1, is only used for determining
+          // the partition, and it doesn't need to be sent to the shuffle readers.
+          // However, if JavaSerializer is used (for test mainly), we need to serialize
+          // the key since we will be attempting to read it from the shuffle reader
+          //
+          // TODO we are actually not guaranteeing that a buffer used to send data for a
+          // partition does not exceed BUFFER_SIZE. We currently are not implementing spanning rows
+          // across multiple buffers as it requires interface changes in the serializers
+          if (serializerInstance.isInstanceOf[JavaSerializerInstance]) {
+            partitionSerializationStream.writeKey(record._1.asInstanceOf[Any])
+          }
+          partitionSerializationStream.writeValue(record._2.asInstanceOf[Any])
+          partitionSerializationStream.flush()
 
-        // A single row is never split across buffers (see the TODO above), so an oversized row
-        // grows its buffer past BUFFER_SIZE and inflates the tracked memory budget. Warn
-        // (throttled) so operators can raise the block size or writer memory instead of overshoot.
-        // When a row trips both thresholds the more severe memory warning takes precedence.
-        val rowSize = timestampedBuffer.buffer.writerIndex() - dataStartPos
-        if (rowSize > MAX_BUFFER_BYTES / 4) {
-          hugeRowWarningThrottler(
-            log"Row size ${MDC(LogKeys.BYTE_SIZE, rowSize)} is >25% of " +
-            log"total writer memory " +
-            log"${MDC(LogKeys.MEMORY_THRESHOLD_SIZE, MAX_BUFFER_BYTES)}. " +
-            log"Consider increasing the maximum writer memory.")
-        } else if (rowSize > largeRowThreshold) {
-          largeRowWarningThrottler(
-            log"Row size ${MDC(LogKeys.BYTE_SIZE, rowSize)} is larger than the block size " +
-            log"${MDC(LogKeys.MEMORY_THRESHOLD_SIZE, largeRowThreshold)}. " +
-            log"Consider increasing the block size.")
-        }
+          // A single row is never split across buffers (see the TODO above), so an oversized row
+          // grows its buffer past BUFFER_SIZE and inflates the tracked memory budget. Warn
+          // (throttled) so operators can raise the block size or writer memory.
+          // When a row trips both thresholds the more severe memory warning takes precedence.
+          val rowSize = timestampedBuffer.buffer.writerIndex() - dataStartPos
+          if (rowSize > MAX_BUFFER_BYTES / 4) {
+            hugeRowWarningThrottler(
+              log"Row size ${MDC(LogKeys.BYTE_SIZE, rowSize)} is >25% of " +
+              log"total writer memory " +
+              log"${MDC(LogKeys.MEMORY_THRESHOLD_SIZE, MAX_BUFFER_BYTES)}. " +
+              log"Consider increasing the maximum writer memory.")
+          } else if (rowSize > largeRowThreshold) {
+            largeRowWarningThrottler(
+              log"Row size ${MDC(LogKeys.BYTE_SIZE, rowSize)} is larger than the block size " +
+              log"${MDC(LogKeys.MEMORY_THRESHOLD_SIZE, largeRowThreshold)}. " +
+              log"Consider increasing the block size.")
+          }
 
-        timestampedBuffer.updateChecksum()
-
-        // Flush immediately if the buffer is almost full or stale.
-        if (timestampedBuffer.totalByteSize() < BUFFER_SIZE * 9 / 10 &&
-            timestampedBuffer.ageMs() < MAX_BUFFERING_TIME_MS) {
-          shard.putBuffer(timestampedBuffer)
-        } else {
-          shard.send(timestampedBuffer)
-          throwErrorIfExists()
+          // Flush immediately if the buffer is almost full or stale.
+          if (timestampedBuffer.totalByteSize() < BUFFER_SIZE * 9 / 10 &&
+              timestampedBuffer.ageMs() < MAX_BUFFERING_TIME_MS) {
+            shard.putBuffer(timestampedBuffer)
+          } else {
+            shard.send(timestampedBuffer)
+            throwErrorIfExists()
+          }
         }
       }
       isWriteFinished.countDown()
-      shards.foreach(_.close())
+      shards.indices.filter(liveMask).foreach(p => shards(p).close())
       logInfo(log"StreamingShuffleWriter finished writing data and termination messages for " +
         log"shuffle writer ${MDC(LogKeys.SHUFFLE_WRITER_ID, shuffleWriterId)}. Shutting down now.")
       // Wait for all termination acks. This has no wall-clock timeout by design, and that is

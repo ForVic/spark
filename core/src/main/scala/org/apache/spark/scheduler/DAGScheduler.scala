@@ -187,6 +187,14 @@ private[spark] class DAGScheduler(
       delayedTaskCompletionEvents: ListBuffer[CompletionEvent] = new ListBuffer[CompletionEvent])
   private[scheduler] val dependentStageMap = new HashMap[Stage, DependentStageInfo]
 
+  // Registered jobs with groups still awaiting admission. Keeping them as ActiveJobs makes
+  // cancellation, job groups, SQL cleanup and shutdown use the ordinary job lifecycle.
+  private[scheduler] val waitingPipelinedJobs = new mutable.LinkedHashSet[ActiveJob]
+
+  private[scheduler] val pipelinedExecutionPlans =
+    new mutable.LinkedHashMap[ActiveJob, PipelinedExecutionPlan]
+  private val admissionBlockedStages = new HashSet[Stage]
+
   // Whether we have already logged that the pipelined-group slot check is disabled. Only the
   // (single-threaded) event loop touches this, so a plain var is safe. Limits the warning to once
   // per scheduler rather than once per submitted batch job.
@@ -830,9 +838,8 @@ private[spark] class DAGScheduler(
    * Group-level idioms are handled elsewhere, since they are properties of the group rather than a
    * single producer stage: fan-out (a producer with more than one consumer) and a group with a
    * non-default resource profile are rejected up front at job submission by
-   * `checkPipelinedGroupsSupportedInRDDGraph` (before any stage is created). A regular shuffle
-   * internal to a group does not arise for the all-pipelined job shape (groups are split at
-   * regular-shuffle boundaries) and so is not checked.
+   * `checkPipelinedGroupsSupportedInRDDGraph` (before any stage is created).
+   * `PipelinedExecutionPlan` validates durable edges when forming execution groups.
    */
   private def checkPipelinedProducerSupported(shuffleDep: ShuffleDependency[_, _, _]): Unit = {
     if (!shuffleDep.isInstanceOf[PipelinedShuffleDependency[_, _, _]]) {
@@ -1156,170 +1163,56 @@ private[spark] class DAGScheduler(
       val hasPipelined = rdd.dependencies.exists {
         case _: PipelinedShuffleDependency[_, _, _] => true
         case dep =>
-          enqueue(dep.rdd)
+          if (!isMaterializedShuffle(dep)) enqueue(dep.rdd)
           false
       }
       !hasPipelined // keep traversing while none found; stop (return false) when one is found
     }
   }
 
-  /**
-   * Shape of the shuffle boundaries in the RDD graph rooted at a job's final RDD, computed by
-   * [[classifyJobShuffleShape]] before any stage is created (so an unsupported job is rejected
-   * fail-fast with no partial scheduler state).
-   *
-   * The supported shapes are:
-   *  - all-regular (`hasPipelined` false, nothing pipelined anywhere);
-   *  - all-pipelined (`hasPipelined` true, no regular boundary anywhere);
-   *  - MATERIALIZED-PREFIX MIXED: pipelined shuffles in the region reachable from the final RDD
-   *    without crossing a regular shuffle, where every regular boundary at the edge of that
-   *    region is FULLY MATERIALIZED (all map outputs registered with the MapOutputTracker) and
-   *    no pipelined shuffle sits below any regular boundary. The materialized prefix never
-   *    re-runs, so the job executes exactly like an all-pipelined job whose leaves read
-   *    already-materialized shuffle data; gang admission demand (final stage + suffix producers)
-   *    is unchanged. This is the shape adaptive execution produces: prior map-stage jobs
-   *    materialize the prefix stages, and the final job runs the pipelined tail.
-   *
-   * An UNMATERIALIZED regular boundary in a pipelined job stays rejected: its stage would have to
-   * run while gang-admitted producers already hold slots (blocked on transport backpressure
-   * waiting for consumers), and admission does not account for the prefix's slots -- the prefix
-   * could be starved and deadlock the group. Sequencing the prefix before the gang is future
-   * work. A pipelined shuffle BELOW a regular boundary is also rejected: it is not part of the
-   * suffix group, and (if the boundary were unmaterialized) would have to run under a regime the
-   * group machinery does not cover.
-   */
-  private[scheduler] case class JobShuffleShape(
-      hasPipelined: Boolean,
-      hasUnmaterializedRegularBoundary: Boolean,
-      hasPipelinedBelowRegular: Boolean) {
-    /** Mixed in a way the scheduler does not support (see class doc). */
-    def isUnsupportedMix: Boolean =
-      hasPipelinedBelowRegular || (hasPipelined && hasUnmaterializedRegularBoundary)
+  /** A completed regular shuffle terminates the runnable group's lineage. */
+  private def isMaterializedShuffle(dep: Dependency[_]): Boolean = dep match {
+    case _: PipelinedShuffleDependency[_, _, _] => false
+    case sd: ShuffleDependency[_, _, _] =>
+      mapOutputTracker.containsShuffle(sd.shuffleId) &&
+        mapOutputTracker.getNumAvailableOutputs(sd.shuffleId) == sd.rdd.partitions.length
+    case _ => false
   }
 
-  /**
-   * Which KINDS of shuffle boundary the RDD graph rooted at `finalRDD` contains: any
-   * [[PipelinedShuffleDependency]], and any regular (non-pipelined) `ShuffleDependency`. Narrow
-   * dependencies are not boundaries and are ignored. Walks the RDD graph directly (before any stage
-   * exists) over the shared `traverseRDDGraph`, whose visited set is keyed on the RDD alone -- so
-   * this pass allocates nothing per visit.
-   *
-   * This is the cheap pre-pass for [[classifyJobShuffleShape]]: a job with only one kind cannot be
-   * an unsupported mix, so the precise (and more expensive) below-regular analysis is only needed
-   * when both kinds are present.
-   */
-  private[scheduler] def classifyJobShuffleKinds(finalRDD: RDD[_]): (Boolean, Boolean) = {
-    var hasPipelined = false
-    var hasRegular = false
-    traverseRDDGraph(finalRDD) { (rdd, enqueue) =>
-      rdd.dependencies.foreach { dep =>
-        dep match {
-          case _: PipelinedShuffleDependency[_, _, _] => hasPipelined = true
-          case _: ShuffleDependency[_, _, _] => hasRegular = true
-          case _ => // narrow dependency: not a boundary
-        }
-        // Descend through every edge (shuffle and narrow) so a pipelined boundary behind a regular
-        // one -- or vice versa -- anywhere in the graph is still detected. traverseRDDGraph dedups.
-        enqueue(dep.rdd)
+  /** Validate an execution graph, regardless of whether it returns rows or shuffle statistics. */
+  private def preparePipelinedJob(
+      jobId: Int,
+      finalRDD: RDD[_],
+      listener: JobListener): Option[Boolean] = {
+    try {
+      val hasPipelined = rddGraphHasPipelinedDependency(finalRDD)
+      if (hasPipelined) {
+        if (rejectUnsupportedPipelinedJob(jobId, finalRDD, listener)) return None
+        checkPipelinedGroupsSupportedInRDDGraph(finalRDD)
       }
+      Some(hasPipelined)
+    } catch {
+      case e: Exception =>
+        listener.jobFailed(e)
+        None
     }
-    (hasPipelined, hasRegular)
   }
 
-  /** Classify `finalRDD`'s shuffle graph; see [[JobShuffleShape]] for the shape semantics. */
-  private[scheduler] def classifyJobShuffleShape(finalRDD: RDD[_]): JobShuffleShape = {
-    // Cheap pre-pass first: which KINDS of boundary the graph has, over the shared
-    // `traverseRDDGraph` (a HashSet[RDD] visited set, no per-visit allocation). Only a job with
-    // BOTH kinds can be an unsupported mix, and only then are the two below-regular facts
-    // meaningful:
-    //   - all-regular  (no pipelined dep)  => nothing can be pipelined-below-regular;
-    //   - all-pipelined (no regular dep)   => no regular boundary to be below, or to materialize.
-    // So every job that is not mixed -- which is EVERY job on a deployment that never enables the
-    // feature -- costs exactly what it costs without this feature, instead of paying for the
-    // (RDD, Boolean)-keyed two-context walk and the boundary map below.
-    val (hasPipelinedKind, hasRegularKind) = classifyJobShuffleKinds(finalRDD)
-    if (!hasPipelinedKind || !hasRegularKind) {
-      return JobShuffleShape(
-        hasPipelined = hasPipelinedKind,
-        hasUnmaterializedRegularBoundary = false,
-        hasPipelinedBelowRegular = false)
-    }
-    var hasPipelined = false
-    var pipelinedBelow = false
-    // Frontier regular shuffle boundaries: those reachable from the final RDD WITHOUT crossing
-    // another regular boundary, deduped by shuffle ID. Only these matter for the materialization
-    // check (a regular boundary below another one is never a runnable suffix member).
-    val regularBoundaries = new HashMap[Int, ShuffleDependency[_, _, _]]
-
-    // ONE walk, carrying `belowRegular` (true once the path from the final RDD has crossed a
-    // regular boundary), computes hasPipelined and pipelinedBelow together -- replacing the old
-    // per-boundary rddGraphHasPipelinedDependency re-walks (O(K x graph) on shared ancestors).
-    // A node reachable BOTH above and below a regular boundary must be explored in BOTH contexts:
-    // a pipelined dep under it counts as pipelinedBelow on the below path but not on the above
-    // path. So the visited set is keyed on (RDD, belowRegular), NOT on the RDD alone -- keying on
-    // the RDD alone would let the first-reached context win and drop the other, missing a
-    // pipelined-below-regular dep (a wrongly-accepted job). A node is thus visited at most twice,
-    // keeping the cost O(graph) rather than O(K x graph). hasPipelined is set only above a regular
-    // boundary, matching the old walk (which stopped at boundaries): a below-boundary pipelined
-    // dep is the pipelinedBelow reject case, never a runnable group member.
-    val visited = new HashSet[(RDD[_], Boolean)]
-    val stack = new ListBuffer[(RDD[_], Boolean)]
-    stack += ((finalRDD, false))
-    while (stack.nonEmpty) {
-      val entry = stack.remove(0)
-      val rdd = entry._1
-      val belowRegular = entry._2
-      if (visited.add(entry)) {
-        rdd.dependencies.foreach {
-          case pd: PipelinedShuffleDependency[_, _, _] =>
-            if (belowRegular) pipelinedBelow = true else hasPipelined = true
-            stack.prepend((pd.rdd, belowRegular))
-          case sd: ShuffleDependency[_, _, _] =>
-            // A frontier boundary only when not already below one; descend with belowRegular set.
-            if (!belowRegular) regularBoundaries.getOrElseUpdate(sd.shuffleId, sd)
-            stack.prepend((sd.rdd, true))
-          case narrowDep =>
-            stack.prepend((narrowDep.rdd, belowRegular))
-        }
-      }
-    }
-
-    // The materialization check only matters for a pipelined job: `isUnsupportedMix` consumes
-    // `hasUnmaterializedRegularBoundary` only when `hasPipelined` is true (a pipelined shuffle
-    // below an unmaterialized regular boundary is the rejected shape). A job with no pipelined
-    // dependency -- every job on a feature-off deployment -- would otherwise pay K
-    // getNumAvailableOutputs lookups (a read-locked shuffleStatuses count) for a value never read,
-    // on the single-threaded event loop. So skip the loop entirely unless the walk saw a pipelined
-    // dependency; a non-pipelined job reports hasUnmaterialized = false (unused).
-    var hasUnmaterialized = false
-    if (hasPipelined) {
-      regularBoundaries.values.foreach { sd =>
-        // Materialized means every MAP partition has a registered output: the tracker counts map
-        // outputs, so compare against the producer RDD's partition count (matching how
-        // ShuffleMapStage.isAvailable derives completeness), not the reducer-side partitioner.
-        // This is a point-in-time check at job submission. If a materialized prefix's output were
-        // LOST after this classification but before the pipelined suffix finished (executor loss),
-        // the prefix would need to re-run while the gang holds all slots -- the very deadlock this
-        // shape check forbids. That is safe here for two reasons: (1) the only supported deployment
-        // is single-executor local mode, where executor loss does not occur in normal operation;
-        // and (2) if a FetchFailed did strip the prefix, handleTaskCompletion routes it to a
-        // WHOLE-GROUP abort (the failing stage is a pipelined group member), not a lone-stage
-        // resubmit into the held slots. A caller must rematerialize lost prefixes before retrying;
-        // the SQL channel rules exclude this mixed shape.
-        if (mapOutputTracker.getNumAvailableOutputs(sd.shuffleId) != sd.rdd.partitions.length) {
-          hasUnmaterialized = true
-        }
-      }
-    }
-    JobShuffleShape(hasPipelined, hasUnmaterialized, pipelinedBelow)
+  private def pipelinedJobProperties(
+      jobId: Int,
+      properties: Properties,
+      hasPipelined: Boolean): Properties = {
+    if (!hasPipelined || !pipelinedManagerWantsLiveReduceHints) return properties
+    val copy = Option(Utils.cloneProperties(properties)).getOrElse(new Properties())
+    copy.setProperty(SparkContext.SPARK_PIPELINED_RUN_EPOCH, jobId.toString)
+    copy
   }
 
   /**
    * Reject a job that uses a pipelined shuffle in combination with a cluster feature that a
    * pipelined group cannot support. Checked up front, before any stage is created, so a rejection
-   * leaves no partial scheduler state. Used by the result-job path (handleJobSubmitted); the
-   * map-stage-job path rejects a pipelined dependency outright (see handleMapStageSubmitted), which
-   * subsumes these. Returns true (and fails the job via `listener`) if rejected; false otherwise.
+   * leaves no partial scheduler state. Used by both result and map-stage submissions. Returns
+   * true (and fails the job via `listener`) if rejected; false otherwise.
    * The RDD-graph walk runs only when a relevant feature is enabled and is inert for jobs without a
    * pipelined dependency.
    *
@@ -1387,11 +1280,8 @@ private[spark] class DAGScheduler(
    *    group is required to run on the default profile; any member with an explicit non-default
    *    profile is rejected. Per-profile accounting is a follow-up.
    *
-   * (The remaining group-level case -- a regular shuffle internal to a group -- is a structural
-   * invariant that does not arise for the prefix -> pipelined-group -> suffix shapes targeted here:
-   * groups are split at regular-shuffle boundaries. The producer-side idioms -- barrier, DRA,
-   * indeterminate, checksum, push-merge -- are rejected in checkPipelinedProducerSupported at stage
-   * creation, where a producer-only throw leaves no partial state.)
+   * PipelinedExecutionPlan rejects a regular dependency internal to a live-connected group.
+   * Producer-side restrictions are checked at stage creation.
    */
   private def checkPipelinedGroupsSupportedInRDDGraph(finalRDD: RDD[_]): Unit = {
     // Walk the whole RDD graph once, collecting for each pipelined shuffleId the distinct consumer
@@ -1406,7 +1296,7 @@ private[spark] class DAGScheduler(
         reliablyCheckpointed += rdd
       }
       // An RDD's EFFECTIVE profile is its explicit one, or the default when unset. The slot check
-      // measures capacity against the default profile (see rejectUnadmittablePipelinedGroup), so
+      // measures capacity against the default profile (see submitJobFinalStage), so
       // the whole group must run on the default profile; any explicit non-default profile on a
       // member makes the group span profiles (against the default the rest use) and is rejected.
       val rp = rdd.getResourceProfile()
@@ -1418,8 +1308,8 @@ private[spark] class DAGScheduler(
           consumersByShuffleId.getOrElseUpdate(pd.shuffleId, new HashSet[Int]) += rdd.id
           producerRoots += pd.rdd
           enqueue(pd.rdd)
-        case dep =>
-          enqueue(dep.rdd)
+        case dep if !isMaterializedShuffle(dep) => enqueue(dep.rdd)
+        case _ =>
       }
     }
     if (consumersByShuffleId.values.exists(_.size > 1)) {
@@ -1544,10 +1434,15 @@ private[spark] class DAGScheduler(
                 }
                 for ((k, v) <- shuffleIdToMapStage.find(_._2 == stage)) {
                   shuffleIdToMapStage.remove(k)
+                  if (isPipelinedProducer(stage)) {
+                    // Live writer addresses belong to this run, not to retained RDD lineage.
+                    sc.env.streamingShuffleOutputTracker.foreach(_.unregisterShuffle(k))
+                  }
                 }
                 if (waitingStages.contains(stage)) {
                   logDebug("Removing stage %d from waiting set.".format(stageId))
                   waitingStages -= stage
+                  admissionBlockedStages -= stage
                 }
                 if (failedStages.contains(stage)) {
                   logDebug("Removing stage %d from failed set.".format(stageId))
@@ -1594,7 +1489,9 @@ private[spark] class DAGScheduler(
    * @param job The job whose state to cleanup.
    */
   private def cleanupStateForJobAndIndependentStages(job: ActiveJob): Unit = {
-    if (job.hasPipelinedDependency && pipelinedManagerWantsLiveReduceHints) {
+    waitingPipelinedJobs.remove(job)
+    pipelinedExecutionPlans.remove(job)
+    if (job.hasPipelinedDependency) {
       sc.env.pipelinedShuffleManager.endRun(job.jobId)
     }
     cleanupStagesForJob(job.jobId)
@@ -1850,7 +1747,7 @@ private[spark] class DAGScheduler(
     // a context-wide cancellation, not because it failed on its own, so attribute the reason when
     // the caller supplied one.
     val updatedReason = reason.getOrElse(DAGScheduler.DEFAULT_CANCEL_ALL_JOBS_REASON)
-    runningStages.map(_.firstJobId).foreach(handleJobCancellation(_, Option(updatedReason)))
+    activeJobs.toSeq.foreach(job => handleJobCancellation(job.jobId, Option(updatedReason)))
     // Also fail the barrier jobs deferred for a slot-check retry: they are registered nowhere
     // else, and their pending re-posts are dropped once the entries are marked cancelled.
     deferredBarrierJobs.keySet().forEach { jobId =>
@@ -1955,11 +1852,8 @@ private[spark] class DAGScheduler(
    * producer/consumer relationship check `child.parents.contains(stage)` separately.
    */
   /**
-   * Whether the configured pipelined manager consumes the driver's live-reduce-partition hint and
-   * per-run epoch (see `PipelinedShuffleManager.supportsLiveReducePartitionHints`). False for the
-   * RPC streaming transport, whose writer reads neither -- so for a Real-Time Mode job the
-   * scheduler skips computing and stamping them, and skips the partial-read abort whose remedy
-   * (disabling the batch SQL flag) does not apply to it.
+   * Whether the configured transport consumes the driver's live-reduce-partition hint and
+   * per-run epoch (see `PipelinedShuffleManager.supportsLiveReducePartitionHints`).
    */
   private def pipelinedManagerWantsLiveReduceHints: Boolean = {
     val mgr = sc.env.pipelinedShuffleManager
@@ -2105,102 +1999,98 @@ private[spark] class DAGScheduler(
     memo
   }
 
-  /**
-   * The total concurrent-task demand of a pipelined job's group, computed from the RDD graph
-   * BEFORE any stage is created (so a rejection based on it leaves no partial scheduler state,
-   * exactly as the barrier slot check and the speculation/DA reject do). A pipelined job's group
-   * is the final result stage plus every pipelined producer; a materialized-prefix mixed job (see
-   * JobShuffleShape) contributes no additional members, since its regular prefix never re-runs
-   * and (by the shape check) has no pipelined shuffle below it. Each member's task count is its
-   * RDD's partition count (`rdd.partitions.length`), matching how `createShuffleMapStage` derives
-   * `numTasks`. `finalNumPartitions` is the result stage's task count (the number of partitions
-   * the job runs, which may be a subset of `finalRDD.partitions`).
-   *
-   * Count each producer once per SHUFFLE ID, matching what execution schedules: one stage is
-   * created per shuffle ID (`getOrCreateShuffleMapStage`), not per dependency edge. A fan-out or
-   * diamond graph references one `PipelinedShuffleDependency` from more than one consumer RDD, so
-   * charging its producer per edge would over-count and could reject a group whose stages actually
-   * fit. Dedup on `shuffleId`, not `pd.rdd`: two distinct dependencies can share a producer RDD yet
-   * carry distinct shuffle IDs and produce distinct stages, and both must be counted.
-   */
-  private def pipelinedJobConcurrentTaskDemand(finalRDD: RDD[_], finalNumPartitions: Int): Int = {
-    var demand = finalNumPartitions
-    val countedShuffleIds = new HashSet[Int]
-    traverseRDDGraph(finalRDD) { (rdd, enqueue) =>
-      rdd.dependencies.foreach {
-        case pd: PipelinedShuffleDependency[_, _, _] =>
-          if (countedShuffleIds.add(pd.shuffleId)) {
-            demand += pd.rdd.partitions.length
-          }
-        case _ => // narrow deps are not boundaries; a regular dep is a materialized prefix
-                  // boundary (JobShuffleShape), whose stages never run and are not members
-      }
-      rdd.dependencies.foreach(dep => enqueue(dep.rdd))
+  /** Register an execution graph; admission is per live group, independent of SQL query stages. */
+  private def submitJobFinalStage(job: ActiveJob): Unit = {
+    if (!job.hasPipelinedDependency) {
+      submitStage(job.finalStage)
+      return
     }
-    demand
+    try {
+      val plan = new PipelinedExecutionPlan(job)
+      val capacity = maxConcurrentTasksForProfile(ResourceProfile.DEFAULT_RESOURCE_PROFILE_ID)
+      val largestGroup = plan.groups.filter(_.pipelined).map(_.taskCount).maxOption.getOrElse(0L)
+      if (sc.conf.get(config.PIPELINED_GROUP_SLOT_CHECK_ENABLED) && largestGroup > capacity) {
+        throw new SparkException(
+          errorClass = "CONCURRENT_SCHEDULER_INSUFFICIENT_SLOT",
+          messageParameters = scala.collection.immutable.Map(
+            "numTasks" -> largestGroup.toString, "numSlots" -> capacity.toString),
+          cause = null)
+      }
+      pipelinedExecutionPlans(job) = plan
+      waitingPipelinedJobs += job
+      submitWaitingPipelinedJobs()
+    } catch {
+      case e: Exception => failJobAndIndependentStages(job, e)
+    }
   }
 
   /**
-   * Up-front gang admission for a pipelined job, checked BEFORE any stage exists. A pipelined
-   * job's runnable stage graph is one pipelined group (an unsupported mix is already rejected,
-   * and a materialized-prefix mixed job's regular stages never run -- see JobShuffleShape), so
-   * its full demand is known up front and the group is ready to admit immediately. Checking here
-   * (rather than in `submitStage` once a producer is already running) is true all-or-nothing gang
-   * admission: the whole group is admitted, or the job is failed before any member runs, so a
-   * member is never left running while a sibling cannot get slots -- and, like the barrier slot
-   * check, a rejection leaves no partial scheduler state.
-   *
-   * Free-slot accounting: demand vs. total capacity (`maxNumConcurrentTasks` for the default
-   * profile -- a group is required to be single-profile) minus what OTHER work (other jobs) has
-   * outstanding -- running plus enqueued -- in that profile. Counting enqueued, not just running,
-   * tasks charges a busy neighbor's queued backlog against capacity too, so a group is not admitted
-   * against slots other work is already committed to. Fails the job via `listener` with no retry --
-   * a transient shortfall is the caller's to retry (e.g. the streaming batch loop reruns it).
-   * Returns true (job failed) if it does not fit.
-   *
-   * The likeness to barrier's slot check is only that both reject before any stage is created
-   * (leaving no partial state) and compute demand from the RDD graph. Retry behavior differs
-   * deliberately: barrier RE-POSTS the job and re-runs its check on a timer up to
-   * `spark.scheduler.barrier.maxConcurrentTasksCheck.maxFailures` times; pipelined admission is
-   * TERMINAL (one check, then fail), delegating transient-shortfall retry to the caller.
-   *
-   * The check can be turned off with `spark.scheduler.pipelinedGroup.slotCheck.enabled=false` (for
-   * deployments that admit capacity out-of-band, e.g. via a slot reservation).
+   * Reserve a group's unfinished input groups as well when they can co-fit. Otherwise work from
+   * smaller ancestor groups. Reservations include consumers waiting for a materialized sibling;
+   * unrelated work must not take their future slots while the live producers are back-pressured.
    */
-  private def rejectUnadmittablePipelinedGroup(
-      jobId: Int, finalRDD: RDD[_], partitions: Array[Int], listener: JobListener): Boolean = {
-    if (!sc.conf.get(config.PIPELINED_GROUP_SLOT_CHECK_ENABLED)) {
-      // The only deadlock-prevention check for gang admission is off. Legitimate only when the
-      // deployment admits capacity out-of-band (e.g. a slot reservation); otherwise a pipelined
-      // group that cannot co-fit will be gang-scheduled and can deadlock. Warn once so this is
-      // never a silent state.
-      if (!warnedPipelinedSlotCheckDisabled) {
-        warnedPipelinedSlotCheckDisabled = true
-        logWarning(log"${MDC(CONFIG, config.PIPELINED_GROUP_SLOT_CHECK_ENABLED.key)}=false: " +
-          log"pipelined-group gang admission is NOT checking free slots. This is safe only if " +
-          log"capacity is reserved out-of-band; otherwise a group that cannot co-fit may deadlock.")
-      }
-      return false
+  private[scheduler] def submitWaitingPipelinedJobs(): Unit = {
+    val rpId = ResourceProfile.DEFAULT_RESOURCE_PROFILE_ID
+    val checkSlots = sc.conf.get(config.PIPELINED_GROUP_SLOT_CHECK_ENABLED)
+    if (!checkSlots && waitingPipelinedJobs.nonEmpty && !warnedPipelinedSlotCheckDisabled) {
+      warnedPipelinedSlotCheckDisabled = true
+      logWarning(log"${MDC(CONFIG, config.PIPELINED_GROUP_SLOT_CHECK_ENABLED.key)}=false: " +
+        log"pipelined execution requires capacity to be reserved out-of-band")
     }
-    val rp = sc.resourceProfileManager.defaultResourceProfile
-    val demand = pipelinedJobConcurrentTaskDemand(finalRDD, partitions.length)
-    val totalSlots = maxConcurrentTasksForProfile(rp.id)
-    // No stage of this job exists yet, so it has no outstanding tasks of its own to exclude; only
-    // other concurrent jobs' outstanding demand is charged, resource-profile-scoped.
-    val outstandingForOthers = outstandingTasksForOtherWork(rp.id, Set.empty)
-    val freeSlots = math.max(0, totalSlots - outstandingForOthers)
-    if (demand > freeSlots) {
-      logWarning(log"Rejecting job ${MDC(JOB_ID, jobId)}: pipelined stage group needs " +
-        log"${MDC(NUM_TASKS, demand)} concurrent task slots but only " +
-        log"${MDC(NUM_SLOTS, freeSlots)} are free")
-      listener.jobFailed(new SparkException(
-        errorClass = "CONCURRENT_SCHEDULER_INSUFFICIENT_SLOT",
-        messageParameters = scala.collection.immutable.Map(
-          "numTasks" -> demand.toString, "numSlots" -> freeSlots.toString),
-        cause = null))
-      true
+    var canAdmit = true
+    while (waitingPipelinedJobs.nonEmpty && canAdmit) {
+      val job = waitingPipelinedJobs.head
+      val plan = pipelinedExecutionPlans(job)
+      val capacity = maxConcurrentTasksForProfile(rpId)
+      if (checkSlots && plan.pendingGroups.exists(g => g.pipelined && g.taskCount > capacity)) {
+        failJobAndIndependentStages(job, new SparkException(
+          s"A pipelined group no longer fits the cluster's $capacity task slots"))
+      } else {
+        val reservations = pipelinedExecutionPlans.valuesIterator
+          .flatMap(_.reservedGroups).toSeq
+        val reservedTasks = pipelinedExecutionPlans.valuesIterator
+          .map(_.reservedTaskCount).sum
+        val reservedStageIds = reservations.flatMap(_.stages.map(_.id)).toSet
+        val candidate = plan.pendingGroups.iterator.map(plan.admissionClosure).find { groups =>
+          val stageIds = reservedStageIds ++ groups.flatMap(_.stages.map(_.id))
+          val otherTasks = outstandingTasksForOtherWork(rpId, stageIds)
+          !checkSlots || reservedTasks + groups.map(_.reservation).sum +
+            otherTasks <= capacity
+        }
+        candidate match {
+          case Some(groups) =>
+            if (!plan.started) sc.env.pipelinedShuffleManager.startRun(job.jobId)
+            plan.admit(groups)
+            if (plan.pendingGroups.isEmpty) waitingPipelinedJobs.remove(job)
+            groups.flatMap(_.stages).distinct.sortBy(_.id).foreach { stage =>
+              if (stageIdToStage.contains(stage.id)) {
+                waitingStages -= stage
+                admissionBlockedStages -= stage
+                submitStage(stage)
+              }
+            }
+          case None => canAdmit = false
+        }
+      }
+    }
+    // Stages held only for a reservation can resume once every reserved task set has been
+    // submitted (then TaskScheduler accounts for it), or the owning group has completed.
+    admissionBlockedStages.toSeq.sortBy(_.firstJobId).foreach { stage =>
+      if (!isStageAdmissionBlocked(stage)) {
+        admissionBlockedStages -= stage
+        waitingStages -= stage
+        if (stageIdToStage.contains(stage.id)) submitStage(stage)
+      }
+    }
+  }
+
+  private def isStageAdmissionBlocked(stage: Stage): Boolean = {
+    if (pipelinedExecutionPlans.isEmpty) return false
+    val owners = pipelinedExecutionPlans.valuesIterator.filter(_.contains(stage)).toSeq
+    if (owners.nonEmpty) {
+      !owners.exists(_.isAdmitted(stage))
     } else {
-      false
+      pipelinedExecutionPlans.valuesIterator.exists(_.hasUnsubmittedStages(runningStages))
     }
   }
 
@@ -2384,6 +2274,9 @@ private[spark] class DAGScheduler(
       }
     }
     deferredBarrierJobs.clear()
+    waitingPipelinedJobs.clear()
+    pipelinedExecutionPlans.clear()
+    admissionBlockedStages.clear()
   }
 
   private[scheduler] def handleGetTaskResult(taskInfo: TaskInfo): Unit = {
@@ -2425,56 +2318,10 @@ private[spark] class DAGScheduler(
       return
     }
 
-    // A job that uses a pipelined shuffle co-schedules its producer and consumer stages, which is
-    // incompatible with speculation (a speculative producer copy would race a consumer reading its
-    // partial output) and with dynamic allocation (the gang-scheduling slot check would fail
-    // against a not-yet-warmed cluster). Reject such a job up front -- before any stages are
-    // created, so no partial scheduler state is left behind. (Inert for jobs without any pipelined
-    // dependency.)
-    if (rejectUnsupportedPipelinedJob(jobId, finalRDD, listener)) {
-      return
-    }
-
-    // A job's shuffle graph must be all-regular, all-pipelined, or the materialized-prefix mixed
-    // shape (every regular boundary fully materialized and below the pipelined suffix -- see
-    // JobShuffleShape). Anything else is rejected up front (before any stage is created): an
-    // unmaterialized regular stage would have to run while gang-admitted producers hold slots
-    // blocked on transport backpressure, which admission does not account for and can deadlock.
-    val shape = classifyJobShuffleShape(finalRDD)
-    val hasPipelined = shape.hasPipelined
-    if (shape.isUnsupportedMix) {
-      logWarning(log"Rejecting job ${MDC(JOB_ID, jobId)}: a job mixing a pipelined shuffle with " +
-        log"a regular shuffle is only supported when every regular shuffle is a materialized " +
-        log"prefix below the pipelined shuffles")
-      listener.jobFailed(new SparkException(
-        "A job that mixes a pipelined shuffle dependency with a regular shuffle dependency is " +
-          "only supported when every regular shuffle is a fully-materialized prefix below the " +
-          "pipelined shuffles; otherwise a job must be either all-regular or all-pipelined."))
-      return
-    }
-
-    // Gang admission for a pipelined job: the runnable stage graph is one pipelined group (a
-    // materialized prefix's stages never run), so check up front (before any stage is created)
-    // that the cluster can run the entire group concurrently. If it cannot fit, fail the job now
-    // -- no partial scheduler state, and no member ever left running while a sibling waits on
-    // slots (true all-or-nothing gang admission). Inert for a regular job (no pipelined
-    // dependency).
-    if (hasPipelined && rejectUnadmittablePipelinedGroup(jobId, finalRDD, partitions, listener)) {
-      return
-    }
+    val hasPipelined = preparePipelinedJob(jobId, finalRDD, listener)
+      .getOrElse(return)
     var finalStage: ResultStage = null
     try {
-      // Reject group-level unsupported pipelined idioms (e.g. fan-out, a non-default resource
-      // profile, a reliable checkpoint in a member stage) from the RDD graph, up front -- before
-      // any stage is created, so a rejection leaves no partial scheduler state. Gated on
-      // hasPipelined: every idiom this checks concerns a pipelined group, so it must not run for a
-      // job with no pipelined dependency (the resource-profile check in particular is not keyed on
-      // a pipelined dependency and would otherwise reject an ordinary job that merely uses a
-      // non-default profile via RDD.withResources). Inside this try so any incidental exception
-      // from the graph walk is handled by the same listener.jobFailed path as stage creation.
-      if (hasPipelined) {
-        checkPipelinedGroupsSupportedInRDDGraph(finalRDD)
-      }
       // New stage creation may throw an exception if, for example, jobs are run on a
       // HadoopRDD whose underlying HDFS files have been deleted.
       finalStage = createResultStage(finalRDD, func, partitions, jobId, callSite)
@@ -2532,23 +2379,7 @@ private[spark] class DAGScheduler(
     // Job submitted, clear internal data.
     barrierJobIdToNumTasksCheckFailures.remove(jobId)
 
-    // For a pipelined job, stamp the per-run epoch (the jobId) into the job's properties BEFORE
-    // creating the ActiveJob, so submitMissingTasks -- which clones jobIdToActiveJob(jobId)
-    // .properties per stage -- carries the SAME epoch to every stage's tasks. Both the producer
-    // (writer) and the consumer (reader) of the one gang belong to this job, so both read one
-    // value; a different run is a different job, hence a different epoch, which keys the
-    // in-process channel rendezvous per run (see SPARK_PIPELINED_RUN_EPOCH). Copy the caller's
-    // Properties rather than mutating it. Inert for a non-pipelined job (property never set,
-    // never read).
-    val jobProperties =
-      if (hasPipelined && pipelinedManagerWantsLiveReduceHints) {
-        val p = Utils.cloneProperties(if (properties == null) new Properties() else properties)
-        p.setProperty(SparkContext.SPARK_PIPELINED_RUN_EPOCH, jobId.toString)
-        p
-      } else {
-        properties
-      }
-    // Pass hasPipelined (computed above) into the job; see ActiveJob.hasPipelinedDependency.
+    val jobProperties = pipelinedJobProperties(jobId, properties, hasPipelined)
     val job = new ActiveJob(jobId, finalStage, callSite, listener, artifacts, jobProperties,
       hasPipelinedDependency = hasPipelined)
     clearCacheLocs()
@@ -2574,10 +2405,7 @@ private[spark] class DAGScheduler(
     listenerBus.post(
       SparkListenerJobStart(job.jobId, jobSubmissionTime, stageInfos,
         Utils.cloneProperties(properties)))
-    if (hasPipelined && pipelinedManagerWantsLiveReduceHints) {
-      sc.env.pipelinedShuffleManager.startRun(jobId)
-    }
-    submitStage(finalStage)
+    submitJobFinalStage(job)
   }
 
   private[scheduler] def handleMapStageSubmitted(jobId: Int,
@@ -2604,6 +2432,11 @@ private[spark] class DAGScheduler(
           "map output to produce statistics from. This is not supported."))
       return
     }
+    // AQE may materialize a regular output whose computation contains pipelined edges.
+    // Its final map stage is the group's consumer, just as a result stage is for an action.
+    val hasPipelined = !isMaterializedShuffle(dependency) && preparePipelinedJob(
+      jobId, dependency.rdd, listener).getOrElse(return)
+    val jobProperties = pipelinedJobProperties(jobId, properties, hasPipelined)
     // Submitting this map stage might still require the creation of some parent stages, so make
     // sure that happens.
     var finalStage: ShuffleMapStage = null
@@ -2618,7 +2451,8 @@ private[spark] class DAGScheduler(
         return
     }
 
-    val job = new ActiveJob(jobId, finalStage, callSite, listener, artifacts, properties)
+    val job = new ActiveJob(jobId, finalStage, callSite, listener, artifacts, jobProperties,
+      hasPipelinedDependency = hasPipelined)
     clearCacheLocs()
     logInfo(log"Got map stage job ${MDC(JOB_ID, jobId)} " +
       log"(${MDC(CALL_SITE_SHORT_FORM, callSite.shortForm)}) with " +
@@ -2642,7 +2476,7 @@ private[spark] class DAGScheduler(
     listenerBus.post(
       SparkListenerJobStart(job.jobId, jobSubmissionTime, stageInfos,
         Utils.cloneProperties(properties)))
-    submitStage(finalStage)
+    submitJobFinalStage(job)
 
     // If the whole stage has already finished, tell the listener and remove it
     if (finalStage.isAvailable) {
@@ -2654,6 +2488,23 @@ private[spark] class DAGScheduler(
   private def submitStage(stage: Stage): Unit = {
     val jobId = activeJobForStage(stage)
     if (jobId.isDefined) {
+      val missingOutput = stage match {
+        case s: ShuffleMapStage => !s.isAvailable
+        case _ => false
+      }
+      val lostInput = missingOutput && pipelinedExecutionPlans.nonEmpty &&
+        stage.jobIds.iterator.flatMap(jobIdToActiveJob.get).flatMap(pipelinedExecutionPlans.get)
+          .exists(p => !p.contains(stage) || p.isCompleted(stage))
+      if (lostInput) {
+        abortStage(stage, "A materialized input was lost after pipelined admission; " +
+          "retry the execution as a whole", None)
+        return
+      }
+      if (isStageAdmissionBlocked(stage)) {
+        admissionBlockedStages += stage
+        waitingStages += stage
+        return
+      }
       logDebug(s"submitStage($stage (name=${stage.name};" +
         s"jobs=${stage.jobIds.toSeq.sorted.mkString(",")}))")
       if (!waitingStages(stage) && !runningStages(stage) && !failedStages(stage)) {
@@ -2682,8 +2533,7 @@ private[spark] class DAGScheduler(
             // including this one and fails the job). If that happened, `stage` is no longer
             // registered; do not proceed to co-schedule or re-park it (re-parking would re-insert a
             // job-less stage into waitingStages -- a scheduler-state leak). Inert for a
-            // non-aborting submit. (Pipelined group admission is decided up front in
-            // handleJobSubmitted, so it cannot abort the group from within this recursion.)
+            // non-aborting submit.
             if (!stageIdToStage.contains(stage.id)) {
               logInfo(log"${MDC(STAGE, stage)} was removed during parent submission (its job was " +
                 log"aborted); not co-scheduling or re-parking it")
@@ -2708,13 +2558,8 @@ private[spark] class DAGScheduler(
               pipelinedMissing.nonEmpty && pipelinedMissing.forall(runningStages.contains)
 
             if (regularMissing.isEmpty && allPipelinedParentsRunning) {
-              // The whole group's capacity was already admitted up front (handleJobSubmitted ->
-              // rejectUnadmittablePipelinedGroup) before any member was submitted, so the group is
-              // known to fit; just co-schedule this consumer with its running producer(s). No slot
-              // check here -- that would re-measure capacity against a mid-flight snapshot and is
-              // unnecessary once admission is decided up front (gang admission). Group-level
-              // idiom rejection (fan-out, internal regular shuffle) already happened at job
-              // submission (checkPipelinedGroupsSupportedInRDDGraph + the all-pipelined check).
+              // Admission has reserved every member's capacity, including this waiting consumer.
+              // Do not recheck free slots after producers have occupied their reservations.
               logInfo(log"Submitting ${MDC(STAGE, stage)} concurrently with its running " +
                 log"pipelined producer(s) ${MDC(MISSING_PARENT_STAGES, pipelinedMissing)}")
               // Record that this stage is co-scheduled with still-running pipelined producers,
@@ -2981,6 +2826,12 @@ private[spark] class DAGScheduler(
   /** Called when stage's parents are available and we can now do its task. */
   private def submitMissingTasks(stage: Stage, jobId: Int): Unit = {
     logDebug("submitMissingTasks(" + stage + ")")
+    if (isPipelinedGroupMember(stage) &&
+        !jobIdToActiveJob.get(jobId).exists(_.hasPipelinedDependency)) {
+      abortStage(stage, "Cannot replay a pipelined group after losing its materialized output; " +
+        "retry the query as a whole", None)
+      return
+    }
 
     if (Utils.isTesting) {
       maybePreemptiveCorruptionForResultStage(stage)
@@ -3027,9 +2878,9 @@ private[spark] class DAGScheduler(
     addPySparkConfigsToProperties(stage, properties)
 
     // For a pipelined PRODUCER stage, tell its tasks which of its reduce partitions the job
-    // actually reads. The in-process channel writer drops records routed to partitions no
-    // consumer will drain -- otherwise a partial-read job (LIMIT / executeTake reads a subset)
-    // fills the unread partitions' bounded queues and deadlocks the writer. The result stage
+    // actually reads. Writers drop records routed to partitions no consumer will drain;
+    // otherwise a partial-read job fills bounded queues or waits for acknowledgements from
+    // readers that will never start. The result stage
     // is created before submitStage, so its partitions are known here.
     //
     // The live set is per-SHUFFLE-EDGE, not per-job: it is the reduce partitions the consumer of
@@ -3079,7 +2930,7 @@ private[spark] class DAGScheduler(
               if (reaches && partialRead) {
                 abortStage(sms, "Pipelined shuffle cannot determine the live reduce-partition " +
                   "set for a partial read (LIMIT/take) through this plan shape; disable " +
-                  "spark.sql.shuffle.localPipelined.enabled for this query.", None)
+                  "pipelined shuffle for this query.", None)
                 return
               }
           }
@@ -3883,10 +3734,12 @@ private[spark] class DAGScheduler(
             log"${MDC(STAGE_ATTEMPT_ID, task.stageAttemptId)} and there is a more recent attempt for " +
             log"that stage (attempt " +
             log"${MDC(NUM_ATTEMPT, failedStage.latestInfo.attemptNumber())}) running")
-        } else if (activeJobForStage(failedStage).flatMap(jobIdToActiveJob.get)
-            .exists(_.hasPipelinedDependency) &&
-            (isPipelinedGroupMember(failedStage) || isPipelinedGroupMember(mapStage))) {
-          // Failure is group-atomic for a pipelined group. The base scheduler handles a
+        } else if (failedStage.jobIds.iterator.flatMap(jobIdToActiveJob.get)
+            .exists(_.hasPipelinedDependency)) {
+          // A mixed execution fails as a unit, including its ordinary input stages. A completed
+          // input's reservation may already have been reused by a live group. Retrying that input
+          // alone would run outside the admitted graph's resource and stream lifetime contract.
+          // The base scheduler handles a
           // FetchFailed by resubmitting just the map stage in isolation and recomputing serially,
           // but a transient pipelined shuffle cannot be re-read and its members are co-scheduled,
           // so a lone-stage resubmit is never valid and would deadlock the group. Abort the
@@ -4862,6 +4715,7 @@ private[spark] class DAGScheduler(
         case _ => false
       }
       if (!producerAboutToResubmit) {
+        if (!producerFailed) pipelinedExecutionPlans.valuesIterator.foreach(_.complete(stage))
         releaseDeferredPipelinedConsumers(stage, producerFailed = producerFailed)
       }
     }
@@ -4899,7 +4753,7 @@ private[spark] class DAGScheduler(
         // Treating producerFailed as terminal is sound because every failure path that reaches a
         // pipelined member's markStageAsFinished(errorMessage) here is terminal for the group: the
         // one base path that fails a stage and then resubmits it (a barrier task failure) cannot
-        // occur, because a barrier member is rejected up front (rejectUnadmittablePipelinedGroup),
+        // occur, because a barrier member is rejected at stage creation,
         // so a pipelined group never contains one.
         dependentStageMap -= consumer
         val events = deferral.delayedTaskCompletionEvents.toList
@@ -5152,6 +5006,7 @@ private[scheduler] class DAGSchedulerEventProcessLoop(dagScheduler: DAGScheduler
     val timerContext = timer.time()
     try {
       doOnReceive(event)
+      dagScheduler.submitWaitingPipelinedJobs()
     } catch {
       case ex: ShuffleStatusNotFoundException =>
         dagScheduler.handleShuffleStatusNotFoundException(ex)

@@ -1035,6 +1035,17 @@ case class UnionExec(children: Seq[SparkPlan]) extends SparkPlan with CodegenSup
     }
   }
 
+  override def estimatedPartitionCount: Option[Int] = {
+    if (!isPlainUnion) return super.estimatedPartitionCount
+    val widths = children.map(_.estimatedPartitionCount)
+    if (widths.forall(_.isDefined)) {
+      val total = widths.flatten.map(_.toLong).sum
+      if (total <= Int.MaxValue) Some(total.toInt) else None
+    } else {
+      None
+    }
+  }
+
   // True when the codegen path applies: `outputPartitioning` is `UnknownPartitioning`,
   // and `unionedInputRDD` matches the semantics of `sparkContext.union(...)` in `unionRDDs`.
   // A `KeyedPartitioning` union also uses `sparkContext.union(...)` in `unionRDDs`, but

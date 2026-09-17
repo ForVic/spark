@@ -50,6 +50,7 @@ import org.apache.spark.internal.SparkLoggerFactory;
 import org.apache.spark.internal.LogKeys;
 import org.apache.spark.internal.MDC;
 import org.apache.spark.network.TransportContext;
+import org.apache.spark.network.server.RpcHandler;
 import org.apache.spark.network.server.TransportChannelHandler;
 import org.apache.spark.network.util.*;
 
@@ -277,9 +278,28 @@ public class TransportClientFactory implements Closeable {
     return createClient(address);
   }
 
+  /**
+   * Create an unpooled connection with its own RPC handler, sharing this factory's I/O resources.
+   * This is useful for stateful streams whose handler cannot be shared with another connection.
+   * The caller owns the connection and must close it; closing it does not close the factory.
+   * Client bootstraps and transport security still apply to this connection.
+   */
+  public TransportClient createUnmanagedClient(
+      String remoteHost,
+      int remotePort,
+      RpcHandler rpcHandler) throws IOException, InterruptedException {
+    Objects.requireNonNull(rpcHandler, "rpcHandler");
+    return createClient(new InetSocketAddress(remoteHost, remotePort), rpcHandler);
+  }
+
   /** Create a completely new {@link TransportClient} to the remote address. */
   @VisibleForTesting
   TransportClient createClient(InetSocketAddress address)
+      throws IOException, InterruptedException {
+    return createClient(address, null);
+  }
+
+  private TransportClient createClient(InetSocketAddress address, RpcHandler rpcHandler)
       throws IOException, InterruptedException {
     logger.debug("Creating new connection to {}", address);
 
@@ -310,7 +330,8 @@ public class TransportClientFactory implements Closeable {
     bootstrap.handler(new ChannelInitializer<SocketChannel>() {
       @Override
       public void initChannel(SocketChannel ch) {
-        TransportChannelHandler clientHandler = context.initializePipeline(ch, true);
+        TransportChannelHandler clientHandler = rpcHandler == null ?
+          context.initializePipeline(ch, true) : context.initializePipeline(ch, rpcHandler, true);
         clientRef.set(clientHandler.getClient());
         channelRef.set(ch);
       }
