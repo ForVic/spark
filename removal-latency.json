@@ -1,0 +1,34 @@
+[
+  {
+    "version": "before",
+    "fork": 0,
+    "events": 498,
+    "median_ms": 846.68925,
+    "p95_ms": 1429.39975,
+    "max_ms": 1515.553
+  },
+  {
+    "version": "before",
+    "fork": 1,
+    "events": 498,
+    "median_ms": 801.463166,
+    "p95_ms": 1387.534916,
+    "max_ms": 1463.453125
+  },
+  {
+    "version": "after",
+    "fork": 0,
+    "events": 498,
+    "median_ms": 736.169271,
+    "p95_ms": 1308.840417,
+    "max_ms": 1373.46975
+  },
+  {
+    "version": "after",
+    "fork": 1,
+    "events": 498,
+    "median_ms": 756.0255830000001,
+    "p95_ms": 1332.092541,
+    "max_ms": 1398.834125
+  }
+]

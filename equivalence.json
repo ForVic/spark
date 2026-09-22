@@ -1,0 +1,26 @@
+[
+  {
+    "retain": false,
+    "faults": false,
+    "actions": 126,
+    "identical": true
+  },
+  {
+    "retain": false,
+    "faults": true,
+    "actions": 126,
+    "identical": true
+  },
+  {
+    "retain": true,
+    "faults": false,
+    "actions": 79,
+    "identical": true
+  },
+  {
+    "retain": true,
+    "faults": true,
+    "actions": 80,
+    "identical": true
+  }
+]
