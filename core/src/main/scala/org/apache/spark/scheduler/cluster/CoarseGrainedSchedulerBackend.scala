@@ -39,7 +39,7 @@ import org.apache.spark.resource.{CpuAmount, ResourceProfile}
 import org.apache.spark.rpc._
 import org.apache.spark.scheduler._
 import org.apache.spark.scheduler.cluster.CoarseGrainedClusterMessages._
-import org.apache.spark.scheduler.cluster.CoarseGrainedSchedulerBackend.ENDPOINT_NAME
+import org.apache.spark.scheduler.cluster.CoarseGrainedSchedulerBackend.{ENDPOINT_NAME, ReviveTaskCpuOffers}
 import org.apache.spark.sql.catalyst.util.DateTimeConstants.NANOS_PER_MILLIS
 import org.apache.spark.status.api.v1.ThreadStackTrace
 import org.apache.spark.util.{RpcUtils, SerializableBuffer, ThreadUtils, Utils}
@@ -156,6 +156,8 @@ class CoarseGrainedSchedulerBackend(protected val scheduler: TaskSchedulerImpl, 
     override val rpcEnv: RpcEnv = CoarseGrainedSchedulerBackend.this.rpcEnv
 
     protected val addressToExecutorId = new HashMap[RpcAddress, String]
+    private val taskCpuReservations = new TaskCpuReservations
+    private val pendingTaskCpuOffers = HashSet.empty[String]
 
     // Spark configuration sent to executors. This is a lazy val so that subclasses of the
     // scheduler can modify the SparkConf object before this view is created.
@@ -177,11 +179,17 @@ class CoarseGrainedSchedulerBackend(protected val scheduler: TaskSchedulerImpl, 
 
     override def receive: PartialFunction[Any, Unit] = {
       case StatusUpdate(executorId, taskId, state, data, taskCpus, resources) =>
+        val releasedCpus = if (TaskState.isFinished(state)) {
+          scheduler.taskCpuReleased(taskId, false)
+          taskCpuReservations.finish(taskId)
+        } else {
+          BigDecimal(0)
+        }
         scheduler.statusUpdate(taskId, state, data.value)
         if (TaskState.isFinished(state)) {
           executorDataMap.get(executorId) match {
             case Some(executorInfo) =>
-              executorInfo.freeCores += taskCpus
+              executorInfo.freeCores += releasedCpus
               resources.foreach { case (rName, addressAmount) =>
                 executorInfo.resourcesInfo.get(rName).foreach { r =>
                   r.release(addressAmount)
@@ -195,6 +203,24 @@ class CoarseGrainedSchedulerBackend(protected val scheduler: TaskSchedulerImpl, 
                 log"from unknown executor with ID ${MDC(LogKeys.EXECUTOR_ID, executorId)}")
           }
         }
+
+      case ReleaseTaskCpu(executorId, taskId, sequence) =>
+        executorDataMap.get(executorId).foreach { data =>
+          val cpus = taskCpuReservations.release(taskId, executorId, sequence)
+          if (cpus > 0) {
+            scheduler.taskCpuReleased(taskId, true)
+            data.freeCores += cpus
+            reviveTaskCpuOffers(executorId)
+          }
+        }
+
+      case RequestTaskCpu(executorId, taskId, sequence) =>
+        taskCpuReservations.ready(taskId, executorId, sequence)
+        reviveTaskCpuOffers(executorId)
+
+      case ReviveTaskCpuOffers(executorId) =>
+        pendingTaskCpuOffers -= executorId
+        makeOffers(executorId)
 
       case ShufflePushCompletion(shuffleId, shuffleMergeId, mapIndex) =>
         scheduler.dagScheduler.shufflePushCompleted(shuffleId, shuffleMergeId, mapIndex)
@@ -246,7 +272,10 @@ class CoarseGrainedSchedulerBackend(protected val scheduler: TaskSchedulerImpl, 
 
       case LaunchedExecutor(executorId) =>
         executorDataMap.get(executorId).foreach { data =>
-          data.freeCores = CpuAmount.normalize(BigDecimal(data.totalCores))
+          // Offers bound resident work. Runnable CPU is delegated to the executor-local pool;
+          // local handoffs never increase this driver's offer capacity.
+          data.freeCores = CpuAmount.normalize(BigDecimal(data.totalCores)) *
+            conf.get(EXECUTOR_TASK_RESIDENCY_MULTIPLIER)
         }
         makeOffers(executorId)
 
@@ -399,11 +428,23 @@ class CoarseGrainedSchedulerBackend(protected val scheduler: TaskSchedulerImpl, 
         logError(log"Received unexpected ask ${MDC(ERROR, e)}")
     }
 
+    private def reviveTaskCpuOffers(executorId: String): Unit = withLock {
+      executorDataMap.get(executorId).foreach { data =>
+        // Resume ready tasks immediately. Process queued CPU updates before lending any
+        // remaining capacity to a new task, which could delay another ready reader.
+        resumeTasks(executorId, data)
+        if (data.freeCores > 0 && pendingTaskCpuOffers.add(executorId)) {
+          self.send(ReviveTaskCpuOffers(executorId))
+        }
+      }
+    }
+
     // Make fake resource offers on all executors
     private def makeOffers(): Unit = {
       // Make sure no executor is killed while some task is launching on it
       val taskDescs = withLock {
         // Filter out executors under killing
+        executorDataMap.foreach { case (id, data) => resumeTasks(id, data) }
         val activeExecutors = executorDataMap.filter { case (id, _) => isExecutorActive(id) }
         val workOffers = activeExecutors.map {
           case (id, executorData) => buildWorkerOffer(id, executorData)
@@ -417,13 +458,29 @@ class CoarseGrainedSchedulerBackend(protected val scheduler: TaskSchedulerImpl, 
 
     private def buildWorkerOffer(executorId: String, executorData: ExecutorData) = {
       val resources = ExecutorResourcesAmounts(executorData.resourcesInfo)
+      val ordinaryCores = if (conf.get(EXECUTOR_TASK_RESIDENCY_MULTIPLIER) > 1) {
+        Some((BigDecimal(executorData.totalCores) -
+          taskCpuReservations.ordinaryCpus(executorId)).max(BigDecimal(0)))
+      } else {
+        None
+      }
       WorkerOffer(
         executorId,
         executorData.executorHost,
         executorData.freeCores,
         Some(executorData.executorAddress.hostPort),
         resources,
-        executorData.resourceProfileId)
+        executorData.resourceProfileId,
+        ordinaryCores)
+    }
+
+    private def resumeTasks(executorId: String, data: ExecutorData): Unit = {
+      taskCpuReservations.resume(executorId, data.freeCores).foreach {
+        case (taskId, sequence, cpus) =>
+          data.freeCores -= cpus
+          scheduler.taskCpuReleased(taskId, false)
+          data.executorEndpoint.send(ResumeTaskCpu(taskId, sequence))
+      }
     }
 
     override def onDisconnected(remoteAddress: RpcAddress): Unit = {
@@ -440,6 +497,7 @@ class CoarseGrainedSchedulerBackend(protected val scheduler: TaskSchedulerImpl, 
       // Make sure no executor is killed while some task is launching on it
       val taskDescs = withLock {
         // Filter out executors under killing
+        executorDataMap.get(executorId).foreach(resumeTasks(executorId, _))
         if (isExecutorActive(executorId)) {
           val executorData = executorDataMap(executorId)
           val workOffers = IndexedSeq(buildWorkerOffer(executorId, executorData))
@@ -475,6 +533,10 @@ class CoarseGrainedSchedulerBackend(protected val scheduler: TaskSchedulerImpl, 
           // Do resources allocation here. The allocated resources will get released after the task
           // finishes.
           executorData.freeCores -= task.cpus
+          val isPipelined = task.properties.getProperty(
+            org.apache.spark.executor.TaskCpuLease.PROPERTY) == "true"
+          taskCpuReservations.start(task.taskId, task.executorId, task.cpus,
+            conf.get(EXECUTOR_TASK_RESIDENCY_MULTIPLIER) == 1 && isPipelined, isPipelined)
           task.resources.foreach { case (rName, addressAmounts) =>
             executorData.resourcesInfo(rName).acquire(addressAmounts)
           }
@@ -489,6 +551,7 @@ class CoarseGrainedSchedulerBackend(protected val scheduler: TaskSchedulerImpl, 
     // Remove a disconnected executor from the cluster
     private def removeExecutor(executorId: String, reason: ExecutorLossReason): Unit = {
       logDebug(s"Asked to remove executor $executorId with reason $reason")
+      taskCpuReservations.removeExecutor(executorId)
       executorDataMap.get(executorId) match {
         case Some(executorInfo) =>
           // This must be synchronized because variables mutated
@@ -1300,4 +1363,6 @@ class CoarseGrainedSchedulerBackend(protected val scheduler: TaskSchedulerImpl, 
 
 private[spark] object CoarseGrainedSchedulerBackend {
   val ENDPOINT_NAME = "CoarseGrainedScheduler"
+
+  private case class ReviveTaskCpuOffers(executorId: String)
 }

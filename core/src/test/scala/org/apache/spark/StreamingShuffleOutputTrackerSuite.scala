@@ -109,7 +109,8 @@ class StreamingShuffleOutputTrackerSuite
         1 -> StreamingShuffleTaskLocation("executor-2", "host-2", 0))
     master.registerShuffle(shuffleId, numMaps, numReduces, jobId)
     // register one shuffle write task
-    worker.registerShuffleWriterTask(shuffleId, 0, taskMap(0))
+    assert(!worker.registerShuffleWriterTask(shuffleId, 0, taskMap(0), jobId + 1))
+    assert(worker.registerShuffleWriterTask(shuffleId, 0, taskMap(0), jobId))
     // Get all shuffle write task location information.  Should return None since
     // only one of the shuffle writers have registered
     worker.getAllShuffleWriterTaskLocations(shuffleId) should be(None)
@@ -141,6 +142,27 @@ class StreamingShuffleOutputTrackerSuite
       0,
       0,
       StreamingShuffleTaskLocation("executor-1", "host-1", 0)) should be(false)
+  }
+
+  test("closing a run freezes writer registration and preserves all cleanup endpoints") {
+    val master = newTrackerMaster()
+    val first = StreamingShuffleTaskLocation("executor-1", "host-1", 10)
+    val second = StreamingShuffleTaskLocation("executor-2", "host-2", 20)
+    master.registerShuffle(0, 2, 1, 10)
+    master.registerShuffle(1, 2, 1, 10)
+    master.registerShuffle(2, 2, 1, 11)
+    assert(master.registerShuffleWriterTask(0, 0, first))
+    assert(master.registerShuffleWriterTask(1, 0, first))
+    assert(master.registerShuffleWriterTask(1, 1, second))
+    assert(master.closeRun(10).toSet == Set(first, second))
+    assert(!master.registerShuffleWriterTask(0, 1, second))
+    assert(master.closeRun(10).toSet == Set(first, second))
+    assert(master.registerShuffleWriterTask(2, 0, second))
+    master.unregisterShuffle(0)
+    master.registerShuffle(0, 1, 1, 12)
+    assert(master.registerShuffleWriterTask(0, 0, second, 12))
+    assert(!master.registerShuffleWriterTask(0, 0, first, 10))
+    assert(master.getAllShuffleWriterTaskLocations(0).contains(Map(0L -> second)))
   }
 
   test("get task location for shuffle that doesn't exist") {
@@ -382,6 +404,36 @@ class StreamingShuffleOutputTrackerSuite
     assert(response.get.shuffleTaskLocations.size === 1)
     assert(response.get.numShuffleWriterTasks === numMaps)
     assert(response.get.shuffleTaskLocations(0L) === location)
+  }
+
+  test("reader discovery omits unchanged location maps and resumes after new registration") {
+    val master = newTrackerMaster()
+    val worker = newTrackerWorker()
+    val rpcEnv = createRpcEnv("changed-locations")
+    val endpoint = rpcEnv.setupEndpoint(StreamingShuffleOutputTracker.ENDPOINT_NAME,
+      new StreamingShuffleOutputTrackerMasterEndpoint(rpcEnv, master, conf))
+    master.trackerEndpoint = endpoint
+    worker.trackerEndpoint = endpoint
+    master.registerShuffle(0, numMaps = 3, numReduces = 1, jobId = 0)
+    val location = StreamingShuffleTaskLocation("executor", "host", 1234)
+    assert(worker.getAvailableShuffleWriterTaskLocations(0, 0).get ==
+      ShuffleLocationResponse(Map.empty, 3))
+    assert(worker.registerShuffleWriterTask(0, 9, location))
+    val first = worker.getAvailableShuffleWriterTaskLocations(0, 0).get
+    assert(first.shuffleTaskLocations == Map(9L -> location))
+    assert(worker.getAvailableShuffleWriterTaskLocations(0, 1).get ==
+      ShuffleLocationResponse(Map.empty, 3))
+    // The original API still returns complete snapshots, including replacement locations.
+    val replacement = location.copy(port = 1235)
+    assert(worker.registerShuffleWriterTask(0, 9, replacement))
+    assert(worker.getAvailableShuffleWriterTaskLocations(0).get.shuffleTaskLocations ==
+      Map(9L -> replacement))
+    assert(worker.registerShuffleWriterTask(0, 2, location))
+    assert(worker.getAvailableShuffleWriterTaskLocations(0, 1).get.shuffleTaskLocations ==
+      Map(9L -> replacement, 2L -> location))
+    assert(worker.getAvailableShuffleWriterTaskLocations(0, 2).get.shuffleTaskLocations.isEmpty)
+    master.unregisterShuffle(0)
+    assert(worker.getAvailableShuffleWriterTaskLocations(0, 2).isEmpty)
   }
 
   test("get available writer task locations for shuffle that doesn't exist through worker RPC") {

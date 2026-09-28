@@ -17,6 +17,8 @@
 
 package org.apache.spark.shuffle.local.pipelined
 
+import java.util.concurrent.atomic.AtomicLong
+
 import scala.reflect.ClassTag
 
 import org.mockito.Mockito.{mock, when}
@@ -24,6 +26,7 @@ import org.mockito.Mockito.{mock, when}
 import org.apache.spark.{HashPartitioner, Partitioner, PipelinedShuffleDependency, SparkConf, SparkContext, SparkEnv, SparkFunSuite, TaskContext, TaskKilledException}
 import org.apache.spark.executor.TempShuffleReadMetrics
 import org.apache.spark.rdd.{RDD, ShuffledRDD}
+import org.apache.spark.scheduler.{SparkListener, SparkListenerTaskEnd}
 import org.apache.spark.shuffle.BaseShuffleHandle
 
 /**
@@ -91,6 +94,20 @@ class PipelinedChannelShuffleSuite extends SparkFunSuite {
     }
   }
 
+  test("short channel tasks publish their final shuffle read metrics") {
+    withPipelinedSparkContext(cores = 4) { sc =>
+      val readRecords = new AtomicLong
+      sc.addSparkListener(new SparkListener {
+        override def onTaskEnd(e: SparkListenerTaskEnd): Unit = {
+          readRecords.addAndGet(e.taskMetrics.shuffleReadMetrics.recordsRead)
+        }
+      })
+      assert(repartition(sc, 100, numIn = 2, numOut = 2).length == 100)
+      sc.listenerBus.waitUntilEmpty()
+      assert(readRecords.get() == 100)
+    }
+  }
+
   test("result matches a regular shuffle of the same workload") {
     // Ground-truth grouping from a plain (non-pipelined) repartition.
     val expected = {
@@ -122,14 +139,17 @@ class PipelinedChannelShuffleSuite extends SparkFunSuite {
     }
   }
 
-  test("a group whose demand exceeds the slots is rejected up front") {
-    // This is the single-machine ceiling of the pipelined model: all stages of the group
-    // must hold a slot at once. On local[8], numIn=8 + numOut=2 = 10 > 8, so the scheduler
-    // rejects the job before any task runs rather than deadlocking. Documented constraint,
-    // pinned here so a future scheduler change that silently relaxes it is caught.
+  test("source waves allow a group with more tasks than concurrent slots") {
+    withPipelinedSparkContext(cores = 8) { sc =>
+      val out = repartition(sc, n = 100, numIn = 8, numOut = 2)
+      assert(out.map(_._3).sorted.toSeq === (0 until 100))
+    }
+  }
+
+  test("a group's readers and minimum source reservation must fit concurrent slots") {
     withPipelinedSparkContext(cores = 8) { sc =>
       val ex = intercept[org.apache.spark.SparkException] {
-        repartition(sc, n = 100, numIn = 8, numOut = 2)
+        repartition(sc, n = 100, numIn = 1, numOut = 8)
       }
       assert(ex.getMessage.contains("CONCURRENT_SCHEDULER_INSUFFICIENT_SLOT") ||
         ex.getMessage.contains("concurrent task slots"),
@@ -402,17 +422,13 @@ class PipelinedChannelShuffleSuite extends SparkFunSuite {
     }
   }
 
-  test("an unmaterialized regular prefix below a pipelined suffix is still rejected") {
+  test("an unmaterialized regular prefix completes before its pipelined suffix reads it") {
     withPipelinedSparkContext(cores = 8) { sc =>
       val keyed: RDD[(Int, Int)] = sc.parallelize(0 until 100, 2).map(v => (v % 10, v))
       val prefix = new ShuffledRDD[Int, Int, Int](keyed, new HashPartitioner(3))
       // No action on `prefix`: its shuffle is not materialized when the mixed job submits.
       val suffix = new PipelinedShuffledRDD[Int, Int, Int](prefix, new HashPartitioner(4))
-      val ex = intercept[org.apache.spark.SparkException] {
-        suffix.collect()
-      }
-      assert(ex.getMessage.contains("fully-materialized prefix"),
-        s"expected the unmaterialized-prefix rejection, got: ${ex.getMessage}")
+      assert(suffix.collect().map(_._2).sorted.toSeq === (0 until 100))
     }
   }
 

@@ -389,7 +389,7 @@ trait FileSourceScanLike extends DataSourceScanExec with SessionStateHelper {
     SQLMetrics.postDriverMetricUpdates(sparkContext, executionId, driverMetrics.values.toSeq)
   }
 
-  private def isDynamicPruningFilter(e: Expression): Boolean =
+  protected def isDynamicPruningFilter(e: Expression): Boolean =
     e.exists(_.isInstanceOf[PlanExpression[_]])
 
 
@@ -762,13 +762,28 @@ case class FileSourceScanExec(
         options = options,
         hadoopConf = getHadoopConf(relation.sparkSession, relation.options))
 
-    val readRDD = if (bucketedScan) {
-      createBucketedReadRDD(relation.bucketSpec.get, readFile, dynamicallySelectedPartitions)
-    } else {
-      createReadRDD(readFile, dynamicallySelectedPartitions)
-    }
+    val readRDD = new FileScanRDD(relation.sparkSession, readFile, filePartitions,
+      new StructType(requiredSchema.fields ++ relation.partitionSchema.fields),
+      fileConstantMetadataColumns, relation.fileFormat.fileConstantMetadataExtractors,
+      new FileSourceOptions(CaseInsensitiveMap(relation.options)))
     sendDriverMetrics()
     readRDD
+  }
+
+  override def estimatedPartitionCount: Option[Int] = {
+    // Planning the file splits must not construct readers or broadcast Hadoop configuration.
+    // AQE may discard this scan instance. Do not evaluate runtime pruning subqueries here either.
+    if ((partitionFilters ++ dataFilters).exists(isDynamicPruningFilter)) None
+    else if (useSingleTaskExecution) Some(1)
+    else Some(filePartitions.size)
+  }
+
+  @transient private lazy val filePartitions: Seq[FilePartition] = {
+    if (bucketedScan) {
+      planBucketedPartitions(relation.bucketSpec.get, dynamicallySelectedPartitions)
+    } else {
+      planFilePartitions(dynamicallySelectedPartitions)
+    }
   }
 
   override def inputRDDs(): Seq[RDD[InternalRow]] = {
@@ -840,20 +855,18 @@ case class FileSourceScanExec(
   override val nodeNamePrefix: String = "File"
 
   /**
-   * Create an RDD for bucketed reads.
-   * The non-bucketed variant of this function is [[createReadRDD]].
+   * Plan file partitions for bucketed reads.
+   * The non-bucketed variant of this function is [[planFilePartitions]].
    *
    * The algorithm is pretty simple: each RDD partition being returned should include all the files
    * with the same bucket id from all the given Hive partitions.
    *
    * @param bucketSpec the bucketing spec.
-   * @param readFile a function to read each (part of a) file.
    * @param selectedPartitions Hive-style partition that are part of the read.
    */
-  private def createBucketedReadRDD(
+  private def planBucketedPartitions(
       bucketSpec: BucketSpec,
-      readFile: (PartitionedFile) => Iterator[InternalRow],
-      selectedPartitions: ScanFileListing): RDD[InternalRow] = {
+      selectedPartitions: ScanFileListing): Seq[FilePartition] = {
     logInfo(log"Planning with ${MDC(COUNT, bucketSpec.numBuckets)} buckets")
     val partitionArray = selectedPartitions.toPartitionArray
     val filesGroupedToBuckets = partitionArray.groupBy { f =>
@@ -871,7 +884,7 @@ case class FileSourceScanExec(
       filesGroupedToBuckets
     }
 
-    val filePartitions = optionalNumCoalescedBuckets.map { numCoalescedBuckets =>
+    optionalNumCoalescedBuckets.map { numCoalescedBuckets =>
       logInfo(log"Coalescing to ${MDC(COUNT, numCoalescedBuckets)} buckets")
       val coalescedBuckets = prunedFilesGroupedToBuckets.groupBy(_._1 % numCoalescedBuckets)
       Seq.tabulate(numCoalescedBuckets) { bucketId =>
@@ -885,23 +898,15 @@ case class FileSourceScanExec(
         FilePartition(bucketId, prunedFilesGroupedToBuckets.getOrElse(bucketId, Array.empty))
       }
     }
-
-    new FileScanRDD(relation.sparkSession, readFile, filePartitions,
-      new StructType(requiredSchema.fields ++ relation.partitionSchema.fields),
-      fileConstantMetadataColumns, relation.fileFormat.fileConstantMetadataExtractors,
-      new FileSourceOptions(CaseInsensitiveMap(relation.options)))
   }
 
   /**
-   * Create an RDD for non-bucketed reads.
-   * The bucketed variant of this function is [[createBucketedReadRDD]].
+   * Plan file partitions for non-bucketed reads.
+   * The bucketed variant of this function is [[planBucketedPartitions]].
    *
-   * @param readFile a function to read each (part of a) file.
    * @param selectedPartitions Hive-style partition that are part of the read.
    */
-  private def createReadRDD(
-      readFile: PartitionedFile => Iterator[InternalRow],
-      selectedPartitions: ScanFileListing): RDD[InternalRow] = {
+  private def planFilePartitions(selectedPartitions: ScanFileListing): Seq[FilePartition] = {
     val openCostInBytes = getSqlConf(relation.sparkSession).filesOpenCostInBytes
     val maxSplitBytes =
       FilePartition.maxSplitBytes(relation.sparkSession, selectedPartitions)
@@ -940,13 +945,8 @@ case class FileSourceScanExec(
       }
     }.toArray.sortBy(_.length)(implicitly[Ordering[Long]].reverse)
 
-    val partitions = FilePartition
-      .getFilePartitions(relation.sparkSession, splitFiles.toImmutableArraySeq, maxSplitBytes)
-
-    new FileScanRDD(relation.sparkSession, readFile, partitions,
-      new StructType(requiredSchema.fields ++ relation.partitionSchema.fields),
-      fileConstantMetadataColumns, relation.fileFormat.fileConstantMetadataExtractors,
-      new FileSourceOptions(CaseInsensitiveMap(relation.options)))
+    FilePartition.getFilePartitions(
+      relation.sparkSession, splitFiles.toImmutableArraySeq, maxSplitBytes)
   }
 
   // Filters unused DynamicPruningExpression expressions - one which has been replaced

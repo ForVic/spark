@@ -22,7 +22,7 @@ import scala.collection.mutable
 import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.catalyst.plans.physical.SinglePartition
 import org.apache.spark.sql.execution.{ShufflePartitionSpec, SparkPlan, UnaryExecNode, UnionExec}
-import org.apache.spark.sql.execution.exchange.{ENSURE_REQUIREMENTS, REBALANCE_PARTITIONS_BY_COL, REBALANCE_PARTITIONS_BY_NONE, REPARTITION_BY_COL, ShuffleExchangeLike, ShuffleOrigin}
+import org.apache.spark.sql.execution.exchange.{ENSURE_REQUIREMENTS, REBALANCE_PARTITIONS_BY_COL, REBALANCE_PARTITIONS_BY_NONE, REPARTITION_BY_COL, ShuffleExchangeExec, ShuffleExchangeLike, ShuffleOrigin}
 import org.apache.spark.sql.execution.joins.{BroadcastHashJoinExec, BroadcastNestedLoopJoinExec, CartesianProductExec}
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.util.Utils
@@ -163,6 +163,12 @@ case class CoalesceShufflePartitions(session: SparkSession) extends AQEShuffleRe
     case p if !childrenNeedCompatiblePartitioning(p) =>
       val hasExplodingJoinSoFar = hasExplodingJoin || isExplodingJoin(p)
       p.children.flatMap(collectCoalesceGroups(_, hasExplodingJoinSoFar))
+    // An inline live exchange fixes the partition count seen by its consumer. Its materialized
+    // ancestors are not interchangeable with that output when coalescing compatible join inputs.
+    case p if p.exists {
+        case s: ShuffleExchangeExec => s.pipelined
+        case _ => false
+      } => collectGroupsBelowExchanges(p)
     // If not all leaf nodes are exchange query stages, it's not safe to reduce the number of
     // shuffle partitions, because we may break the assumption that all children of a spark plan
     // have same number of output partitions.
@@ -178,6 +184,13 @@ case class CoalesceShufflePartitions(session: SparkSession) extends AQEShuffleRe
         Seq.empty
       }
     case _ => Seq.empty
+  }
+
+  // A fixed exchange output separates its input's layout from the compatible consumer above
+  // it. Keep that output unchanged while allowing ordinary AQE reads below it to coalesce.
+  private def collectGroupsBelowExchanges(plan: SparkPlan): Seq[CoalesceGroup] = plan match {
+    case s: ShuffleExchangeExec => collectCoalesceGroups(s.child)
+    case other => other.children.flatMap(collectGroupsBelowExchanges)
   }
 
   private def childrenNeedCompatiblePartitioning(p: SparkPlan): Boolean = p match {

@@ -39,7 +39,12 @@ private[spark] class TaskSet(
     // isolation, so any task failure must fail the whole group rather than be retried per-task;
     // the TaskSetManager uses this to fail fast (maxTaskFailures = 1) and to count every failure,
     // including otherwise-uncounted ones like executor loss. Defaults to false.
-    val isPipelined: Boolean = false) {
+    val isPipelined: Boolean = false,
+    // Bound source-task waves so back-pressured writers cannot occupy their readers' slots.
+    // Updates after submission must hold the TaskSchedulerImpl lock.
+    var maxConcurrentTasks: Int = Int.MaxValue,
+    val pipelinedGroupId: Option[Int] = None,
+    val isPipelinedSource: Boolean = false) {
   val id: String = s"$stageId.$stageAttemptId"
 
   override def toString: String = "TaskSet " + id

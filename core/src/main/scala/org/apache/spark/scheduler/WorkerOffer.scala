@@ -31,4 +31,6 @@ case class WorkerOffer(
     // when multiple executors are launched on the same host.
     address: Option[String] = None,
     resources: ExecutorResourcesAmounts = ExecutorResourcesAmounts.empty,
-    resourceProfileId: Int = ResourceProfile.DEFAULT_RESOURCE_PROFILE_ID)
+    resourceProfileId: Int = ResourceProfile.DEFAULT_RESOURCE_PROFILE_ID,
+    // Extra resident slots are for pipelined tasks. Ordinary work stays at physical capacity.
+    ordinaryCores: Option[BigDecimal] = None)

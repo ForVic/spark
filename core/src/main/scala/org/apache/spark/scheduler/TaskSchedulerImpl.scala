@@ -136,6 +136,16 @@ private[spark] class TaskSchedulerImpl(
   // Protected by `this`
   val taskIdToExecutorId = new HashMap[Long, String]
 
+  // Only released readers enlarge a group's source wave. A blocked writer must not admit an
+  // unbounded succession of other writers while retaining its buffers and operator state.
+  private val releasedPipelinedReaders = new HashMap[Long, Int]
+
+  // Reservations also constrain ordinary task sets that were queued before a live group arrived.
+  // Running ordinary tasks finish normally; their replacements cannot take the group's slots.
+  private var pipelinedReservedStages = Set.empty[Int]
+  private var pipelinedReservedTasks = 0
+  private var pipelinedTaskCapacity = 0
+
   @volatile private var hasReceivedTask = false
   @volatile private var hasLaunchedTask = false
   private val starvationTimer = ThreadUtils.newDaemonSingleThreadScheduledExecutor(
@@ -160,6 +170,93 @@ private[spark] class TaskSchedulerImpl(
 
   def runningTasksByExecutors: Map[String, Int] = synchronized {
     executorIdToRunningTaskIds.toMap.transform((_, v) => v.size)
+  }
+
+  private[scheduler] def canReservePipelinedTasks(stageIds: Set[Int]): Boolean = synchronized {
+    !taskSetsByStageIdAndAttempt.valuesIterator.flatMap(_.valuesIterator).exists { manager =>
+      !manager.isZombie && manager.taskSet.isPipelined &&
+        !stageIds.contains(manager.taskSet.stageId)
+    }
+  }
+
+  private[scheduler] def updatePipelinedReservations(
+      stageIds: Set[Int],
+      reservedTasks: Int,
+      capacity: Int): Unit = {
+    require(reservedTasks >= 0 && reservedTasks <= capacity)
+    val changed = synchronized {
+      val changed = pipelinedReservedStages != stageIds ||
+        pipelinedReservedTasks != reservedTasks || pipelinedTaskCapacity != capacity
+      pipelinedReservedStages = stageIds
+      pipelinedReservedTasks = reservedTasks
+      pipelinedTaskCapacity = capacity
+      changed
+    }
+    if (changed) backend.reviveOffers()
+  }
+
+  private[spark] def taskCpuReleased(taskId: Long, released: Boolean): Unit = synchronized {
+    if (released) {
+      Option(taskIdToTaskSetManager.get(taskId)).foreach { manager =>
+        val set = manager.taskSet
+        if (!set.isPipelinedSource) {
+          set.pipelinedGroupId.foreach(id => releasedPipelinedReaders(taskId) = id)
+        }
+      }
+    } else {
+      releasedPipelinedReaders.remove(taskId)
+    }
+  }
+
+  private[scheduler] def canLaunchPipelinedSource(manager: TaskSetManager): Boolean = {
+    val set = manager.taskSet
+    if (pipelinedReservedStages.nonEmpty &&
+        set.resourceProfileId == ResourceProfile.DEFAULT_RESOURCE_PROFILE_ID &&
+        !(set.isPipelined && !set.isPipelinedSource)) {
+      var nonReaders = 0L
+      var unreserved = 0L
+      taskSetsByStageIdAndAttempt.valuesIterator.flatMap(_.valuesIterator).foreach { other =>
+        val tasks = other.taskSet
+        if (!other.isZombie && tasks.resourceProfileId == set.resourceProfileId &&
+            !(tasks.isPipelined && !tasks.isPipelinedSource)) {
+          nonReaders += other.runningTasks
+          if (!pipelinedReservedStages.contains(tasks.stageId)) {
+            unreserved += other.runningTasks
+          }
+        }
+      }
+      // A writer can lend CPU while retaining its state. Include it in this resident-task limit,
+      // even when ordinary work was already running when the group reserved future capacity.
+      // Barrier offers are staged before any task becomes running, so charge the whole gang.
+      val demand = if (manager.isBarrier) manager.numTasks else 1
+      if (nonReaders + demand > pipelinedTaskCapacity) return false
+      if (!pipelinedReservedStages.contains(set.stageId)) {
+        // A resident reader has already obtained its place in the group. While it lends CPU,
+        // ordinary work may borrow that capacity too, subject to the same residency bound.
+        // Future readers remain reserved, and the backend grants resumptions before new tasks.
+        val releasedReaders = releasedPipelinedReaders.keysIterator.count { taskId =>
+          Option(taskIdToTaskSetManager.get(taskId)).exists { other =>
+            !other.isZombie && pipelinedReservedStages.contains(other.taskSet.stageId)
+          }
+        }
+        val available = pipelinedTaskCapacity.toLong - pipelinedReservedTasks + releasedReaders
+        if (unreserved + demand > available) return false
+      }
+    }
+    val borrowed = set.pipelinedGroupId.filter(_ => set.isPipelinedSource).map { id =>
+      releasedPipelinedReaders.valuesIterator.count(_ == id)
+    }.getOrElse(0)
+    if (manager.runningTasks.toLong >= set.maxConcurrentTasks.toLong + borrowed) {
+      false
+    } else if (borrowed == 0) {
+      true
+    } else {
+      val sources = taskSetsByStageIdAndAttempt.valuesIterator.flatMap(_.valuesIterator)
+        .filter(m => !m.isZombie && m.taskSet.isPipelinedSource &&
+          m.taskSet.pipelinedGroupId == set.pipelinedGroupId).toSeq
+      sources.map(_.runningTasks.toLong).sum <
+        sources.map(_.taskSet.maxConcurrentTasks.toLong).sum + borrowed
+    }
   }
 
   /**
@@ -340,6 +437,24 @@ private[spark] class TaskSchedulerImpl(
     backend.reviveOffers()
   }
 
+  override def increaseTaskSetConcurrencyLimits(limits: Map[Int, Int]): Unit = {
+    val changed = synchronized {
+      var updated = false
+      limits.foreach { case (stageId, limit) =>
+        taskSetsByStageIdAndAttempt.get(stageId).foreach { attempts =>
+          attempts.valuesIterator.filterNot(_.isZombie).foreach { manager =>
+            if (limit > manager.taskSet.maxConcurrentTasks) {
+              manager.taskSet.maxConcurrentTasks = limit
+              updated = true
+            }
+          }
+        }
+      }
+      updated
+    }
+    if (changed) backend.reviveOffers()
+  }
+
   // Label as private[scheduler] to allow tests to swap in different task set managers if necessary
   private[scheduler] def createTaskSetManager(
       taskSet: TaskSet,
@@ -460,6 +575,7 @@ private[spark] class TaskSchedulerImpl(
       maxLocality: TaskLocality,
       shuffledOffers: Seq[WorkerOffer],
       availableCpus: Array[BigDecimal],
+      availableOrdinaryCpus: Array[BigDecimal],
       availableResources: Array[ExecutorResourcesAmounts],
       tasks: IndexedSeq[ArrayBuffer[TaskDescription]])
     : (Boolean, Option[TaskLocality]) = {
@@ -480,8 +596,11 @@ private[spark] class TaskSchedulerImpl(
       // check whether the task can be scheduled to the executor base on resource profile.
       if (sc.resourceProfileManager
         .canBeScheduled(taskSetRpID, shuffledOffers(i).resourceProfileId)) {
+        val offeredCpus = if (taskSet.taskSet.isPipelined) availableCpus(i) else {
+          availableCpus(i).min(availableOrdinaryCpus(i))
+        }
         val taskResAssignmentsOpt = resourcesMeetTaskRequirements(taskSet, taskCpus,
-          availableCpus(i), availableResources(i))
+          offeredCpus, availableResources(i))
         taskResAssignmentsOpt.foreach { taskResAssignments =>
           try {
             val (taskDescOption, didReject, index) =
@@ -503,6 +622,10 @@ private[spark] class TaskSchedulerImpl(
               minLaunchedLocality = minTaskLocality(minLaunchedLocality, Some(locality))
               availableCpus(i) = availableCpus(i) - taskCpus
               assert(availableCpus(i).signum >= 0)
+              if (!taskSet.taskSet.isPipelined) {
+                availableOrdinaryCpus(i) -= taskCpus
+                assert(availableOrdinaryCpus(i).signum >= 0)
+              }
               availableResources(i).acquire(resources)
             }
           } catch {
@@ -617,6 +740,8 @@ private[spark] class TaskSchedulerImpl(
     }
     val availableResources = shuffledOffers.map(_.resources).toArray
     val availableCpus = shuffledOffers.map(o => o.cores).toArray
+    val availableOrdinaryCpus = shuffledOffers.map(o => o.ordinaryCores.getOrElse(o.cores))
+      .toArray
     val resourceProfileIds = shuffledOffers.map(o => o.resourceProfileId).toArray
     val sortedTaskSets = rootPool.getSortedTaskSetQueue
     for (taskSet <- sortedTaskSets) {
@@ -636,7 +761,12 @@ private[spark] class TaskSchedulerImpl(
       val numBarrierSlotsAvailable = if (taskSet.isBarrier) {
         val rpId = taskSet.taskSet.resourceProfileId
         val resAmounts = availableResources.map(_.resourceAddressAmount)
-        calculateAvailableSlots(this, conf, rpId, resourceProfileIds, availableCpus, resAmounts)
+        val barrierCpus = if (taskSet.taskSet.isPipelined) availableCpus else {
+          availableCpus.zip(availableOrdinaryCpus).map { case (all, ordinary) =>
+            all.min(ordinary)
+          }
+        }
+        calculateAvailableSlots(this, conf, rpId, resourceProfileIds, barrierCpus, resAmounts)
       } else {
         -1
       }
@@ -658,7 +788,7 @@ private[spark] class TaskSchedulerImpl(
           do {
             val (noDelayScheduleReject, minLocality) = resourceOfferSingleTaskSet(
               taskSet, currentMaxLocality, shuffledOffers, availableCpus,
-              availableResources, tasks)
+              availableOrdinaryCpus, availableResources, tasks)
             launchedTaskAtCurrentMaxLocality = minLocality.isDefined
             launchedAnyTask |= launchedTaskAtCurrentMaxLocality
             noDelaySchedulingRejects &= noDelayScheduleReject
@@ -774,6 +904,9 @@ private[spark] class TaskSchedulerImpl(
                 // revert all assigned resources
                 availableCpus(task.assignedOfferIndex) =
                   availableCpus(task.assignedOfferIndex) + task.assignedCores
+                if (!taskSet.taskSet.isPipelined) {
+                  availableOrdinaryCpus(task.assignedOfferIndex) += task.assignedCores
+                }
                 availableResources(task.assignedOfferIndex).release(
                   task.assignedResources)
                 // re-add the task to the schedule pending list
@@ -1143,6 +1276,7 @@ private[spark] class TaskSchedulerImpl(
    * Cleans up the TaskScheduler's state for tracking the given task.
    */
   private def cleanupTaskState(tid: Long): Unit = {
+    releasedPipelinedReaders.remove(tid)
     taskIdToTaskSetManager.remove(tid)
     taskIdToExecutorId.remove(tid).foreach { executorId =>
       executorIdToRunningTaskIds.get(executorId).foreach { _.remove(tid) }

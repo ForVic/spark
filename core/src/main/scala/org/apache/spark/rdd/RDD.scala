@@ -116,6 +116,14 @@ abstract class RDD[T: ClassTag](
   def compute(split: Partition, context: TaskContext): Iterator[T]
 
   /**
+   * Prepare live shuffle connections without evaluating records or waiting for input. A consumer
+   * that visits several inputs lazily can call this before computing any of them, so writers for
+   * later inputs do not occupy execution slots waiting for their readers to connect. This must be
+   * idempotent within a task and release prepared resources at task completion.
+   */
+  private[spark] def preparePipelinedInput(split: Partition, context: TaskContext): Unit = {}
+
+  /**
    * Implemented by subclasses to return the set of partitions in this RDD. This method will only
    * be called once, so it is safe to implement a time-consuming computation in it.
    *

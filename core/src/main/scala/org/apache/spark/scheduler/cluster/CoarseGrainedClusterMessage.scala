@@ -64,6 +64,14 @@ private[spark] object CoarseGrainedClusterMessages {
   case class UpdateUserCredentials(version: Long, credentials: Array[Byte])
     extends CoarseGrainedClusterMessage
 
+  case class ReleaseTaskCpu(executorId: String, taskId: Long, sequence: Long)
+    extends CoarseGrainedClusterMessage
+
+  case class RequestTaskCpu(executorId: String, taskId: Long, sequence: Long)
+    extends CoarseGrainedClusterMessage
+
+  case class ResumeTaskCpu(taskId: Long, sequence: Long) extends CoarseGrainedClusterMessage
+
   // Executors to driver
   case class RegisterExecutor(
       executorId: String,

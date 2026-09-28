@@ -131,6 +131,28 @@ private[spark] trait BlockingShuffleManager extends ShuffleManager {
  */
 private[spark] trait PipelinedShuffleManager extends ShuffleManager {
   /**
+   * Opt in to finite batch groups. Every live reduce partition has one concurrent reader.
+   * Writers signal end of input and release their resources after consumption. A group may end
+   * in a regular materialized shuffle. Output cannot be replayed and any task failure aborts the
+   * group. This does not imply support for coalesced, skew-split or shared readers.
+   */
+  def supportsBatchExecution: Boolean = false
+
+  /**
+   * Producers can finish without a running consumer: published output survives their tasks,
+   * and bounded storage spills rather than waiting indefinitely for an unstarted reader.
+   * This permits executor-side queuing before producer operator state is initialized.
+   */
+  def supportsIndependentProducerCompletion: Boolean = false
+
+  /**
+   * Preferred payload per producer/reader stream when estimating reader parallelism. A framed
+   * transport can expose its existing buffer size to avoid fragmenting small outputs across many
+   * connections. Zero leaves sizing independent of transport framing. This is not a hard limit.
+   */
+  def advisoryBytesPerStream: Long = 0L
+
+  /**
    * Whether this manager relies on a `StreamingShuffleOutputTracker` to discover writer task
    * locations. The RPC streaming transport needs it (writers publish their host/port; readers
    * look them up to open connections). An in-process transport that finds writer and reader
@@ -157,13 +179,9 @@ private[spark] trait PipelinedShuffleManager extends ShuffleManager {
    * producer's task properties as `SPARK_PIPELINED_LIVE_REDUCE_PARTITIONS`, plus the per-run epoch
    * `SPARK_PIPELINED_RUN_EPOCH` that keys its rendezvous.
    *
-   * Only a transport whose writer would BLOCK on a partition nobody drains needs the hint: the
-   * in-process channel hands batches across a bounded queue, so feeding a reader-less partition
-   * fills it and parks the writer forever. A transport that does not block that way (the RPC
-   * streaming shuffle, whose writer never reads either property) returns false, and the scheduler
-   * then skips computing and stamping the hint entirely -- leaving the Real-Time Mode path exactly
-   * as it is without this feature, rather than paying for a hint nobody reads and risking an abort
-   * whose remedy does not apply to it.
+   * Both bounded queues and RPC writers waiting for completion acknowledgements need this
+   * hint to avoid waiting for unscheduled readers. The live set applies only to this job;
+   * a later partial read runs fresh producers. A missing hint means every reducer is live.
    */
   def supportsLiveReducePartitionHints: Boolean = false
 
@@ -209,9 +227,10 @@ private[spark] object ShuffleManager {
     val shortShuffleMgrNames = Map(
       "sort" -> classOf[org.apache.spark.shuffle.sort.SortShuffleManager].getName,
       "tungsten-sort" -> classOf[org.apache.spark.shuffle.sort.SortShuffleManager].getName,
+      "batch-memory" ->
+        classOf[org.apache.spark.shuffle.streaming.BatchMemoryShuffleManager].getName,
       "streaming" -> classOf[org.apache.spark.shuffle.streaming.StreamingShuffleManager].getName)
 
     shortShuffleMgrNames.getOrElse(shuffleMgrName.toLowerCase(Locale.ROOT), shuffleMgrName)
   }
 }
-

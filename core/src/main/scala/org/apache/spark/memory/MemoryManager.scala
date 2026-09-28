@@ -22,6 +22,7 @@ import javax.annotation.concurrent.GuardedBy
 import org.apache.spark.SparkConf
 import org.apache.spark.internal.Logging
 import org.apache.spark.internal.config._
+import org.apache.spark.resource.ResourceProfile
 import org.apache.spark.storage.BlockId
 import org.apache.spark.storage.memory.MemoryStore
 import org.apache.spark.unsafe.Platform
@@ -85,6 +86,14 @@ private[spark] abstract class MemoryManager(
    * depending on the MemoryManager implementation.
    */
   def maxOffHeapStorageMemory: Long
+
+  /** Storage's initial region, which execution cannot reclaim while it is occupied. */
+  private[spark] final def storageMemoryRegionSize(memoryMode: MemoryMode): Long = {
+    memoryMode match {
+      case MemoryMode.ON_HEAP => onHeapStorageMemory
+      case MemoryMode.OFF_HEAP => offHeapStorageMemory
+    }
+  }
 
   /**
    * Set the [[MemoryStore]] used by this manager to evict cached blocks.
@@ -245,28 +254,34 @@ private[spark] abstract class MemoryManager(
     }
   }
 
+  private val initialTungstenMemory: Long = tungstenMemoryMode match {
+    case MemoryMode.ON_HEAP => onHeapExecutionMemoryPool.poolSize
+    case MemoryMode.OFF_HEAP => offHeapExecutionMemoryPool.poolSize
+  }
+
+  private val configuredPageSizeBytes = conf.get(BUFFER_PAGESIZE)
+
   /**
-   * The default page size, in bytes.
+   * The default page size, in bytes, for a task's CPU reservation.
    *
-   * If user didn't explicitly set "spark.buffer.pageSize", we figure out the default value
-   * by looking at the number of cores available to the process, and the total amount of memory,
-   * and then divide it by a factor of safety.
+   * Fractional CPU reservations allow more tasks than cores. Account for that concurrency so
+   * that pinned pages in sorts and aggregations do not grow with CPU oversubscription. Retain
+   * the existing sizing for tasks reserving at least one CPU. This is allocation granularity,
+   * not a per-task memory limit; ordinary execution-memory arbitration still applies.
    *
    * SPARK-37593 If we are using G1GC, ZGC or ShenandoahGC, it's better to take the
    * LONG_ARRAY_OFFSET into consideration so that the requested memory size is power of 2
    * and can be divided by heap region size to reduce memory waste.
    */
-  private lazy val defaultPageSizeBytes = {
+  private def defaultPageSizeBytes(taskCpus: BigDecimal): Long = {
     val minPageSize = 1L * 1024 * 1024   // 1MB
     val maxPageSize = 64L * minPageSize  // 64MB
     val cores = if (numCores > 0) numCores else Runtime.getRuntime.availableProcessors()
+    val slots = math.max(cores,
+      ResourceProfile.numMemoryShareSlotsCeil(BigDecimal(cores), taskCpus))
     // Because of rounding to next power of 2, we may have safetyFactor as 8 in worst case
     val safetyFactor = 16
-    val maxTungstenMemory: Long = tungstenMemoryMode match {
-      case MemoryMode.ON_HEAP => onHeapExecutionMemoryPool.poolSize
-      case MemoryMode.OFF_HEAP => offHeapExecutionMemoryPool.poolSize
-    }
-    val size = ByteArrayMethods.nextPowerOf2(maxTungstenMemory / cores / safetyFactor)
+    val size = ByteArrayMethods.nextPowerOf2(initialTungstenMemory / slots / safetyFactor)
     val chosenPageSize = math.min(maxPageSize, math.max(minPageSize, size))
     if ((Utils.isG1GC || Utils.isZGC || Utils.isShenandoahGC) &&
         tungstenMemoryMode == MemoryMode.ON_HEAP) {
@@ -276,7 +291,13 @@ private[spark] abstract class MemoryManager(
     }
   }
 
-  val pageSizeBytes: Long = conf.get(BUFFER_PAGESIZE).getOrElse(defaultPageSizeBytes)
+  val pageSizeBytes: Long = pageSizeBytesForTask(conf.get(CPUS_PER_TASK))
+
+  // Use the task's reservation, not the executor's profile: task-only profiles can share an
+  // executor. Capture this value in TaskMemoryManager before the task starts or allocates pages.
+  def pageSizeBytesForTask(taskCpus: BigDecimal): Long = {
+    configuredPageSizeBytes.getOrElse(defaultPageSizeBytes(taskCpus))
+  }
 
   /**
    * Allocates memory for use by Unsafe/Tungsten code.

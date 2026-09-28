@@ -21,7 +21,7 @@ import scala.collection.mutable
 
 import org.apache.spark.sql.catalyst.rules.Rule
 import org.apache.spark.sql.execution.{BinaryExecNode, SparkPlan}
-import org.apache.spark.sql.execution.exchange.{PipelinedShuffleEligibility, ReusedExchangeExec, ShuffleExchangeExec}
+import org.apache.spark.sql.execution.exchange.{PipelinedShuffleEligibility, PlanBatchPipelinedShuffle, ReusedExchangeExec, ShuffleExchangeExec}
 import org.apache.spark.sql.execution.joins.ShuffledJoin
 
 /**
@@ -38,6 +38,7 @@ import org.apache.spark.sql.execution.joins.ShuffledJoin
 object AQEEnablePipelinedShuffle extends Rule[SparkPlan] {
 
   override def apply(plan: SparkPlan): SparkPlan = {
+    if (conf.batchPipelinedShuffleEnabled) return PlanBatchPipelinedShuffle(plan)
     // Shared environment gate (opt-in flag, single-executor local mode, channel manager active),
     // identical to the non-AQE rule's -- see PipelinedShuffleEligibility for why it is a
     // correctness gate that must not drift between the two rules.

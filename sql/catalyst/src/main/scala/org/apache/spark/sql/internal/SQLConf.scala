@@ -1280,6 +1280,41 @@ object SQLConf {
     .booleanConf
     .createWithDefault(true)
 
+  val BATCH_PIPELINED_SHUFFLE_ENABLED = buildConf("spark.sql.shuffle.pipelined.enabled")
+    .internal()
+    .doc("Experimental batch pipelining with or without AQE. Exchanges use the configured " +
+      "pipelined shuffle manager in local or distributed execution. Connected stages must " +
+      "fit concurrent task capacity; materialized boundaries retain AQE statistics and reuse. " +
+      "A failure aborts the execution instead of retrying individual stages. Requires static " +
+      "resources and speculation disabled. RDD exports and cache construction stay regular.")
+    .version("4.4.0")
+    .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
+    .booleanConf
+    .createWithDefault(false)
+
+  val BATCH_PIPELINED_SHUFFLE_COALESCE_ENABLED =
+    buildConf("spark.sql.shuffle.pipelined.coalescePartitions.enabled")
+      .internal()
+      .doc("Coalesce selected batch pipelined hash exchanges before execution, using logical " +
+        "size estimates and the adaptive shuffle partition sizing settings. Compatible inputs " +
+        "share one fixed layout. Unknown estimates and explicitly requested partition counts " +
+        "are preserved. This does not collect runtime shuffle statistics or split skewed keys.")
+      .version("4.4.0")
+      .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
+      .booleanConf
+      .createWithDefault(false)
+
+  val BATCH_PIPELINED_SHUFFLE_COALESCE_PARALLELISM_FIRST =
+    buildConf("spark.sql.shuffle.pipelined.coalescePartitions.parallelismFirst")
+      .internal()
+      .doc("Whether estimated live reader coalescing prioritizes the default parallelism over " +
+        "the advisory partition size. If unset, inherits the adaptive coalescing policy. " +
+        "Setting false sizes live readers independently of materialized AQE shuffles.")
+      .version("4.4.0")
+      .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
+      .booleanConf
+      .createOptional
+
   val LOCAL_PIPELINED_SHUFFLE_ENABLED = buildConf("spark.sql.shuffle.localPipelined.enabled")
     .internal()
     .doc("When true in local mode, eligible shuffle exchanges use the in-process channel " +
@@ -1287,7 +1322,7 @@ object SQLConf {
       "run concurrently. Plans whose estimated group width exceeds the local task capacity, " +
       "or whose width cannot be determined, retain regular shuffles. In particular, ordinary " +
       "non-bucketed file scans report unknown widths and stay regular. Runtime admission still " +
-      "checks available slots and can reject a group when other work occupies them. " +
+      "checks available slots and queues groups while other work occupies them. " +
       "Pipelined exchanges do not receive AQE coalescing. Dataset.rdd, toLocalIterator, cache " +
       "construction, cached inputs and mixed AQE plans use regular shuffles. Concurrent " +
       "actions sharing a pipelined exchange remain unsupported. Other multi-job consumers " +
@@ -9064,6 +9099,8 @@ class SQLConf extends Serializable with Logging with SqlApiConf {
   def schemaLevelCollationsEnabled: Boolean = getConf(SCHEMA_LEVEL_COLLATIONS_ENABLED)
 
   def adaptiveExecutionEnabled: Boolean = getConf(ADAPTIVE_EXECUTION_ENABLED)
+
+  def batchPipelinedShuffleEnabled: Boolean = getConf(BATCH_PIPELINED_SHUFFLE_ENABLED)
 
   def localPipelinedShuffleEnabled: Boolean = getConf(LOCAL_PIPELINED_SHUFFLE_ENABLED)
 

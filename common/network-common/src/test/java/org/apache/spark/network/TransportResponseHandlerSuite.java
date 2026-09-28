@@ -95,7 +95,7 @@ public class TransportResponseHandlerSuite {
   @Test
   public void handleSuccessfulRPC() throws Exception {
     TransportResponseHandler handler = new TransportResponseHandler(new LocalChannel());
-    RpcResponseCallback callback = mock(RpcResponseCallback.class);
+    RpcResponseCallback callback = mock(RpcResponseCallback.class, CALLS_REAL_METHODS);
     handler.addRpcRequest(12345, callback);
     assertEquals(1, handler.numOutstandingRequests());
 

@@ -25,4 +25,8 @@ import org.apache.spark.ShuffleDependency
 private[spark] class BaseShuffleHandle[K, V, C](
     shuffleId: Int,
     val dependency: ShuffleDependency[K, V, C])
-  extends ShuffleHandle(shuffleId)
+  extends ShuffleHandle(shuffleId) {
+
+  /** Whether another executor on this host can read the output directly from local disk. */
+  def supportsHostLocalDiskRead: Boolean = true
+}

@@ -30,14 +30,9 @@ import org.apache.spark.sql.execution.joins.CartesianProductExec
 import org.apache.spark.sql.internal.SQLConf
 
 /**
- * Shared environment gate for the two pipelined-shuffle enabling rules
- * ([[EnablePipelinedShuffle]] non-AQE and `AQEEnablePipelinedShuffle` under AQE). This is a
- * CORRECTNESS gate, not cosmetics: flipping an exchange to pipelined while the incremental manager
- * is still the RPC streaming one would route it to an untested transport that reports
- * `requiresDetachedRecords = false`, so the SQL layer would skip the row copy and silently corrupt
- * rows shared across the writer/reader threads. Both rules must apply the identical gate, so it
- * lives here rather than being copy-pasted into each `apply` (where the two could drift and split
- * AQE vs non-AQE behavior). Each rule keeps only its own plan-shape logic.
+ * Shared environment and execution-boundary checks for batch pipelining. The original local
+ * flag selects the channel-only policy; the generic batch flag requires a transport that explicitly
+ * supports finite batch groups. Row ownership is specified separately by requiresDetachedRecords.
  */
 private[sql] object PipelinedShuffleEligibility extends Logging {
 
@@ -75,18 +70,13 @@ private[sql] object PipelinedShuffleEligibility extends Logging {
     fits
   }
 
-  /**
-   * Whether the pipelined channel transport may be used for `plan` at all, independent of plan
-   * shape. Requires: the opt-in flag on; single-executor local mode (the in-process channel
-   * transport needs producer and consumer in one JVM); and the configured incremental manager
-   * actually being the in-process channel manager. Returns false (with a DEBUG diagnostic) when
-   * any gate fails, so the caller leaves the plan regular.
-   */
+  /** Whether this environment supports batch pipelining, independent of exchange selection. */
   def enabled(plan: SparkPlan, conf: SQLConf): Boolean = {
-    if (!conf.localPipelinedShuffleEnabled) {
+    if (!conf.localPipelinedShuffleEnabled && !conf.batchPipelinedShuffleEnabled) {
       return false
     }
-    if (plan.session == null || !plan.session.sparkContext.isLocal) {
+    if (plan.session == null ||
+        (!conf.batchPipelinedShuffleEnabled && !plan.session.sparkContext.isLocal)) {
       return false
     }
     // Batch only. `IncrementalExecution.preparations` inherits QueryExecution's list, so without
@@ -113,6 +103,12 @@ private[sql] object PipelinedShuffleEligibility extends Logging {
       logDebug("Pipelined shuffle: the plan is a streaming plan; leaving it to the streaming " +
         "engine's own pipelined-shuffle marking.")
       return false
+    }
+    if (conf.batchPipelinedShuffleEnabled) {
+      val sc = plan.session.sparkContext
+      return !sc.conf.get(config.SPECULATION_ENABLED) &&
+        !org.apache.spark.util.Utils.isDynamicAllocationEnabled(sc.conf) &&
+        SparkEnv.get.pipelinedShuffleManager.supportsBatchExecution
     }
     if (!SparkEnv.get.pipelinedShuffleManager.isInstanceOf[PipelinedChannelShuffleManager]) {
       // WARN, not DEBUG, and once per JVM: the user asked for this feature and is silently not

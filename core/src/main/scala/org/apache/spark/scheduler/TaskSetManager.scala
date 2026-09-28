@@ -480,7 +480,7 @@ private[spark] class TaskSetManager(
       excludeList.isNodeExcludedForTaskSet(host) ||
         excludeList.isExecutorExcludedForTaskSet(execId)
     }
-    if (!isZombie && !offerExcluded) {
+    if (!isZombie && !offerExcluded && sched.canLaunchPipelinedSource(this)) {
       val curTime = clock.getTimeMillis()
 
       var allowedLocality = maxLocality
@@ -593,6 +593,14 @@ private[spark] class TaskSetManager(
       }))
 
     sched.dagScheduler.taskStarted(task, info)
+    val taskProperties = if (taskSet.isPipelined) {
+      val copy = Option(Utils.cloneProperties(task.localProperties))
+        .getOrElse(new java.util.Properties())
+      copy.setProperty(org.apache.spark.executor.TaskCpuLease.PROPERTY, "true")
+      copy
+    } else {
+      task.localProperties
+    }
     new TaskDescription(
       taskId,
       attemptNum,
@@ -601,7 +609,7 @@ private[spark] class TaskSetManager(
       index,
       task.partitionId,
       task.artifacts,
-      task.localProperties,
+      taskProperties,
       taskCpus,
       taskResourceAssignments,
       Option(env.userCredentials.get()).map(vc => (vc.version, vc.bytes)),

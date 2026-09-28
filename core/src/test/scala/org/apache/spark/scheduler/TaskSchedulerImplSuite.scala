@@ -208,6 +208,193 @@ class TaskSchedulerImplSuite extends SparkFunSuite with LocalSparkContext
     assert(!failedTaskSet)
   }
 
+  gridTest("resident offers bound ordinary queues across task sets and retain live capacity")(
+      Seq("1", "0.75")) { cpus =>
+    val scheduler = setupScheduler(config.CPUS_PER_TASK.key -> cpus)
+    scheduler.submitTasks(FakeTask.createTaskSet(1, stageId = 0, stageAttemptId = 0))
+    scheduler.submitTasks(FakeTask.createTaskSet(8, stageId = 1, stageAttemptId = 0))
+    val limit = BigDecimal(cpus) * 2
+    val first = scheduler.resourceOffers(IndexedSeq(
+      WorkerOffer("executor0", "host0", 32, ordinaryCores = Some(limit)))).flatten
+    assert(first.size == 2)
+    val second = scheduler.resourceOffers(IndexedSeq(
+      WorkerOffer("executor1", "host1", 32, ordinaryCores = Some(limit)))).flatten
+    assert(second.size == 2, "ordinary work must remain available for another executor")
+    val base = FakeTask.createTaskSet(4, stageId = 2, stageAttemptId = 0)
+    scheduler.submitTasks(new TaskSet(base.tasks, 2, 0, 0, base.properties,
+      base.resourceProfileId, None, isPipelined = true))
+    val live = scheduler.resourceOffers(IndexedSeq(
+      WorkerOffer("executor0", "host0", 30, ordinaryCores = Some(BigDecimal(0))))).flatten
+    assert(live.size == 4)
+    assert(live.forall(t => scheduler.taskIdToTaskSetManager.get(t.taskId).taskSet.isPipelined))
+  }
+
+  test("ordinary barrier admission cannot count extra resident slots") {
+    val scheduler = setupScheduler()
+    scheduler.submitTasks(FakeTask.createBarrierTaskSet(3))
+    assert(scheduler.resourceOffers(IndexedSeq(
+      WorkerOffer("executor0", "host0", 32, Some("host0:1"),
+        ordinaryCores = Some(BigDecimal(2)))))
+      .flatten.isEmpty)
+    assert(scheduler.resourceOffers(IndexedSeq(
+      WorkerOffer("executor0", "host0", 32, Some("host0:1"),
+        ordinaryCores = Some(BigDecimal(3)))))
+      .flatten.size == 3)
+  }
+
+  test("Scheduler expands an active producer wave only to its updated concurrency limit") {
+    val scheduler = setupScheduler()
+    val taskSet = FakeTask.createTaskSet(6)
+    taskSet.maxConcurrentTasks = 1
+    scheduler.submitTasks(taskSet)
+    def offer(cores: Int): Int = {
+      scheduler.resourceOffers(IndexedSeq(WorkerOffer("executor0", "host0", cores)))
+        .flatten.size
+    }
+    assert(offer(8) == 1)
+    scheduler.increaseTaskSetConcurrencyLimits(Map(taskSet.stageId -> 3))
+    assert(offer(7) == 2)
+    assert(offer(5) == 0, "free executor slots cannot exceed the reader reservation")
+    scheduler.increaseTaskSetConcurrencyLimits(Map(taskSet.stageId -> 2))
+    assert(taskSet.maxConcurrentTasks == 3, "an increase must not lower an active limit")
+    assert(offer(5) == 0)
+  }
+
+  test("released readers lend a bounded source wave across their group only") {
+    val scheduler = setupScheduler()
+    def tasks(stage: Int, source: Boolean, group: Int): TaskSet = {
+      val base = FakeTask.createTaskSet(4, stageId = stage, stageAttemptId = 0)
+      new TaskSet(base.tasks, stage, 0, 0, base.properties, base.resourceProfileId, None,
+        isPipelined = true, maxConcurrentTasks = 1, pipelinedGroupId = Some(group),
+        isPipelinedSource = source)
+    }
+    val reader = tasks(0, source = false, group = 0)
+    val source1 = tasks(1, source = true, group = 0)
+    val source2 = tasks(2, source = true, group = 0)
+    val neighbor = tasks(3, source = true, group = 3)
+    Seq(reader, source1, source2, neighbor).foreach(scheduler.submitTasks)
+    def offer(): Seq[TaskDescription] = {
+      scheduler.resourceOffers(IndexedSeq(WorkerOffer("executor0", "host0", 8))).flatten
+    }
+    val initial = offer()
+    assert(initial.size == 4)
+    val readerId = initial.find(t =>
+      scheduler.taskIdToTaskSetManager.get(t.taskId).taskSet == reader).get.taskId
+    val writerId = initial.find(t =>
+      scheduler.taskIdToTaskSetManager.get(t.taskId).taskSet == source1).get.taskId
+    scheduler.taskCpuReleased(writerId, true)
+    assert(offer().isEmpty, "blocked writers must not grow the resident source wave")
+    scheduler.taskCpuReleased(readerId, true)
+    val extra = offer()
+    assert(extra.size == 1, "one reader lends only one slot across all source task sets")
+    assert(scheduler.taskIdToTaskSetManager.get(extra.head.taskId).taskSet != neighbor)
+    assert(offer().isEmpty)
+    scheduler.taskCpuReleased(readerId, false)
+    assert(offer().isEmpty)
+  }
+
+  test("live reservations bound older ordinary queues and borrowed producer residency") {
+    val scheduler = setupScheduler()
+    val ordinary = FakeTask.createTaskSet(8, stageId = 0, stageAttemptId = 0)
+    def liveTasks(stage: Int, source: Boolean, count: Int): TaskSet = {
+      val base = FakeTask.createTaskSet(count, stageId = stage, stageAttemptId = 0)
+      new TaskSet(base.tasks, stage, 0, 1, base.properties, base.resourceProfileId, None,
+        isPipelined = true, maxConcurrentTasks = 2, pipelinedGroupId = Some(1),
+        isPipelinedSource = source)
+    }
+    val source = liveTasks(1, source = true, count = 4)
+    val readers = liveTasks(2, source = false, count = 2)
+    scheduler.submitTasks(ordinary)
+    scheduler.updatePipelinedReservations(Set(1, 2), reservedTasks = 4, capacity = 6)
+    Seq(source, readers).foreach(scheduler.submitTasks)
+    def offer(): Seq[TaskDescription] = {
+      scheduler.resourceOffers(IndexedSeq(WorkerOffer("executor0", "host0", 6))).flatten
+    }
+    val initial = offer()
+    def stage(task: TaskDescription): Int =
+      scheduler.taskIdToTaskSetManager.get(task.taskId).taskSet.stageId
+    assert(initial.groupBy(stage).view.mapValues(_.size).toMap == Map(0 -> 2, 1 -> 2, 2 -> 2))
+    assert(offer().isEmpty)
+    initial.filter(stage(_) == 2).foreach(t => scheduler.taskCpuReleased(t.taskId, true))
+    val borrowed = offer()
+    assert(borrowed.size == 2 && borrowed.forall(stage(_) == 0))
+    assert(offer().isEmpty, "released CPUs must not increase non-reader residency above capacity")
+    scheduler.updatePipelinedReservations(Set.empty, 0, 0)
+    assert(offer().count(stage(_) == 0) == 4, "remaining ordinary backlog resumes after release")
+  }
+
+  test("ordinary work borrows only released resident readers in reserved groups") {
+    val scheduler = setupScheduler()
+    val ordinary = FakeTask.createTaskSet(8, stageId = 0, stageAttemptId = 0)
+    def liveTasks(stage: Int, source: Boolean): TaskSet = {
+      val base = FakeTask.createTaskSet(2, stageId = stage, stageAttemptId = 0)
+      new TaskSet(base.tasks, stage, 0, 1, base.properties, base.resourceProfileId, None,
+        isPipelined = true, maxConcurrentTasks = 2, pipelinedGroupId = Some(1),
+        isPipelinedSource = source)
+    }
+    scheduler.submitTasks(ordinary)
+    scheduler.updatePipelinedReservations(Set(1, 2), reservedTasks = 4, capacity = 6)
+    Seq(liveTasks(1, source = true), liveTasks(2, source = false))
+      .foreach(scheduler.submitTasks)
+    def offer(): Seq[TaskDescription] = {
+      scheduler.resourceOffers(IndexedSeq(WorkerOffer("executor0", "host0", 6))).flatten
+    }
+    def stage(task: TaskDescription): Int =
+      scheduler.taskIdToTaskSetManager.get(task.taskId).taskSet.stageId
+    val initial = offer()
+    assert(initial.groupBy(stage).view.mapValues(_.size).toMap == Map(0 -> 2, 1 -> 2, 2 -> 2))
+    val ordinaryTask = initial.find(stage(_) == 0).get
+    val ordinaryManager = scheduler.taskIdToTaskSetManager.get(ordinaryTask.taskId)
+    assert(!scheduler.canLaunchPipelinedSource(ordinaryManager),
+      "future reader capacity remains reserved")
+    initial.filter(stage(_) == 1).foreach(t => scheduler.taskCpuReleased(t.taskId, true))
+    assert(!scheduler.canLaunchPipelinedSource(ordinaryManager),
+      "blocked writers must not increase non-reader residency")
+    val readers = initial.filter(stage(_) == 2)
+    readers.foreach(t => scheduler.taskCpuReleased(t.taskId, true))
+    assert(scheduler.canLaunchPipelinedSource(ordinaryManager),
+      "ordinary work can use a resident reader's released capacity")
+    val readerManager = scheduler.taskIdToTaskSetManager.get(readers.head.taskId)
+    readerManager.isZombie = true
+    assert(!scheduler.canLaunchPipelinedSource(ordinaryManager),
+      "retired readers cannot lend capacity while their task cleanup is pending")
+    readerManager.isZombie = false
+    scheduler.updatePipelinedReservations(Set(1), reservedTasks = 4, capacity = 6)
+    assert(!scheduler.canLaunchPipelinedSource(ordinaryManager),
+      "readers outside the reserved group cannot enlarge its ordinary-work allowance")
+    scheduler.updatePipelinedReservations(Set(1, 2), reservedTasks = 4, capacity = 6)
+    readers.foreach(t => scheduler.taskCpuReleased(t.taskId, false))
+    assert(!scheduler.canLaunchPipelinedSource(ordinaryManager),
+      "resumed readers reclaim their allowance before more ordinary tasks launch")
+    readers.foreach(t => scheduler.taskCpuReleased(t.taskId, true))
+    val borrowed = offer()
+    assert(borrowed.size == 2 && borrowed.forall(stage(_) == 0))
+    assert(offer().isEmpty, "borrowing preserves the existing non-reader residency bound")
+  }
+
+  test("live reservations do not count an unmanaged pipelined task set as ordinary work") {
+    val scheduler = setupScheduler()
+    val base = FakeTask.createTaskSet(2, stageId = 3, stageAttemptId = 0)
+    val live = new TaskSet(base.tasks, 3, 0, 0, base.properties, base.resourceProfileId, None,
+      isPipelined = true)
+    scheduler.submitTasks(live)
+    assert(!scheduler.canReservePipelinedTasks(Set(1, 2)))
+    assert(scheduler.canReservePipelinedTasks(Set(1, 2, 3)))
+  }
+
+  test("live reservations preserve the complete demand of an ordinary barrier task set") {
+    val scheduler = setupScheduler(4)
+    val barrier = FakeTask.createBarrierTaskSet(3)
+    scheduler.submitTasks(barrier)
+    val offers = IndexedSeq(WorkerOffer("executor0", "host0", 4, Some("192.168.0.1:1234")))
+    scheduler.updatePipelinedReservations(Set(1), reservedTasks = 2, capacity = 4)
+    assert(scheduler.resourceOffers(offers).flatten.isEmpty,
+      "three barrier tasks cannot launch into two unreserved slots")
+    scheduler.updatePipelinedReservations(Set(1), reservedTasks = 1, capacity = 4)
+    assert(scheduler.resourceOffers(offers).flatten.size == 3,
+      "the complete barrier task set launches once its three slots are available")
+  }
+
   test("Scheduler correctly accounts for multiple CPUs per task") {
     val taskCpus = 2
     val taskScheduler = setupSchedulerWithMaster(

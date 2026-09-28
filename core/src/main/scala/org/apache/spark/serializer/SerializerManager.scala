@@ -160,6 +160,11 @@ private[spark] class SerializerManager(
     if (shouldCompress(blockId)) compressionCodec.compressedOutputStream(s) else s
   }
 
+  /** Keep buffering for streams whose codec does not absorb small serializer writes cheaply. */
+  def serializerNeedsBuffering(blockId: BlockId): Boolean = {
+    !shouldCompress(blockId) || !compressionCodec.buffersSmallWrites
+  }
+
   /**
    * Wrap an output stream so that bytes written through it are folded into `checksum`.
    *

@@ -46,6 +46,9 @@ trait CompressionCodec {
 
   def compressedOutputStream(s: OutputStream): OutputStream
 
+  /** Whether small writes can avoid an additional buffer above the compression stream. */
+  private[spark] def buffersSmallWrites: Boolean = false
+
   private[spark] def compressedContinuousOutputStream(s: OutputStream): OutputStream = {
     compressedOutputStream(s)
   }
@@ -140,6 +143,8 @@ class LZ4CompressionCodec(conf: SparkConf) extends CompressionCodec {
 
   private[this] val defaultSeed: Int = 0x9747b28c // LZ4BlockOutputStream.DEFAULT_SEED
   private[this] val blockSize = conf.get(IO_COMPRESSION_LZ4_BLOCKSIZE).toInt
+
+  override private[spark] def buffersSmallWrites: Boolean = true
 
   override def compressedOutputStream(s: OutputStream): OutputStream = {
     val syncFlush = false

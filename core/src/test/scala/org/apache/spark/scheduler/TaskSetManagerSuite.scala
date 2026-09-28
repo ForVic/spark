@@ -281,6 +281,24 @@ class TaskSetManagerSuite
     assert(sched.finishedManagers.contains(manager))
   }
 
+  test("a source task limit leaves offers for readers and admits the next producer wave") {
+    sc = new SparkContext("local", "test")
+    sched = new FakeTaskScheduler(sc, ("exec1", "host1"), ("exec2", "host2"))
+    val original = FakeTask.createTaskSet(3)
+    val taskSet = new TaskSet(original.tasks, original.stageId, original.stageAttemptId,
+      original.priority, original.properties, original.resourceProfileId, original.shuffleId,
+      isPipelined = true, maxConcurrentTasks = 1)
+    val manager = new TaskSetManager(sched, taskSet, MAX_TASK_FAILURES)
+    val first = manager.resourceOffer("exec1", "host1", ANY)._1.get
+    assert(manager.resourceOffer("exec2", "host2", ANY)._1.isEmpty)
+    manager.handleSuccessfulTask(first.taskId,
+      createTaskResult(first.index, taskSet.tasks(first.index).metrics.internalAccums))
+    val second = manager.resourceOffer("exec2", "host2", ANY)._1.get
+    assert(second.index != first.index)
+    assert(manager.runningTasks == 1)
+    assert(manager.resourceOffer("exec1", "host1", ANY)._1.isEmpty)
+  }
+
   test("TaskSet with no preferences") {
     sc = new SparkContext("local", "test")
     sched = new FakeTaskScheduler(sc, ("exec1", "host1"))

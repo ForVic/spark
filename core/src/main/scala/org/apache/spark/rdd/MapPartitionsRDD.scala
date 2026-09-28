@@ -53,6 +53,12 @@ private[spark] class MapPartitionsRDD[U: ClassTag, T: ClassTag](
 
   override def getPartitions: Array[Partition] = firstParent[T].partitions
 
+  override private[spark] def preparePipelinedInput(
+      split: Partition,
+      context: TaskContext): Unit = {
+    firstParent[T].preparePipelinedInput(split, context)
+  }
+
   override def compute(split: Partition, context: TaskContext): Iterator[U] =
     f(context, split.index, firstParent[T].iterator(split, context))
 

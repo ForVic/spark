@@ -210,6 +210,50 @@ class RDDSuite extends SparkFunSuite with SharedSparkContext with Eventually {
     assert(union.partitioner === nums1.partitioner)
   }
 
+  test("partitioner aware union prepares all inputs without evaluating records") {
+    val events = ArrayBuffer.empty[String]
+    def input(inputName: String): RDD[Int] = new RDD[Int](sc, Nil) {
+      override val partitioner = Some(new HashPartitioner(1))
+      override def getPartitions: Array[Partition] = Array(new Partition {
+        override val index = 0
+      })
+      override private[spark] def preparePipelinedInput(
+          split: Partition,
+          context: TaskContext): Unit = {
+        events += s"prepare $inputName"
+      }
+      override def compute(split: Partition, context: TaskContext): Iterator[Int] = {
+        events += s"compute $inputName"
+        Iterator(1)
+      }
+    }
+    val left = input("left").mapPartitions({ rows =>
+      events += "evaluate left"
+      rows
+    }, preservesPartitioning = true)
+    val right = input("right").mapPartitionsWithEvaluator(
+      new PartitionEvaluatorFactory[Int, Int] {
+        override def createEvaluator(): PartitionEvaluator[Int, Int] = {
+          events += "create evaluator"
+          new PartitionEvaluator[Int, Int] {
+            override def eval(index: Int, inputs: Iterator[Int]*): Iterator[Int] = {
+              events += "evaluate right"
+              inputs.head
+            }
+          }
+        }
+      })
+    val union = new SQLPartitioningAwareUnionRDD(sc, Seq(left, right), 1)
+    val rows = union.compute(union.partitions.head, TaskContext.empty())
+    assert(events.toSeq == Seq("prepare left", "prepare right"))
+    assert(rows.next() == 1)
+    assert(!events.contains("compute right"))
+    assert(!events.contains("create evaluator"))
+    assert(rows.toList == List(1))
+    assert(events.toSeq == Seq("prepare left", "prepare right", "compute left",
+      "evaluate left", "create evaluator", "compute right", "evaluate right"))
+  }
+
   test("UnionRDD partition serialized size should be small") {
     val largeVariable = new Array[Byte](1000 * 1000)
     val rdd1 = sc.parallelize(1 to 10, 2).map(i => largeVariable.length)
