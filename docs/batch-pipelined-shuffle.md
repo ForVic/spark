@@ -25,6 +25,9 @@ producers finish. It works with Spark core RDD execution and SQL, with or withou
 query execution (AQE). Selection depends on the execution graph and available resources.
 The feature is disabled by default and does not change Structured Streaming planning.
 
+For development history, benchmark results, rejected experiments, and outstanding review work,
+see the [experiment and handoff guide](batch-pipelined-shuffle-handoff.md).
+
 ## Enable
 
 Set these properties when creating the SparkContext:
