@@ -17,10 +17,11 @@
 
 package org.apache.spark.shuffle.streaming
 
+import java.io.ByteArrayInputStream
 import java.util.Properties
 import java.util.zip.CRC32C
 
-import io.netty.buffer.{ByteBuf, Unpooled}
+import io.netty.buffer.{ByteBuf, ByteBufInputStream, Unpooled}
 import io.netty.channel.{Channel, ChannelConfig, ChannelFuture}
 import io.netty.util.concurrent.GenericFutureListener
 import org.mockito.ArgumentMatchers.any
@@ -34,15 +35,19 @@ import org.scalatestplus.mockito.MockitoSugar
 import org.apache.spark._
 import org.apache.spark.LocalSparkContext.withSpark
 import org.apache.spark.internal.config.{
+  IO_COMPRESSION_CODEC,
+  SHUFFLE_COMPRESS,
   SHUFFLE_MANAGER_INCREMENTAL,
   STREAMING_SHUFFLE_CHECKSUM_ENABLED,
   STREAMING_SHUFFLE_NETWORK_BUFFER_MAX_WAIT_TIME_MS,
   STREAMING_SHUFFLE_NETWORK_BUFFER_SIZE,
   STREAMING_SHUFFLE_WRITER_CONNECTION_TIMEOUT_MS}
+import org.apache.spark.io.CompressionCodec
 import org.apache.spark.memory.{TaskMemoryManager, TestMemoryManager}
 import org.apache.spark.metrics.MetricsSystem
 import org.apache.spark.network.client.TransportClient
 import org.apache.spark.network.shuffle.streaming.{DataMessage, StreamingShuffleMessage, TerminationControlMessage}
+import org.apache.spark.serializer.JavaSerializer
 import org.apache.spark.shuffle.streaming.StreamingShuffleManager.QUERY_ID_PROPERTY_KEY
 import org.apache.spark.util.ErrorNotifier
 
@@ -319,8 +324,56 @@ class StreamingShuffleWriterSuite
     }
   }
 
+  gridTest("data frames honor shuffle compression and codec")(
+      for (enabled <- Seq(false, true); codec <- Seq("lz4", "lzf", "snappy", "zstd"))
+        yield (enabled, codec)) { case (enabled, codecName) =>
+    val conf = newConf().set(SHUFFLE_COMPRESS, enabled).set(IO_COMPRESSION_CODEC, codecName)
+      .set(STREAMING_SHUFFLE_NETWORK_BUFFER_SIZE, 4096)
+    withSpark(new SparkContext("local", "StreamingShuffleWriterSuite", conf)) { sc =>
+      val context = createTaskContext(sc.conf, 0)
+      try {
+        val writer = newWriter(sc, context)
+        val codec = CompressionCodec.createCodec(sc.conf)
+        val records = scala.collection.mutable.ArrayBuffer.empty[(Any, Any)]
+        var wireBytes = 0L
+        var decodedBytes = 0L
+        var frames = 0
+        bindMockClient(writer, 0) { buffer =>
+          val message = StreamingShuffleMessage.decode(buffer)
+          try {
+            message match {
+              case data: DataMessage =>
+                frames += 1
+                wireBytes += data.dataSize
+                val input = new ByteBufInputStream(data.getRecordData())
+                val decoded = if (enabled) codec.compressedInputStream(input) else input
+                val bytes = try decoded.readAllBytes() finally decoded.close()
+                decodedBytes += bytes.length
+                records ++= new JavaSerializer(sc.conf).newInstance()
+                  .deserializeStream(new ByteArrayInputStream(bytes)).asKeyValueIterator
+              case _: TerminationControlMessage =>
+              case other => fail(s"Unexpected message: $other")
+            }
+          } finally {
+            message.release()
+          }
+        }
+        writer.allAcksReceived.countDown()
+        val expected = (1 to 1000).map(i => (i % 4, 42))
+        writer.write(expected.iterator)
+        assert(records.toSeq == expected)
+        assert(frames > 1)
+        if (enabled) assert(wireBytes < decodedBytes / 2) else assert(wireBytes == decodedBytes)
+        assert(writer.errorNotifier.getError().isEmpty)
+      } finally {
+        context.markTaskCompleted(None)
+      }
+    }
+  }
+
   test("checksum is computed and embedded in the DataMessage sent on the wire") {
     val conf = newConf().set(STREAMING_SHUFFLE_CHECKSUM_ENABLED, true)
+      .set(STREAMING_SHUFFLE_NETWORK_BUFFER_SIZE, 256)
     withSpark(new SparkContext("local", "StreamingShuffleWriterSuite", conf)) { sc =>
       val context = createTaskContext(sc.conf, 0)
       try {
@@ -331,32 +384,37 @@ class StreamingShuffleWriterSuite
         // client future is already resolved.
         bindMockClient(writer, 0) { buf => sentBuffers.add(buf.copy()) }
 
-        // Serialize a record through the writer's own buffer/checksum path and send it.
-        val tsBuffer = writer.TimestampedBuffer(Unpooled.directBuffer(1024))
-        tsBuffer.serializationStream.writeKey(1.asInstanceOf[Any])
-        tsBuffer.serializationStream.writeValue(2.asInstanceOf[Any])
-        tsBuffer.serializationStream.flush()
-        writer.shards(0).send(tsBuffer)
-
-        sentBuffers.size() should be(1)
-        val decoded = StreamingShuffleMessage.decode(sentBuffers.get(0))
-        decoded shouldBe a[DataMessage]
-        val dataMessage = decoded.asInstanceOf[DataMessage]
-
-        // The checksum embedded on the wire must match an independent CRC32C over the payload.
-        // Compute the expected value with java.util.zip.CRC32C directly (not ShuffleChecksum) so
-        // this stays independent of the production checksum wrapper.
-        val payload = dataMessage.getRecordData()
-        val expectedCrc = new CRC32C()
-        expectedCrc.update(payload.nioBuffer(payload.readerIndex(), payload.readableBytes()))
-        dataMessage.checksum should be(expectedCrc.getValue)
-        dataMessage.checksum should not be 0L
+        // Exercise multiple batches and the final flush through the actual write loop. The mock
+        // reader acknowledges completion; sequence validation has separate protocol tests.
+        writer.allAcksReceived.countDown()
+        writer.write((1 to 73).iterator.map(i => (i, i * 2)))
+        var dataMessages = 0
+        sentBuffers.forEach { buf =>
+          val message = StreamingShuffleMessage.decode(buf)
+          try {
+            message match {
+              case data: DataMessage =>
+                dataMessages += 1
+                // Use Java's CRC32C directly, independently of the production checksum wrapper.
+                val payload = data.getRecordData()
+                val expectedCrc = new CRC32C()
+                expectedCrc.update(
+                  payload.nioBuffer(payload.readerIndex(), payload.readableBytes()))
+                data.checksum should be(expectedCrc.getValue)
+                data.checksum should not be 0L
+              case _: TerminationControlMessage =>
+              case other => fail(s"Unexpected message: $other")
+            }
+          } finally {
+            message.release()
+            buf.release()
+          }
+        }
+        assert(dataMessages > 1)
         // The mock released the sent buffer (as the transport would), so the writer's normal
         // recycling path ran (rawBuffer.refCnt() == 1) and recorded no error.
         writer.errorNotifier.getError() shouldBe empty
 
-        dataMessage.release()
-        sentBuffers.forEach(_.release())
       } finally {
         context.markTaskCompleted(None)
       }

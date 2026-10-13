@@ -1569,6 +1569,39 @@ package object config {
           s" ${ByteArrayMethods.MAX_ROUNDED_ARRAY_LENGTH / 1024}.")
       .createWithDefaultString("32k")
 
+  private[spark] val SHUFFLE_MEMORY_ENABLED =
+    ConfigBuilder("spark.shuffle.memory.enabled")
+      .internal()
+      .doc("Retain small bypass-sort shuffle outputs in executor-owned memory. " +
+        "Output remains available after producer completion and falls back to disk under " +
+        "pressure. Requires the built-in shuffle I/O without an external shuffle service.")
+      .version("4.4.0")
+      .booleanConf
+      .createWithDefault(false)
+
+  private[spark] val SHUFFLE_MEMORY_MAX_SIZE =
+    ConfigBuilder("spark.shuffle.memory.maxSize")
+      .internal()
+      .doc("Maximum allocated page capacity for memory shuffle output per executor. " +
+        "Defaults to Spark's protected on-heap storage region and cannot exceed that region. " +
+        "Pages are also charged to Spark's on-heap storage memory.")
+      .version("4.4.0")
+      .bytesConf(ByteUnit.BYTE)
+      .checkValue(_ >= 0, "Memory shuffle capacity must be non-negative.")
+      .createOptional
+
+  private[spark] val SHUFFLE_MEMORY_MAX_MAP_SIZE =
+    ConfigBuilder("spark.shuffle.memory.maxMapSize")
+      .internal()
+      .doc("Maximum allocated page capacity retained for one map output. Larger outputs " +
+        "switch to ordinary disk storage without changing partitioning or serialization. " +
+        "Defaults to the executor's memory shuffle capacity, capped at Int.MaxValue.")
+      .version("4.4.0")
+      .bytesConf(ByteUnit.BYTE)
+      .checkValue(v => v >= 0 && v <= Int.MaxValue,
+        "Memory shuffle map capacity must be non-negative and at most Int.MaxValue.")
+      .createOptional
+
   private[spark] val SHUFFLE_FILE_MERGE_BUFFER_SIZE =
     ConfigBuilder("spark.shuffle.file.merge.buffer")
       .doc("Size of the in-memory buffer for each shuffle file input stream, in KiB unless " +
@@ -1868,6 +1901,21 @@ package object config {
       .stringConf
       .createWithDefault("streaming")
 
+  private[spark] val EXECUTOR_TASK_RESIDENCY_MULTIPLIER =
+    ConfigBuilder("spark.executor.taskScheduler.residencyMultiplier")
+      .internal()
+      .doc("Experimental executor-local CPU scheduling. Values above one admit this many " +
+        "resident pipelined tasks per ordinary task slot. Ordinary tasks remain bounded by " +
+        "the executor's physical cores. An executor-local scheduler limits " +
+        "runnable CPU demand to the executor's allocated cores. Blocked tasks retain their " +
+        "JVM stacks. The driver charges residency until task completion; a local CPU handoff " +
+        "does not return resources to the driver. Barrier execution is unsupported.")
+      .version("4.4.0")
+      .withBindingPolicy(ConfigBindingPolicy.NOT_APPLICABLE)
+      .intConf
+      .checkValue(v => v >= 1 && v <= 64, "must be between 1 and 64")
+      .createWithDefault(1)
+
   private[spark] val SHUFFLE_PIPELINED_CHANNEL_BATCH_SIZE =
     ConfigBuilder("spark.shuffle.channel.batchSize")
       .internal()
@@ -2133,8 +2181,8 @@ package object config {
       .doc("When true, before co-scheduling a pipelined-shuffle stage group the DAGScheduler " +
         "checks that the group's total task demand fits in the currently free slots of its " +
         "resource profile (total capacity minus the outstanding -- running plus enqueued -- " +
-        "tasks of other work), and fails the job with CONCURRENT_SCHEDULER_INSUFFICIENT_SLOT " +
-        "rather than co-scheduling a group that cannot fit and deadlocking. Set to false for " +
+        "tasks of other work). Groups wait for occupied slots and fail with " +
+        "CONCURRENT_SCHEDULER_INSUFFICIENT_SLOT if they exceed total capacity. Set to false for " +
         "deployments that admit capacity out-of-band (e.g. a slot reservation), which then own " +
         "admission. Only applies to jobs that use a pipelined shuffle dependency.")
       .version("4.3.0")

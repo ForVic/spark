@@ -1020,6 +1020,90 @@ class CoarseGrainedSchedulerBackendSuite extends SparkFunSuite with LocalSparkCo
     assert(store.get().bytes === Array[Byte](50, 50))
   }
 
+  test("released CPU is lent to ordinary work and resumed before another task starts") {
+    val backend = createDecommissionBackend()
+    val executor = registerDecommissionExecutor(backend, "1")
+    val base = FakeTask.createTaskSet(1)
+    val readerSet = new TaskSet(base.tasks, 0, 0, 0, base.properties,
+      base.resourceProfileId, None, isPipelined = true)
+    backend.taskScheduler.submitTasks(readerSet)
+    backend.driverEndpoint.send(ReviveOffers)
+    val reader = executor.nextTask()
+    backend.taskScheduler.submitTasks(FakeTask.createTaskSet(2, 1, 0))
+    backend.driverEndpoint.send(ReleaseTaskCpu("1", reader.taskId, 1))
+    val ordinary = executor.nextTask()
+    backend.driverEndpoint.send(RequestTaskCpu("1", reader.taskId, 1))
+    flushDecommissionBackend(backend)
+    assert(executor.resumedTasks.isEmpty)
+    assert(executor.launchedTasks.isEmpty)
+    completeDecommissionTestTask(backend, ordinary)
+    assert(executor.resumedTasks.poll(10, TimeUnit.SECONDS) == ResumeTaskCpu(reader.taskId, 1))
+    assert(executor.launchedTasks.isEmpty, "the resumed reader owns the only CPU")
+    completeDecommissionTestTask(backend, reader)
+    completeDecommissionTestTask(backend, executor.nextTask())
+  }
+
+  test("queued CPU resumptions precede lending their capacity to new work") {
+    val backend = createDecommissionBackend()
+    val executor = registerDecommissionExecutor(backend, "1")
+    val base = FakeTask.createTaskSet(1)
+    backend.taskScheduler.submitTasks(new TaskSet(base.tasks, 0, 0, 0, base.properties,
+      base.resourceProfileId, None, isPipelined = true))
+    backend.driverEndpoint.send(ReviveOffers)
+    val reader = executor.nextTask()
+    backend.taskScheduler.submitTasks(FakeTask.createTaskSet(1, 1, 0))
+    val entered = new CountDownLatch(1)
+    val proceed = new CountDownLatch(1)
+    val offerQueued = new CountDownLatch(1)
+    val allowOffer = new CountDownLatch(1)
+    backend.beforeOffers = () => {
+      entered.countDown()
+      assert(proceed.await(10, TimeUnit.SECONDS))
+      backend.beforeOffers = () => {
+        offerQueued.countDown()
+        assert(allowOffer.await(30, TimeUnit.SECONDS))
+      }
+    }
+    backend.driverEndpoint.send(ReviveOffers)
+    try {
+      assert(entered.await(10, TimeUnit.SECONDS))
+      // Both updates are queued before the endpoint can process the release. The reader's
+      // already queued resumption must not wait for a newly launched ordinary task to finish.
+      backend.driverEndpoint.send(ReleaseTaskCpu("1", reader.taskId, 1))
+      backend.driverEndpoint.send(RequestTaskCpu("1", reader.taskId, 1))
+      backend.driverEndpoint.send(ReviveOffers)
+      proceed.countDown()
+      assert(offerQueued.await(10, TimeUnit.SECONDS))
+      // Only new task offers are deferred. A ready reader must reclaim available CPU
+      // immediately, even while the next ordinary offer is waiting to be processed.
+      assert(executor.resumedTasks.poll(10, TimeUnit.SECONDS) == ResumeTaskCpu(reader.taskId, 1))
+      assert(executor.launchedTasks.isEmpty)
+    } finally {
+      backend.beforeOffers = () => ()
+      proceed.countDown()
+      allowOffer.countDown()
+    }
+    completeDecommissionTestTask(backend, reader)
+    completeDecommissionTestTask(backend, executor.nextTask())
+  }
+
+  test("a resident task can reacquire CPU after its executor starts decommissioning") {
+    val backend = createDecommissionBackend()
+    val executor = registerDecommissionExecutor(backend, "1")
+    val base = FakeTask.createTaskSet(1)
+    backend.taskScheduler.submitTasks(new TaskSet(base.tasks, 0, 0, 0, base.properties,
+      base.resourceProfileId, None, isPipelined = true))
+    backend.driverEndpoint.send(ReviveOffers)
+    val task = executor.nextTask()
+    backend.driverEndpoint.send(ReleaseTaskCpu("1", task.taskId, 1))
+    flushDecommissionBackend(backend)
+    assert(backend.decommissionExecutors(
+      Array("1" -> ExecutorDecommissionInfo("host drain")), false, false) == Seq("1"))
+    backend.driverEndpoint.send(RequestTaskCpu("1", task.taskId, 1))
+    assert(executor.resumedTasks.poll(10, TimeUnit.SECONDS) == ResumeTaskCpu(task.taskId, 1))
+    completeDecommissionTestTask(backend, task)
+  }
+
   private def createDecommissionBackend(
       conf: SparkConf = new SparkConf()): DecommissionTestSchedulerBackend = {
     conf.setMaster(s"coarseclustermanager[${classOf[DecommissionTestSchedulerBackend].getName}]")
@@ -1177,6 +1261,7 @@ private[spark] class DecommissionTestExecutorRpcEndpointRef(
     executorId: String) extends RpcEndpointRef(conf) {
 
   val launchedTasks = new LinkedBlockingQueue[TaskDescription]()
+  val resumedTasks = new LinkedBlockingQueue[ResumeTaskCpu]()
   @volatile var decommissionReceived = false
   @volatile var beforeLaunch: TaskDescription => Unit = (_: TaskDescription) => ()
 
@@ -1188,6 +1273,7 @@ private[spark] class DecommissionTestExecutorRpcEndpointRef(
       val task = TaskDescription.decode(data.value)
       beforeLaunch(task)
       launchedTasks.add(task)
+    case resume: ResumeTaskCpu => resumedTasks.add(resume)
     case DecommissionExecutor => decommissionReceived = true
     case _ =>
   }

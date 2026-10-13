@@ -22,7 +22,7 @@ import java.util.concurrent.ConcurrentHashMap
 import scala.jdk.CollectionConverters._
 
 import org.apache.spark._
-import org.apache.spark.internal.Logging
+import org.apache.spark.internal.{config, Logging}
 import org.apache.spark.shuffle._
 import org.apache.spark.shuffle.api.ShuffleExecutorComponents
 import org.apache.spark.util.collection.OpenHashSet
@@ -82,8 +82,20 @@ private[spark] class SortShuffleManager(conf: SparkConf)
 
   private lazy val shuffleExecutorComponents = loadShuffleExecutorComponents(conf)
 
-  override val shuffleBlockResolver =
+  private val memoryEnabled = conf.get(config.SHUFFLE_MEMORY_ENABLED) &&
+    !conf.get(config.SHUFFLE_SYNC) &&
+    !conf.get(config.SHUFFLE_SERVICE_ENABLED) &&
+    !conf.get(config.SHUFFLE_USE_OLD_FETCH_PROTOCOL) &&
+    !conf.get(config.PUSH_BASED_SHUFFLE_ENABLED) &&
+    !conf.get(config.DECOMMISSION_ENABLED) &&
+    conf.get(config.SHUFFLE_IO_PLUGIN_CLASS) ==
+      classOf[org.apache.spark.shuffle.sort.io.LocalDiskShuffleDataIO].getName
+
+  override val shuffleBlockResolver: IndexShuffleBlockResolver = if (memoryEnabled) {
+    new MemoryShuffleBlockResolver(conf, taskIdMapsForShuffle)
+  } else {
     new IndexShuffleBlockResolver(conf, taskIdMapsForShuffle = taskIdMapsForShuffle)
+  }
 
   /**
    * Obtains a [[ShuffleHandle]] to pass to tasks.
@@ -97,8 +109,13 @@ private[spark] class SortShuffleManager(conf: SparkConf)
       // them at the end. This avoids doing serialization and deserialization twice to merge
       // together the spilled files, which would happen with the normal code path. The downside is
       // having multiple files open at a time and thus more memory allocated to buffers.
-      new BypassMergeSortShuffleHandle[K, V](
-        shuffleId, dependency.asInstanceOf[ShuffleDependency[K, V, V]])
+      if (memoryEnabled) {
+        new MemoryShuffleHandle[K, V](
+          shuffleId, dependency.asInstanceOf[ShuffleDependency[K, V, V]])
+      } else {
+        new BypassMergeSortShuffleHandle[K, V](
+          shuffleId, dependency.asInstanceOf[ShuffleDependency[K, V, V]])
+      }
     } else if (SortShuffleManager.canUseSerializedShuffle(dependency)) {
       // Otherwise, try to buffer map outputs in a serialized form, since this is more efficient:
       new SerializedShuffleHandle[K, V](
@@ -153,6 +170,9 @@ private[spark] class SortShuffleManager(conf: SparkConf)
     mapTaskIds.synchronized { mapTaskIds.add(mapId) }
     val env = SparkEnv.get
     handle match {
+      case memory: MemoryShuffleHandle[K @unchecked, V @unchecked] if memoryEnabled =>
+        new MemoryShuffleWriter(memory, mapId, context, metrics,
+          shuffleBlockResolver.asInstanceOf[MemoryShuffleBlockResolver])
       case unsafeShuffleHandle: SerializedShuffleHandle[K @unchecked, V @unchecked] =>
         new UnsafeShuffleWriter(
           env.blockManager,

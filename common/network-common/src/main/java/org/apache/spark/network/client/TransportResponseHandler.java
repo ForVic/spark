@@ -199,7 +199,7 @@ public class TransportResponseHandler extends MessageHandler<ResponseMessage> {
       } else {
         outstandingRpcs.remove(resp.requestId);
         try {
-          listener.onSuccess(resp.body().nioByteBuffer());
+          listener.onSuccess(resp.body());
         } finally {
           resp.body().release();
         }

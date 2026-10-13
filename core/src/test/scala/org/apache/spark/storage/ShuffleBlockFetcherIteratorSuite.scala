@@ -197,7 +197,8 @@ class ShuffleBlockFetcherIteratorSuite extends SparkFunSuite {
       checksumEnabled: Boolean = true,
       checksumAlgorithm: String = "ADLER32",
       shuffleMetrics: Option[ShuffleReadMetricsReporter] = None,
-      doBatchFetch: Boolean = false): ShuffleBlockFetcherIterator = {
+      doBatchFetch: Boolean = false,
+      supportsHostLocalDiskRead: Boolean = true): ShuffleBlockFetcherIterator = {
     val tContext = taskContext.getOrElse(TaskContext.empty())
     new ShuffleBlockFetcherIterator(
       tContext,
@@ -223,7 +224,8 @@ class ShuffleBlockFetcherIteratorSuite extends SparkFunSuite {
       checksumEnabled,
       checksumAlgorithm,
       shuffleMetrics.getOrElse(tContext.taskMetrics().createTempShuffleReadMetrics()),
-      doBatchFetch)
+      doBatchFetch,
+      supportsHostLocalDiskRead = supportsHostLocalDiskRead)
   }
   // scalastyle:on argcount
 
@@ -299,6 +301,24 @@ class ShuffleBlockFetcherIteratorSuite extends SparkFunSuite {
       assert(logAppender.loggingEvents.exists(
         _.getMessage.getFormattedMessage.contains("Start corruption diagnosis")))
     }
+  }
+
+  test("executor-owned output uses the block service even on the same host") {
+    val blockManager = createMockBlockManager()
+    val producer = BlockManagerId("producer", "test-local-host", 3)
+    val block = ShuffleBlockId(0, 1, 0)
+    val buffer = createMockManagedBuffer()
+    initHostLocalDirManager(blockManager, Map("producer" -> Array("local-dir")))
+    configureMockTransfer(Map(block -> buffer))
+    val iterator = createShuffleBlockIteratorWithDefaults(
+      Map(producer -> toBlockList(Seq(block), 1L, 0)),
+      blockManager = Some(blockManager), supportsHostLocalDiskRead = false)
+    val (id, stream) = iterator.next()
+    assert(id == block)
+    verifyBufferRelease(buffer, stream)
+    assert(!iterator.hasNext)
+    verify(blockManager, times(0)).getHostLocalShuffleData(any(), any())
+    verifyFetchBlocksInvocationCount(1)
   }
 
   test("successful 3 local + 4 host local + 2 remote reads") {

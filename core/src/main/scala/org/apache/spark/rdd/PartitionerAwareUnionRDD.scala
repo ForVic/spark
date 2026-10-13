@@ -83,7 +83,17 @@ abstract class PartitionerAwareUnionRDDBase[T: ClassTag](
     location.toSeq
   }
 
+  override private[spark] def preparePipelinedInput(
+      split: Partition,
+      context: TaskContext): Unit = {
+    val parents = split.asInstanceOf[PartitionerAwareUnionRDDPartition].parents
+    rdds.zip(parents).foreach { case (rdd, part) =>
+      rdd.preparePipelinedInput(part, context)
+    }
+  }
+
   override def compute(s: Partition, context: TaskContext): Iterator[T] = {
+    preparePipelinedInput(s, context)
     val parentPartitions = s.asInstanceOf[PartitionerAwareUnionRDDPartition].parents
     rdds.zip(parentPartitions).iterator.flatMap {
       case (rdd, p) => rdd.iterator(p, context)

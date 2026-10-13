@@ -53,10 +53,18 @@ private[spark] case class UpdateStreamingShuffleTaskLocation(
     location: StreamingShuffleTaskLocation)
   extends StreamingShuffleTaskLocationTrackerMessage
 
+private[spark] case class UpdateStreamingShuffleTaskLocationForRun(
+    shuffleId: Int,
+    mapId: Long,
+    location: StreamingShuffleTaskLocation,
+    jobId: Int)
+  extends StreamingShuffleTaskLocationTrackerMessage
+
 private[spark] case class GetAllStreamingShuffleTaskLocations(shuffleId: Int)
   extends StreamingShuffleTaskLocationTrackerMessage
 
-private[spark] case class GetAvailableStreamingShuffleTaskLocations(shuffleId: Int)
+private[spark] case class GetAvailableStreamingShuffleTaskLocations(
+    shuffleId: Int, knownWriterCount: Int = -1)
   extends StreamingShuffleTaskLocationTrackerMessage
 
 private[spark] case object StopStreamingShuffleOutputTracker
@@ -77,8 +85,9 @@ private[spark] case class GetAllStreamingShuffleTaskLocationsMasterMessage(
   extends StreamingShuffleTaskLocationTrackerMasterMessage
 
 private[spark] case class GetAvailableStreamingShuffleTaskLocationsMasterMessage(
-  shuffleId: Int,
-  context: RpcCallContext)
+    shuffleId: Int,
+    knownWriterCount: Int,
+    context: RpcCallContext)
   extends StreamingShuffleTaskLocationTrackerMasterMessage
 
 private[spark] case class StreamingShuffleTaskLocation(
@@ -99,8 +108,9 @@ private[spark] class StreamingShuffleOutputTrackerMasterEndpoint(
     case GetAllStreamingShuffleTaskLocations(shuffleId) =>
       tracker.post(GetAllStreamingShuffleTaskLocationsMasterMessage(shuffleId, context))
 
-    case GetAvailableStreamingShuffleTaskLocations(shuffleId) =>
-      tracker.post(GetAvailableStreamingShuffleTaskLocationsMasterMessage(shuffleId, context))
+    case GetAvailableStreamingShuffleTaskLocations(shuffleId, knownWriterCount) =>
+      tracker.post(GetAvailableStreamingShuffleTaskLocationsMasterMessage(
+        shuffleId, knownWriterCount, context))
 
     case UpdateStreamingShuffleTaskLocation(
           shuffleId: Int,
@@ -108,6 +118,9 @@ private[spark] class StreamingShuffleOutputTrackerMasterEndpoint(
           location: StreamingShuffleTaskLocation) =>
       tracker.post(
         UpdateStreamingShuffleTaskLocationMasterMessage(shuffleId, mapId, location, context))
+
+    case UpdateStreamingShuffleTaskLocationForRun(shuffleId, mapId, location, jobId) =>
+      context.reply(tracker.registerShuffleWriterTask(shuffleId, mapId, location, jobId))
 
     case StopStreamingShuffleOutputTracker =>
       logInfo(log"StreamingShuffleOutputTrackerMasterEndpoint stopped!")
@@ -188,6 +201,15 @@ private[spark] abstract class StreamingShuffleOutputTracker(conf: SparkConf) ext
       mapId: Long,
       location: StreamingShuffleTaskLocation): Boolean
 
+  /** Reject late publication when a repeated action has already registered a newer run. */
+  def registerShuffleWriterTask(
+      shuffleId: Int,
+      mapId: Long,
+      location: StreamingShuffleTaskLocation,
+      jobId: Int): Boolean = {
+    throw new UnsupportedOperationException("Run-scoped writer registration is not supported")
+  }
+
   /**
    * Get all shuffle writer tasks that are part of the shuffle. This API will return None until
    * all shuffle writer task location info is available.
@@ -208,6 +230,17 @@ private[spark] abstract class StreamingShuffleOutputTracker(conf: SparkConf) ext
    *         total number of shuffle writers to expect.
    */
   def getAvailableShuffleWriterTaskLocations(shuffleId: Int): Option[ShuffleLocationResponse]
+
+  /**
+   * Discovery for readers that already discovered `knownWriterCount` distinct writers. Locations
+   * only grow within a shuffle's lifetime, so an unchanged count needs no repeated map payload.
+   * Existing connections retain their failure behavior; this does not reconnect a failed writer.
+   */
+  def getAvailableShuffleWriterTaskLocations(
+      shuffleId: Int,
+      knownWriterCount: Int): Option[ShuffleLocationResponse] = {
+    getAvailableShuffleWriterTaskLocations(shuffleId)
+  }
 }
 
 private[spark] case class StreamingShuffleInfo(numMaps: Int, numReduces: Int, jobId: Int)
@@ -221,6 +254,7 @@ private[spark] class StreamingShuffleOutputTrackerMaster(conf: SparkConf)
     new ConcurrentHashMap[Int, ConcurrentHashMap[Long, StreamingShuffleTaskLocation]]()
 
   private val shuffleInfos = new ConcurrentHashMap[Int, StreamingShuffleInfo]()
+  private val closedRuns = ConcurrentHashMap.newKeySet[Int]()
 
   private val trackerMasterMessages =
     new LinkedBlockingQueue[StreamingShuffleTaskLocationTrackerMasterMessage]
@@ -257,6 +291,21 @@ private[spark] class StreamingShuffleOutputTrackerMaster(conf: SparkConf)
   // for testing purposes -- size of the per-shuffle taskLocations map, used to assert
   // the absence of orphan entries left behind by a register/unregister race.
   private[spark] def numShufflesWithTaskLocations: Int = taskLocations.size()
+
+  /** Freeze publication before collecting endpoints for executor-owned output cleanup. */
+  private[spark] def closeRun(jobId: Int): Seq[StreamingShuffleTaskLocation] = {
+    closedRuns.add(jobId)
+    val result = scala.collection.mutable.ArrayBuffer.empty[StreamingShuffleTaskLocation]
+    shuffleInfos.asScala.foreach { case (shuffleId, info) =>
+      if (info.jobId == jobId) {
+        taskLocations.computeIfPresent(shuffleId, (_, locations) => {
+          result ++= locations.values().asScala
+          locations
+        })
+      }
+    }
+    result.distinct.toSeq
+  }
 
   override def unregisterShuffle(shuffleId: Int): Unit = {
     logInfo(log"Unregistering shuffleId ${MDC(LogKeys.SHUFFLE_ID, shuffleId)}")
@@ -305,8 +354,9 @@ private[spark] class StreamingShuffleOutputTrackerMaster(conf: SparkConf)
                 val ret = getAllShuffleWriterTaskLocations(shuffleId)
                 context.reply(ret)
 
-              case GetAvailableStreamingShuffleTaskLocationsMasterMessage(shuffleId, context) =>
-                val ret = getAvailableShuffleWriterTaskLocations(shuffleId)
+              case GetAvailableStreamingShuffleTaskLocationsMasterMessage(
+                    shuffleId, knownWriterCount, context) =>
+                val ret = getAvailableShuffleWriterTaskLocations(shuffleId, knownWriterCount)
                 context.reply(ret)
 
               case UpdateStreamingShuffleTaskLocationMasterMessage(
@@ -335,7 +385,26 @@ private[spark] class StreamingShuffleOutputTrackerMaster(conf: SparkConf)
       shuffleId: Int,
       mapId: Long,
       location: StreamingShuffleTaskLocation): Boolean = {
-    if (!shuffleInfos.containsKey(shuffleId)) {
+    registerWriter(shuffleId, mapId, location, None)
+  }
+
+  override def registerShuffleWriterTask(
+      shuffleId: Int,
+      mapId: Long,
+      location: StreamingShuffleTaskLocation,
+      jobId: Int): Boolean = {
+    registerWriter(shuffleId, mapId, location, Some(jobId))
+  }
+
+  private def registerWriter(
+      shuffleId: Int,
+      mapId: Long,
+      location: StreamingShuffleTaskLocation,
+      jobId: Option[Int]): Boolean = {
+    def acceptsRun: Boolean = Option(shuffleInfos.get(shuffleId)).exists { info =>
+      !closedRuns.contains(info.jobId) && jobId.forall(_ == info.jobId)
+    }
+    if (!acceptsRun) {
       logWarning(
         log"Attempting to register shuffle writer task for shuffle with id ${
           MDC(LogKeys.SHUFFLE_ID, shuffleId)} that hasn't been registered. Map id ${
@@ -358,9 +427,9 @@ private[spark] class StreamingShuffleOutputTrackerMaster(conf: SparkConf)
       (
           _: Int,
           shuffleTaskLocationMap: ConcurrentHashMap[Long, StreamingShuffleTaskLocation]) => {
-        if (!shuffleInfos.containsKey(shuffleId)) {
+        if (!acceptsRun) {
           registered = false
-          null
+          shuffleTaskLocationMap
         } else {
           val newShuffleTaskLocationMap = if (shuffleTaskLocationMap == null) {
             new ConcurrentHashMap[Long, StreamingShuffleTaskLocation]()
@@ -417,6 +486,12 @@ private[spark] class StreamingShuffleOutputTrackerMaster(conf: SparkConf)
 
   override def getAvailableShuffleWriterTaskLocations(
       shuffleId: Int): Option[ShuffleLocationResponse] = {
+    getAvailableShuffleWriterTaskLocations(shuffleId, -1)
+  }
+
+  override def getAvailableShuffleWriterTaskLocations(
+      shuffleId: Int,
+      knownWriterCount: Int): Option[ShuffleLocationResponse] = {
     val shuffleInfo = shuffleInfos.get(shuffleId)
     if (shuffleInfo == null) {
       logWarning(log"Attempting to get shuffle writer task location information for " +
@@ -424,7 +499,7 @@ private[spark] class StreamingShuffleOutputTrackerMaster(conf: SparkConf)
       return None
     }
     val locations = taskLocations.get(shuffleId)
-    val shuffleTaskLocationMap = if (locations == null) {
+    val shuffleTaskLocationMap = if (locations == null || locations.size() == knownWriterCount) {
       Map.empty[Long, StreamingShuffleTaskLocation]
     } else {
       locations.asScala.toMap
@@ -444,6 +519,14 @@ private[spark] class StreamingShuffleOutputTrackerWorker(conf: SparkConf)
     askTracker[Boolean](UpdateStreamingShuffleTaskLocation(shuffleId, mapId, location))
   }
 
+  override def registerShuffleWriterTask(
+      shuffleId: Int,
+      mapId: Long,
+      location: StreamingShuffleTaskLocation,
+      jobId: Int): Boolean = {
+    askTracker[Boolean](UpdateStreamingShuffleTaskLocationForRun(shuffleId, mapId, location, jobId))
+  }
+
   override def getAllShuffleWriterTaskLocations(
       shuffleId: Int): Option[Map[Long, StreamingShuffleTaskLocation]] = {
     askTracker[Option[Map[Long, StreamingShuffleTaskLocation]]](
@@ -452,8 +535,14 @@ private[spark] class StreamingShuffleOutputTrackerWorker(conf: SparkConf)
 
   override def getAvailableShuffleWriterTaskLocations(
       shuffleId: Int): Option[ShuffleLocationResponse] = {
+    getAvailableShuffleWriterTaskLocations(shuffleId, -1)
+  }
+
+  override def getAvailableShuffleWriterTaskLocations(
+      shuffleId: Int,
+      knownWriterCount: Int): Option[ShuffleLocationResponse] = {
     askTracker[Option[ShuffleLocationResponse]](
-      GetAvailableStreamingShuffleTaskLocations(shuffleId))
+      GetAvailableStreamingShuffleTaskLocations(shuffleId, knownWriterCount))
   }
 }
 

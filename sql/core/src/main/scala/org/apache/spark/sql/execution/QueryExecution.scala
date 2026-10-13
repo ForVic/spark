@@ -420,13 +420,15 @@ class QueryExecution(
       case q: QueryStageExec => hasShuffle(q.plan)
       case other => other.children.exists(hasShuffle)
     }
-    if (!sparkSession.sessionState.conf.localPipelinedShuffleEnabled ||
+    if ((!sparkSession.sessionState.conf.localPipelinedShuffleEnabled &&
+        !sparkSession.sessionState.conf.batchPipelinedShuffleEnabled) ||
         !PipelinedShuffleEligibility.enabled(executedPlan, sparkSession.sessionState.conf) ||
         !hasShuffle(executedPlan)) {
       this
     } else {
       val session = SparkSession.getOrCloneSessionWithConfigsOff(
-        sparkSession, Seq(SQLConf.LOCAL_PIPELINED_SHUFFLE_ENABLED))
+        sparkSession, Seq(SQLConf.LOCAL_PIPELINED_SHUFFLE_ENABLED,
+          SQLConf.BATCH_PIPELINED_SHUFFLE_ENABLED))
       new QueryExecution(session, commandExecuted, mode = mode,
         shuffleCleanupModeOpt = shuffleCleanupModeOpt,
         refreshPhaseEnabled = refreshPhaseEnabled, analyzerOpt = Some(analyzer))

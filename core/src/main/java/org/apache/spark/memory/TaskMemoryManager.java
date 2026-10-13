@@ -103,6 +103,8 @@ public class TaskMemoryManager {
 
   private final MemoryAllocator tungstenMemoryAllocator;
 
+  private final long pageSizeBytes;
+
   private final long taskAttemptId;
 
   /**
@@ -172,16 +174,30 @@ public class TaskMemoryManager {
     this(memoryManager, taskAttemptId, memoryManager.tungstenMemoryAllocator());
   }
 
+  /** Construct a task manager with the page size selected for this task's CPU reservation. */
+  public TaskMemoryManager(MemoryManager memoryManager, long taskAttemptId, long pageSizeBytes) {
+    this(memoryManager, taskAttemptId, memoryManager.tungstenMemoryAllocator(), pageSizeBytes);
+  }
+
   @VisibleForTesting
   TaskMemoryManager(
       MemoryManager memoryManager,
       long taskAttemptId,
       MemoryAllocator tungstenMemoryAllocator) {
+    this(memoryManager, taskAttemptId, tungstenMemoryAllocator, memoryManager.pageSizeBytes());
+  }
+
+  private TaskMemoryManager(
+      MemoryManager memoryManager,
+      long taskAttemptId,
+      MemoryAllocator tungstenMemoryAllocator,
+      long pageSizeBytes) {
     this.tungstenMemoryMode = memoryManager.tungstenMemoryMode();
     this.memoryManager = memoryManager;
     this.tungstenMemoryAllocator = tungstenMemoryAllocator;
     this.taskAttemptId = taskAttemptId;
     this.consumers = new HashSet<>();
+    this.pageSizeBytes = pageSizeBytes;
   }
 
   /**
@@ -611,7 +627,7 @@ public class TaskMemoryManager {
    * Return the page size in bytes.
    */
   public long pageSizeBytes() {
-    return memoryManager.pageSizeBytes();
+    return pageSizeBytes;
   }
 
   /**

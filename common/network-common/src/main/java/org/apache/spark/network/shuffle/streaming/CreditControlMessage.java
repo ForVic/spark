@@ -21,10 +21,10 @@ import io.netty.buffer.ByteBuf;
 import io.netty.buffer.CompositeByteBuf;
 
 /**
- * Reader → writer control message.
+ * Reader to writer control message.
  *
- * Current function: serves as a connection-establishment and per-consumption "ready"
- * signal. The writer uses receipt of any CreditControlMessage as the trigger that the
+ * Current function: serves as a single connection-establishment "ready" signal.
+ * The writer uses receipt of a CreditControlMessage as the trigger that the
  * reader is ready to receive, and does not act on the numeric value of {@link
  * #numMessages}. Backpressure today is handled at the TCP layer via channel autoRead,
  * not via this message.

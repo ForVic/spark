@@ -54,6 +54,8 @@ class ShuffledRDD[K: ClassTag, V: ClassTag, C: ClassTag](
 
   private var mapSideCombine: Boolean = false
 
+  private var pipelinedShuffle: Boolean = false
+
   /** Set a serializer for this RDD's shuffle, or null to use the default (spark.serializer) */
   def setSerializer(serializer: Serializer): ShuffledRDD[K, V, C] = {
     this.userSpecifiedSerializer = Option(serializer)
@@ -78,6 +80,19 @@ class ShuffledRDD[K: ClassTag, V: ClassTag, C: ClassTag](
     this
   }
 
+  /**
+   * Allow this shuffle's producers and consumers to execute concurrently. Requires a configured
+   * incremental shuffle manager. A failed live group must be rerun from its input boundaries;
+   * it cannot independently retry a producer whose partial output has already been consumed.
+   * Set this before the RDD's dependencies are evaluated.
+   *
+   * @since 4.4.0
+   */
+  def setPipelinedShuffle(enabled: Boolean): ShuffledRDD[K, V, C] = {
+    pipelinedShuffle = enabled
+    this
+  }
+
   override def getDependencies: Seq[Dependency[_]] = {
     val serializer = userSpecifiedSerializer.getOrElse {
       val serializerManager = SparkEnv.get.serializerManager
@@ -87,7 +102,13 @@ class ShuffledRDD[K: ClassTag, V: ClassTag, C: ClassTag](
         serializerManager.getSerializer(implicitly[ClassTag[K]], implicitly[ClassTag[V]])
       }
     }
-    List(new ShuffleDependency(prev, part, serializer, keyOrdering, aggregator, mapSideCombine))
+    val dependency = if (pipelinedShuffle) {
+      new PipelinedShuffleDependency(prev, part, serializer,
+        keyOrdering, aggregator, mapSideCombine)
+    } else {
+      new ShuffleDependency(prev, part, serializer, keyOrdering, aggregator, mapSideCombine)
+    }
+    List(dependency)
   }
 
   override val partitioner = Some(part)
@@ -97,9 +118,13 @@ class ShuffledRDD[K: ClassTag, V: ClassTag, C: ClassTag](
   }
 
   override protected def getPreferredLocations(partition: Partition): Seq[String] = {
-    val tracker = SparkEnv.get.mapOutputTracker.asInstanceOf[MapOutputTrackerMaster]
     val dep = dependencies.head.asInstanceOf[ShuffleDependency[K, V, C]]
-    tracker.getPreferredLocationsForShuffle(dep, partition.index)
+    if (dep.isInstanceOf[PipelinedShuffleDependency[_, _, _]]) {
+      Nil
+    } else {
+      val tracker = SparkEnv.get.mapOutputTracker.asInstanceOf[MapOutputTrackerMaster]
+      tracker.getPreferredLocationsForShuffle(dep, partition.index)
+    }
   }
 
   override def compute(split: Partition, context: TaskContext): Iterator[(K, C)] = {

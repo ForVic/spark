@@ -21,8 +21,11 @@ import java.io.*;
 import java.nio.ByteBuffer;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
+
+import io.netty.buffer.Unpooled;
 
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
@@ -31,6 +34,7 @@ import org.junit.jupiter.api.Test;
 import static org.junit.jupiter.api.Assertions.*;
 
 import org.apache.spark.network.buffer.ManagedBuffer;
+import org.apache.spark.network.buffer.NettyManagedBuffer;
 import org.apache.spark.network.buffer.NioManagedBuffer;
 import org.apache.spark.network.client.*;
 import org.apache.spark.network.server.*;
@@ -66,6 +70,15 @@ public class RpcIntegrationSuite {
         switch (parts[0]) {
           case "hello" ->
             callback.onSuccess(JavaUtils.stringToBytes("Hello, " + parts[1] + "!"));
+          case "managed" -> {
+            ManagedBuffer buffer = new NettyManagedBuffer(
+                Unpooled.wrappedBuffer(new byte[]{3, 1, 4}));
+            try {
+              callback.onSuccess(buffer);
+            } finally {
+              buffer.release();
+            }
+          }
           case "return error" -> callback.onFailure(new RuntimeException("Returned: " + parts[1]));
           case "throw error" -> throw new RuntimeException("Thrown: " + parts[1]);
         }
@@ -91,6 +104,34 @@ public class RpcIntegrationSuite {
     server = context.createServer();
     clientFactory = context.createClientFactory();
     oneWayMsgs = new ArrayList<>();
+  }
+
+  @Test
+  public void retainedRpcBufferSurvivesBothCallbacks() throws Exception {
+    TransportClient client = clientFactory.createClient(TestUtils.getLocalHost(), server.getPort());
+    CompletableFuture<ManagedBuffer> result = new CompletableFuture<>();
+    client.sendRpc(JavaUtils.stringToBytes("managed"), new RpcResponseCallback() {
+      @Override
+      public void onSuccess(ByteBuffer response) {
+        result.completeExceptionally(new AssertionError("Unexpected copying callback"));
+      }
+
+      @Override
+      public void onSuccess(ManagedBuffer response) {
+        result.complete(response.retain());
+      }
+
+      @Override
+      public void onFailure(Throwable error) {
+        result.completeExceptionally(error);
+      }
+    });
+    ManagedBuffer buffer = result.get(10, TimeUnit.SECONDS);
+    try {
+      assertEquals(ByteBuffer.wrap(new byte[]{3, 1, 4}), buffer.nioByteBuffer());
+    } finally {
+      buffer.release();
+    }
   }
 
   private static StreamCallbackWithID receiveStreamHelper(String msg) {

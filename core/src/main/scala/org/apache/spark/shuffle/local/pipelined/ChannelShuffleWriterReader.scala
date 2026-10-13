@@ -279,6 +279,9 @@ private[spark] class ChannelShuffleReader[K, C](
         ChannelShuffleRendezvous.abandon(handle.shuffleId, runEpoch, p)
         p += 1
       }
+      // Short tasks may finish before the executor's next heartbeat merges temporary metrics.
+      // Include reads performed by successful-completion draining, whose listener runs first.
+      tc.taskMetrics().mergeShuffleReadMetrics()
     }
   }
 
@@ -293,6 +296,7 @@ private[spark] class ChannelShuffleReader[K, C](
       private var batch: Array[AnyRef] = _
       private var pos = 0
       private var endOfStreamSeen = 0
+      private var fetchWaitNanos = 0L
       advance()
 
       // Interruptibly wait for the next queue item. `LinkedBlockingQueue.take()` blocks
@@ -307,17 +311,15 @@ private[spark] class ChannelShuffleReader[K, C](
       // fetch-wait time.
       private def takeItem(): AnyRef = {
         var item: AnyRef = null
-        // Time the WHOLE wait and convert once, the way ShuffleBlockFetcherIterator's
-        // withFetchWaitTimeTracked does. Converting each poll separately truncated every
-        // sub-millisecond wait to zero -- and a normal hand-off returns in microseconds -- so a
-        // consumer that really was waiting reported ~0, inverting what this metric is for.
+        // Accumulate before converting to milliseconds so many short batch waits are not lost.
         val start = System.nanoTime()
         while (item == null) {
           Option(TaskContext.get()).foreach(_.killTaskIfInterrupted())
           item = q.poll(100, java.util.concurrent.TimeUnit.MILLISECONDS)
         }
-        readMetrics.incFetchWaitTime(
-          java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start))
+        val previousMillis = fetchWaitNanos / 1000000L
+        fetchWaitNanos += System.nanoTime() - start
+        readMetrics.incFetchWaitTime(fetchWaitNanos / 1000000L - previousMillis)
         item
       }
 

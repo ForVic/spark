@@ -19,6 +19,8 @@ package org.apache.spark.sql.execution
 
 import java.util.Arrays
 
+import scala.collection.mutable
+
 import org.apache.spark._
 import org.apache.spark.rdd.RDD
 import org.apache.spark.shuffle.sort.SortShuffleManager
@@ -130,7 +132,8 @@ class CoalescedPartitioner(val parent: Partitioner, val partitionStartIndices: A
 class ShuffledRowRDD(
     var dependency: ShuffleDependency[Int, InternalRow, InternalRow],
     metrics: Map[String, SQLMetric],
-    partitionSpecs: Array[ShufflePartitionSpec])
+    partitionSpecs: Array[ShufflePartitionSpec],
+    drainPipelinedInput: Boolean)
   extends RDD[InternalRow](dependency.rdd.context, Nil)
   with org.apache.spark.rdd.ShuffleReducePartitionMapping {
 
@@ -157,14 +160,31 @@ class ShuffledRowRDD(
 
   def this(
       dependency: ShuffleDependency[Int, InternalRow, InternalRow],
+      metrics: Map[String, SQLMetric],
+      partitionSpecs: Array[ShufflePartitionSpec]) = {
+    this(dependency, metrics, partitionSpecs, false)
+  }
+
+  def this(
+      dependency: ShuffleDependency[Int, InternalRow, InternalRow],
       metrics: Map[String, SQLMetric]) = {
     this(dependency, metrics,
-      Array.tabulate(dependency.partitioner.numPartitions)(i => CoalescedPartitionSpec(i, i + 1)))
+      Array.tabulate(dependency.partitioner.numPartitions)(i => CoalescedPartitionSpec(i, i + 1)),
+      false)
   }
 
   dependency.rdd.context.setLocalProperty(
     SortShuffleManager.FETCH_SHUFFLE_BLOCKS_IN_BATCH_ENABLED_KEY,
     SQLConf.get.fetchShuffleBlocksInBatch.toString)
+
+  if (drainPipelinedInput) {
+    require(dependency.isInstanceOf[PipelinedShuffleDependency[_, _, _]])
+    require(partitionSpecs.zipWithIndex.forall {
+      case (CoalescedPartitionSpec(start, end, _), index) => start == index && end == index + 1
+      case _ => false
+    } && partitionSpecs.length == dependency.partitioner.numPartitions,
+      "Batch pipelining requires exactly one reader for every complete reduce partition")
+  }
 
   override def getDependencies: Seq[Dependency[_]] = List(dependency)
 
@@ -207,7 +227,42 @@ class ShuffledRowRDD(
     }
   }
 
+  @transient private lazy val preparedInputs =
+    mutable.Map.empty[(TaskContext, Int), Iterator[InternalRow]]
+
+  override private[spark] def preparePipelinedInput(
+      split: Partition,
+      context: TaskContext): Unit = {
+    if (drainPipelinedInput) {
+      preparedInputs.synchronized {
+        val key = (context, split.index)
+        preparedInputs.getOrElseUpdate(key, {
+          val rows = createReadIterator(split, context)
+          context.addTaskCompletionListener[Unit] { _ =>
+            preparedInputs.synchronized { preparedInputs.remove(key) }
+          }
+          rows
+        })
+      }
+    }
+  }
+
   override def compute(split: Partition, context: TaskContext): Iterator[InternalRow] = {
+    val rows = if (drainPipelinedInput) {
+      preparePipelinedInput(split, context)
+      preparedInputs.synchronized { preparedInputs((context, split.index)) }
+    } else {
+      createReadIterator(split, context)
+    }
+    // A multi-input parent constructs its iterators before consuming any of them. Waiting here
+    // for each input's first row can deadlock bounded producers before it drains a ready input.
+    // Preparation starts transport connections; actual consumption owns readiness waits.
+    rows
+  }
+
+  private def createReadIterator(
+      split: Partition,
+      context: TaskContext): Iterator[InternalRow] = {
     val tempMetrics = context.taskMetrics().createTempShuffleReadMetrics()
     // `SQLShuffleReadMetricsReporter` will update its own metrics for SQL exchange operator,
     // as well as the `tempMetrics` for basic shuffle metrics.
@@ -251,7 +306,17 @@ class ShuffledRowRDD(
           context,
           sqlMetricsReporter)
     }
-    reader.read().asInstanceOf[Iterator[Product2[Int, InternalRow]]].map(_._2)
+    val rows = reader.read().asInstanceOf[Iterator[Product2[Int, InternalRow]]]
+    if (drainPipelinedInput) {
+      // A join may finish without exhausting both inputs. Complete the transport protocol before
+      // the reader's cleanup listener runs (listeners run in reverse registration order).
+      context.addTaskCompletionListener[Unit] { task =>
+        if (!task.isFailed() && !task.isInterrupted()) {
+          while (rows.hasNext) rows.next()
+        }
+      }
+    }
+    rows.map(_._2)
   }
 
   override def clearDependencies(): Unit = {

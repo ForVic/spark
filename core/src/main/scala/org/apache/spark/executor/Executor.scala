@@ -253,8 +253,22 @@ private[spark] class Executor(
     userClassPath: Seq[URL] = Nil,
     isLocal: Boolean = false,
     uncaughtExceptionHandler: UncaughtExceptionHandler = new SparkUncaughtExceptionHandler,
-    resources: immutable.Map[String, ResourceInformation])
+    resources: immutable.Map[String, ResourceInformation],
+    taskCpuCapacity: Option[Int] = None)
   extends Logging {
+
+  private val localTaskScheduler = if (env.conf.get(EXECUTOR_TASK_RESIDENCY_MULTIPLIER) > 1) {
+    require(taskCpuCapacity.isDefined, "Executor-local scheduling requires an explicit CPU budget")
+    Some(new ExecutorTaskScheduler(BigDecimal(taskCpuCapacity.get)))
+  } else {
+    None
+  }
+
+  // Queued source task descriptions do not retain initialized operator state. Acquire this
+  // admission before CPU, and retain it while lending CPU to readers, until the task exits.
+  private val sourceStateScheduler = localTaskScheduler.map { _ =>
+    new ExecutorTaskScheduler(BigDecimal(taskCpuCapacity.get))
+  }
 
   logInfo(log"Starting executor ID ${MDC(LogKeys.EXECUTOR_ID, executorId)}" +
     log" on host ${MDC(HOST, executorHostname)}")
@@ -548,6 +562,10 @@ private[spark] class Executor(
   private[executor] def createTaskRunner(context: ExecutorBackend,
     taskDescription: TaskDescription) = new TaskRunner(context, taskDescription, plugins)
 
+  private[spark] def resumeTaskCpu(taskId: Long, sequence: Long): Unit = {
+    Option(runningTasks.get(taskId)).foreach(_.resumeCpu(sequence))
+  }
+
   def launchTask(context: ExecutorBackend, taskDescription: TaskDescription): Unit = {
     val taskId = taskDescription.taskId
     var taskRunnerOpt: Option[TaskRunner] = None
@@ -699,6 +717,21 @@ private[spark] class Executor(
     extends Runnable {
 
     val taskId = taskDescription.taskId
+    private val localPermit = localTaskScheduler.map(_.newPermit(taskDescription.cpus))
+    private val sourceStatePermit = sourceStateScheduler.filter { _ =>
+      taskDescription.properties.getProperty(TaskCpuLease.QUEUED_SOURCE_PROPERTY) == "true"
+    }.map(_.newPermit(taskDescription.cpus))
+    private val cpuLease = if (localPermit.isDefined) {
+      Some(new TaskCpuLease(taskId, execBackend, localPermit))
+    } else if (execBackend.supportsTaskCpuRelease &&
+        taskDescription.properties.getProperty(TaskCpuLease.PROPERTY) == "true") {
+      Some(new TaskCpuLease(taskId, execBackend))
+    } else {
+      None
+    }
+
+    def resumeCpu(sequence: Long): Unit = cpuLease.foreach(_.resume(sequence))
+
     val taskName = taskDescription.name
     val threadName = s"$TASK_THREAD_NAME_PREFIX for $taskName"
     val mdcProperties = taskDescription.properties.asScala
@@ -828,7 +861,8 @@ private[spark] class Executor(
       threadId = Thread.currentThread.getId
       Thread.currentThread.setName(threadName)
       val threadMXBean = ManagementFactory.getThreadMXBean
-      val taskMemoryManager = new TaskMemoryManager(env.memoryManager, taskId)
+      val taskMemoryManager = new TaskMemoryManager(env.memoryManager, taskId,
+        env.memoryManager.pageSizeBytesForTask(taskDescription.cpus))
       val deserializeStartTimeNs = System.nanoTime()
       val deserializeStartCpuTime = if (threadMXBean.isCurrentThreadCpuTimeSupported) {
         threadMXBean.getCurrentThreadCpuTime
@@ -841,8 +875,17 @@ private[spark] class Executor(
       var taskStartCpu: Long = 0
       startGCTime = computeTotalGcTime()
       var taskStarted: Boolean = false
+      cpuLease.foreach(TaskCpuLease.install)
 
       try {
+        sourceStatePermit.foreach { permit =>
+          permit.acquire(() => reasonIfKilled.foreach { reason =>
+            throw new TaskKilledException(reason)
+          })
+        }
+        localPermit.foreach(_.acquire(() => reasonIfKilled.foreach { reason =>
+          throw new TaskKilledException(reason)
+        }))
         // Must be set before updateDependencies() is called, in case fetching dependencies
         // requires access to properties contained within (e.g. for access control).
         Executor.taskDeserializationProps.set(taskDescription.properties)
@@ -1145,6 +1188,9 @@ private[spark] class Executor(
             uncaughtExceptionHandler.uncaughtException(Thread.currentThread(), t)
           }
       } finally {
+        localPermit.foreach(_.release())
+        sourceStatePermit.foreach(_.release())
+        TaskCpuLease.clear()
         cleanMDCForTask(taskName, mdcProperties)
         runningTasks.remove(taskId)
         if (taskStarted) {

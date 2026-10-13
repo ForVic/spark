@@ -32,7 +32,7 @@ import org.apache.spark.launcher.{LauncherBackend, SparkAppHandle}
 import org.apache.spark.resource.{CpuAmount, ResourceInformation, ResourceProfile}
 import org.apache.spark.rpc.{RpcCallContext, RpcEndpointRef, RpcEnv, ThreadSafeRpcEndpoint}
 import org.apache.spark.scheduler._
-import org.apache.spark.scheduler.cluster.CoarseGrainedClusterMessages.{TaskThreadDump, UpdateDelegationTokens}
+import org.apache.spark.scheduler.cluster.CoarseGrainedClusterMessages.{ReleaseTaskCpu, RequestTaskCpu, TaskThreadDump, UpdateDelegationTokens}
 import org.apache.spark.scheduler.cluster.ExecutorInfo
 import org.apache.spark.status.api.v1.ThreadStackTrace
 import org.apache.spark.util.Utils
@@ -58,7 +58,12 @@ private[spark] class LocalEndpoint(
     private val totalCores: Int)
   extends ThreadSafeRpcEndpoint with Logging {
 
-  private var freeCores: BigDecimal = CpuAmount.normalize(BigDecimal(totalCores))
+  // With local CPU scheduling these offers account for residency, not runnable CPU. The entire
+  // physical allocation remains with the executor until it stops, including during local waits.
+  private var freeCores: BigDecimal = CpuAmount.normalize(BigDecimal(totalCores)) *
+    scheduler.conf.get(config.EXECUTOR_TASK_RESIDENCY_MULTIPLIER)
+  private val taskCpuReservations = new TaskCpuReservations
+  private var taskCpuOffersPending = false
 
   val localExecutorId = SparkContext.DRIVER_IDENTIFIER
   val localExecutorHostname = Utils.localCanonicalHostName()
@@ -66,18 +71,32 @@ private[spark] class LocalEndpoint(
   // local mode doesn't support extra resources like GPUs right now
   private val executor = new Executor(
     localExecutorId, localExecutorHostname, SparkEnv.get, userClassPath, isLocal = true,
-    resources = Map.empty[String, ResourceInformation])
+    resources = Map.empty[String, ResourceInformation], taskCpuCapacity = Some(totalCores))
 
   override def receive: PartialFunction[Any, Unit] = {
     case ReviveOffers =>
+      taskCpuOffersPending = false
       reviveOffers()
 
     case StatusUpdate(taskId, state, serializedData) =>
       scheduler.statusUpdate(taskId, state, serializedData)
       if (TaskState.isFinished(state)) {
-        freeCores += scheduler.CPUS_PER_TASK
+        scheduler.taskCpuReleased(taskId, false)
+        freeCores += taskCpuReservations.finish(taskId)
         reviveOffers()
       }
+
+    case ReleaseTaskCpu(executorId, taskId, sequence) =>
+      val cpus = taskCpuReservations.release(taskId, executorId, sequence)
+      if (cpus > 0) {
+        scheduler.taskCpuReleased(taskId, true)
+        freeCores += cpus
+        reviveTaskCpuOffers()
+      }
+
+    case RequestTaskCpu(executorId, taskId, sequence) =>
+      taskCpuReservations.ready(taskId, executorId, sequence)
+      reviveTaskCpuOffers()
 
     case KillTask(taskId, interruptThread, reason) =>
       executor.killTask(taskId, interruptThread, reason)
@@ -95,12 +114,42 @@ private[spark] class LocalEndpoint(
       context.reply(executor.getTaskThreadDump(taskId))
   }
 
+  private def reviveTaskCpuOffers(): Unit = {
+    // Resume ready tasks immediately, before offering the remaining CPU to new work.
+    resumeTasks()
+    if (freeCores > 0 && !taskCpuOffersPending) {
+      taskCpuOffersPending = true
+      self.send(ReviveOffers)
+    }
+  }
+
+  private def resumeTasks(): Unit = {
+    taskCpuReservations.resume(localExecutorId, freeCores).foreach {
+      case (taskId, sequence, cpus) =>
+        freeCores -= cpus
+        scheduler.taskCpuReleased(taskId, false)
+        executor.resumeTaskCpu(taskId, sequence)
+    }
+  }
+
   def reviveOffers(): Unit = {
+    resumeTasks()
+    val ordinaryCores = if (scheduler.conf.get(config.EXECUTOR_TASK_RESIDENCY_MULTIPLIER) > 1) {
+      Some((BigDecimal(totalCores) - taskCpuReservations.ordinaryCpus(localExecutorId))
+        .max(BigDecimal(0)))
+    } else {
+      None
+    }
     // local mode doesn't support extra resources like GPUs right now
     val offers = IndexedSeq(new WorkerOffer(localExecutorId, localExecutorHostname, freeCores,
-      Some(rpcEnv.address.hostPort)))
+      Some(rpcEnv.address.hostPort), ordinaryCores = ordinaryCores))
     for (task <- scheduler.resourceOffers(offers, true).flatten) {
-      freeCores -= scheduler.CPUS_PER_TASK
+      freeCores -= task.cpus
+      val isPipelined = task.properties.getProperty(
+        org.apache.spark.executor.TaskCpuLease.PROPERTY) == "true"
+      taskCpuReservations.start(task.taskId, localExecutorId, task.cpus,
+        scheduler.conf.get(config.EXECUTOR_TASK_RESIDENCY_MULTIPLIER) == 1 && isPipelined,
+        isPipelined)
       executor.launchTask(executorBackend, task)
     }
   }
@@ -234,6 +283,16 @@ private[spark] class LocalSchedulerBackend(
   override def killTask(
       taskId: Long, executorId: String, interruptThread: Boolean, reason: String): Unit = {
     localEndpoint.send(KillTask(taskId, interruptThread, reason))
+  }
+
+  override def supportsTaskCpuRelease: Boolean = true
+
+  override def releaseTaskCpu(taskId: Long, sequence: Long): Unit = {
+    localEndpoint.send(ReleaseTaskCpu(SparkContext.DRIVER_IDENTIFIER, taskId, sequence))
+  }
+
+  override def requestTaskCpu(taskId: Long, sequence: Long): Unit = {
+    localEndpoint.send(RequestTaskCpu(SparkContext.DRIVER_IDENTIFIER, taskId, sequence))
   }
 
   override def statusUpdate(taskId: Long, state: TaskState, serializedData: ByteBuffer): Unit = {

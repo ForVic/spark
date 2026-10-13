@@ -21,7 +21,7 @@ import java.io.Closeable
 import java.util.Properties
 
 import org.apache.spark.annotation.{DeveloperApi, Evolving, Since}
-import org.apache.spark.executor.TaskMetrics
+import org.apache.spark.executor.{TaskCpuLease, TaskMetrics}
 import org.apache.spark.memory.TaskMemoryManager
 import org.apache.spark.metrics.source.Source
 import org.apache.spark.resource.ResourceInformation
@@ -326,6 +326,11 @@ abstract class TaskContext extends Serializable {
    */
   @DeveloperApi
   def getMetricsSources(sourceName: String): Seq[Source]
+
+  /** Release only the current task thread's CPU reservation during a blocking transport wait. */
+  private[spark] def withReleasedCpu[T](body: => T): T = TaskCpuLease.whileWaiting(this)(body)
+
+  private[spark] def yieldExecution(): Unit = TaskCpuLease.yieldIfNeeded(this)
 
   /**
    * If the task is interrupted, throws TaskKilledException with the reason for the interrupt.

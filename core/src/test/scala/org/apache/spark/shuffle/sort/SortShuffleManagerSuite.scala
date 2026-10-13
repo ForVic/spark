@@ -57,6 +57,16 @@ class SortShuffleManagerSuite extends SparkFunSuite with Matchers {
     dep
   }
 
+  gridTest("disk-required settings retain the disk resolver despite memory preference")(
+      Seq("spark.shuffle.sync", "spark.shuffle.service.enabled", "spark.shuffle.push.enabled",
+        "spark.shuffle.useOldFetchProtocol", "spark.decommission.enabled")) { setting =>
+    val conf = new SparkConf(false).set("spark.shuffle.memory.enabled", "true").set(setting, "true")
+    val manager = new SortShuffleManager(conf)
+    try {
+      assert(!manager.shuffleBlockResolver.isInstanceOf[MemoryShuffleBlockResolver])
+    } finally manager.stop()
+  }
+
   test("supported shuffle dependencies for serialized shuffle") {
     val kryo = new KryoSerializer(new SparkConf())
 

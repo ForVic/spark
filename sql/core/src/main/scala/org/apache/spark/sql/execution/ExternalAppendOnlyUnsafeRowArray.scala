@@ -68,7 +68,7 @@ class ExternalAppendOnlyUnsafeRowArray(
       SparkEnv.get.serializerManager,
       TaskContext.get(),
       1024,
-      SparkEnv.get.memoryManager.pageSizeBytes,
+      TaskContext.get().taskMemoryManager().pageSizeBytes(),
       numRowsInMemoryBufferThreshold,
       sizeInBytesInMemoryBufferThreshold,
       numRowsSpillThreshold,

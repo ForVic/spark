@@ -159,9 +159,8 @@ case class AdaptiveSparkPlanExec(
       // local sort left dangling right below the extra shuffle that skew join optimization may
       // insert between two joins.
       RemoveRedundantSorts,
-      // Flips the final unmaterialized tail's exchanges to pipelined (SPARK-57399 pipelined
-      // channel, opt-in). Runs last so skew handling and sort cleanup have settled
-      // before placement is decided.
+      // Selects pipelined exchanges under either opt-in batch policy. Runs last so skew handling
+      // and sort cleanup have settled before placement is decided.
       AQEEnablePipelinedShuffle
     ) ++ context.session.sessionState.adaptiveRulesHolder.queryStagePrepRules
   }
@@ -175,7 +174,10 @@ case class AdaptiveSparkPlanExec(
     CoalesceShufflePartitions(context.session),
     // `OptimizeShuffleWithLocalRead` needs to make use of 'AQEShuffleReadExec.partitionSpecs'
     // added by `CoalesceShufflePartitions`, and must be executed after it.
-    OptimizeShuffleWithLocalRead
+    OptimizeShuffleWithLocalRead,
+    // Producer widths are now known after ordinary AQE coalescing and local-read selection.
+    // Tighten only inline live layouts before execution, with the same distribution validation.
+    CoalescePipelinedShufflePartitions
   ) ++ context.session.sessionState.adaptiveRulesHolder.queryStageOptimizerRules
 
   // This rule is stateful as it maintains the codegen stage ID. We can't create a fresh one every
@@ -841,14 +843,10 @@ case class AdaptiveSparkPlanExec(
    * 3) A list of the new query stages that have been created.
    */
   private def createNonResultQueryStages(plan: SparkPlan): CreateStageResult = plan match {
-    // A pipelined shuffle exchange must NOT be promoted to a query stage: a pipelined
-    // producer cannot materialize on its own (its consumer must be gang-scheduled with it;
-    // the DAGScheduler rejects a map-stage job over a pipelined dependency outright).
-    // Instead it stays inline and executes inside the final result job, whose shape the
-    // scheduler accepts as a fully-materialized regular prefix (the stages created below
-    // here) plus a pipelined suffix group. Recurse through it so child stages still
-    // materialize normally.
-    case s: ShuffleExchangeExec if s.pipelined =>
+    // Live edges and durable inputs whose statistics are not needed stay inside the submitted
+    // execution graph. DAGScheduler owns their individual readiness and group admission.
+    // Recurse to retain adaptive statistics and broadcast prerequisites where they are needed.
+    case s: ShuffleExchangeExec if s.pipelined || !s.materializeForAdaptivePlanning =>
       val result = createNonResultQueryStages(s.child)
       CreateStageResult(
         newPlan = s.withNewChildren(Seq(result.newPlan)),

@@ -53,8 +53,7 @@ private[spark] class ActiveJob(
     // scheduling path -- co-scheduling, deferral, and the per-submit `TaskSet.isPipelined` tag --
     // is inert for a job without one, so this flag lets those paths short-circuit the
     // group-membership graph walk for the common regular job at no cost. Defaults to false; the
-    // result-job path (handleJobSubmitted) passes the value it computed up front, and the
-    // map-stage-job path (which rejects pipelined dependencies) leaves it false.
+    // result-job and map-stage-job paths both pass the value computed during group admission.
     val hasPipelinedDependency: Boolean = false) {
 
   /**

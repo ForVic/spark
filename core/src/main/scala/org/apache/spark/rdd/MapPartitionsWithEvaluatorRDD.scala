@@ -29,6 +29,12 @@ private[spark] class MapPartitionsWithEvaluatorRDD[T : ClassTag, U : ClassTag](
 
   override def getPartitions: Array[Partition] = firstParent[T].partitions
 
+  override private[spark] def preparePipelinedInput(
+      split: Partition,
+      context: TaskContext): Unit = {
+    firstParent[T].preparePipelinedInput(split, context)
+  }
+
   override def compute(split: Partition, context: TaskContext): Iterator[U] = {
     val evaluator = evaluatorFactory.createEvaluator()
     val input = firstParent[T].iterator(split, context)

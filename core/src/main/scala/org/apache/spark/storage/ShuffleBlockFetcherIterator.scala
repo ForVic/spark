@@ -81,6 +81,8 @@ import org.apache.spark.util.{Clock, CompletionIterator, SystemClock, TaskComple
  * @param shuffleMetrics used to report shuffle metrics.
  * @param doBatchFetch fetch continuous shuffle blocks from same executor in batch if the server
  *                     side supports.
+ * @param supportsHostLocalDiskRead whether this shuffle can bypass another executor's block
+ *                                 service and read its files directly.
  */
 private[spark]
 final class ShuffleBlockFetcherIterator(
@@ -101,7 +103,8 @@ final class ShuffleBlockFetcherIterator(
     checksumAlgorithm: String,
     shuffleMetrics: ShuffleReadMetricsReporter,
     doBatchFetch: Boolean,
-  clock: Clock = new SystemClock())
+    clock: Clock = new SystemClock(),
+    supportsHostLocalDiskRead: Boolean = true)
   extends Iterator[(BlockId, InputStream)] with DownloadFileManager with Logging {
 
   import ShuffleBlockFetcherIterator._
@@ -427,7 +430,7 @@ final class ShuffleBlockFetcherIterator(
         numBlocksToFetch += mergedBlockInfos.size
         localBlocks ++= mergedBlockInfos.map(info => (info.blockId, info.mapIndex))
         localBlockBytes += mergedBlockInfos.map(_.size).sum
-      } else if (blockManager.hostLocalDirManager.isDefined &&
+      } else if (supportsHostLocalDiskRead && blockManager.hostLocalDirManager.isDefined &&
         address.host == blockManager.blockManagerId.host) {
         val mergedBlockInfos = mergeContinuousShuffleBlockIdsIfNeeded(
           blockInfos.map(info => FetchBlockInfo(info._1, info._2, info._3)), doBatchFetch)
@@ -587,7 +590,8 @@ final class ShuffleBlockFetcherIterator(
         val buf = blockManager.getLocalBlockData(blockId)
         shuffleMetrics.incLocalBlocksFetched(1)
         shuffleMetrics.incLocalBytesRead(buf.size)
-        buf.retain()
+        // getLocalBlockData transfers one owned reference, just as it does to the RPC server.
+        // A second retain leaks memory-backed output; disk buffers previously hid this leak.
         results.put(SuccessFetchResult(blockId, mapIndex, blockManager.blockManagerId,
           buf.size(), buf, false))
       } catch {
@@ -616,7 +620,7 @@ final class ShuffleBlockFetcherIterator(
       blockManagerId: BlockManagerId): Boolean = {
     try {
       val buf = blockManager.getHostLocalShuffleData(blockId, localDirs)
-      buf.retain()
+      // The resolver transfers ownership of this reference to the result queue.
       results.put(SuccessFetchResult(blockId, mapIndex, blockManagerId, buf.size(), buf,
         isNetworkReqDone = false))
       true

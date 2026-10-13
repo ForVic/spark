@@ -19,6 +19,8 @@ package org.apache.spark.network.client;
 
 import java.nio.ByteBuffer;
 
+import org.apache.spark.network.buffer.ManagedBuffer;
+
 /**
  * Callback for the result of a single RPC. This will be invoked once with either success or
  * failure.
@@ -31,4 +33,17 @@ public interface RpcResponseCallback extends BaseResponseCallback {
    * Please copy the content of `response` if you want to use it after `onSuccess` returns.
    */
   void onSuccess(ByteBuffer response);
+
+  /**
+   * A borrowed response buffer, valid until this callback returns. A receiver may retain it
+   * explicitly for asynchronous consumption. The default preserves the ByteBuffer callback;
+   * send-side implementations must retain or copy before returning if they send asynchronously.
+   */
+  default void onSuccess(ManagedBuffer response) {
+    try {
+      onSuccess(response.nioByteBuffer());
+    } catch (java.io.IOException e) {
+      onFailure(e);
+    }
+  }
 }

@@ -169,7 +169,7 @@ private[spark] class CoarseGrainedExecutorBackend(
       logInfo("Successfully registered with driver")
       try {
         executor = new Executor(executorId, hostname, env, getUserClassPath, isLocal = false,
-          resources = _resources)
+          resources = _resources, taskCpuCapacity = Some(cores))
         driver.get.send(LaunchedExecutor(executorId))
       } catch {
         case NonFatal(e) =>
@@ -186,6 +186,9 @@ private[spark] class CoarseGrainedExecutorBackend(
         logInfo(log"Got assigned task ${MDC(LogKeys.TASK_ID, taskDesc.taskId)}")
         executor.launchTask(this, taskDesc)
       }
+
+    case ResumeTaskCpu(taskId, sequence) =>
+      if (executor != null) executor.resumeTaskCpu(taskId, sequence)
 
     case KillTask(taskId, _, interruptThread, reason) =>
       if (executor == null) {
@@ -231,6 +234,16 @@ private[spark] class CoarseGrainedExecutorBackend(
 
     case DecommissionExecutor =>
       decommissionSelf()
+  }
+
+  override def supportsTaskCpuRelease: Boolean = true
+
+  override def releaseTaskCpu(taskId: Long, sequence: Long): Unit = {
+    driver.foreach(_.send(ReleaseTaskCpu(executorId, taskId, sequence)))
+  }
+
+  override def requestTaskCpu(taskId: Long, sequence: Long): Unit = {
+    driver.foreach(_.send(RequestTaskCpu(executorId, taskId, sequence)))
   }
 
   override def receiveAndReply(context: RpcCallContext): PartialFunction[Any, Unit] = {

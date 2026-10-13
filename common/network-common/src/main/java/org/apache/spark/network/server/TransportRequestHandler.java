@@ -172,6 +172,29 @@ public class TransportRequestHandler extends MessageHandler<RequestMessage> {
         }
 
         @Override
+        public void onSuccess(ManagedBuffer response) {
+          ManagedBuffer owned = response.retain();
+          Runnable send = () -> {
+            if (channel.isActive()) {
+              respond(new RpcResponse(req.requestId, owned));
+            } else {
+              owned.release();
+            }
+          };
+          // An incremental response can become ready after its connection (or event loop) ends.
+          // Transfer ownership to the encoder only while running on an active channel's loop.
+          if (channel.eventLoop().inEventLoop()) {
+            send.run();
+          } else {
+            try {
+              channel.eventLoop().execute(send);
+            } catch (java.util.concurrent.RejectedExecutionException e) {
+              owned.release();
+            }
+          }
+        }
+
+        @Override
         public void onFailure(Throwable e) {
           respond(new RpcFailure(req.requestId, JavaUtils.stackTraceToString(e)));
         }

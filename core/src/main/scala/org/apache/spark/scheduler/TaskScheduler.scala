@@ -54,6 +54,10 @@ private[spark] trait TaskScheduler {
   // Submit a sequence of tasks to run.
   def submitTasks(taskSet: TaskSet): Unit
 
+  // Allow admitted producers to use newly reserved capacity. Implementations may retain the
+  // stricter original limits; expanding them is an optional scheduling optimization.
+  def increaseTaskSetConcurrencyLimits(limits: scala.collection.immutable.Map[Int, Int]): Unit = {}
+
   /**
    * Kills a task attempt.
    * Throw UnsupportedOperationException if the backend doesn't support kill a task.

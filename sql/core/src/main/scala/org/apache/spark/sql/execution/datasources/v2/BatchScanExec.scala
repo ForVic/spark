@@ -86,6 +86,12 @@ case class BatchScanExec(
   @transient override lazy val inputPartitions: Seq[InputPartition] =
     batch.planInputPartitions().toImmutableArraySeq
 
+  override def estimatedPartitionCount: Option[Int] = {
+    if (runtimeFilters.nonEmpty) None
+    else if (inputPartitions.isEmpty && outputPartitioning == SinglePartition) Some(1)
+    else Some(inputPartitions.size)
+  }
+
   // Visible for testing
   @transient private[sql] lazy val filteredPartitions: Seq[Option[InputPartition]] =
     PushDownUtils.replanWithRuntimeFilters(

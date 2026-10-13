@@ -19,7 +19,7 @@ package org.apache.spark.sql.execution
 
 import java.util.concurrent.TimeUnit._
 
-import org.apache.spark.{SparkEnv, TaskContext}
+import org.apache.spark.TaskContext
 import org.apache.spark.executor.TaskMetrics
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.catalyst.InternalRow
@@ -96,7 +96,7 @@ case class SortExec(
       }
     }
 
-    val pageSize = SparkEnv.get.memoryManager.pageSizeBytes
+    val pageSize = TaskContext.get().taskMemoryManager().pageSizeBytes()
     rowSorter = UnsafeExternalRowSorter.create(
       schema, ordering, prefixComparator, prefixComputer, pageSize, canUseRadixSort)
 

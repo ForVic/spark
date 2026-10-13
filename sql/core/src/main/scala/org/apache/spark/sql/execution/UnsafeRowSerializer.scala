@@ -22,6 +22,8 @@ import java.nio.ByteBuffer
 
 import scala.reflect.ClassTag
 
+import org.apache.commons.io.input.UnsynchronizedBufferedInputStream
+
 import org.apache.spark.SparkUnsupportedOperationException
 import org.apache.spark.serializer.{DeserializationStream, SerializationStream, Serializer, SerializerInstance}
 import org.apache.spark.sql.catalyst.expressions.UnsafeRow
@@ -55,13 +57,22 @@ private class UnsafeRowSerializerInstance(
    * Serializes a stream of UnsafeRows. Within the stream, each record consists of a record
    * length (stored as a 4-byte integer, written high byte first), followed by the record's bytes.
    */
-  override def serializeStream(out: OutputStream): SerializationStream = new SerializationStream {
-    private[this] var writeBuffer: Array[Byte] = new Array[Byte](4096)
+  override def serializeStream(out: OutputStream): SerializationStream =
+    serializeStream(out, useBuffering = true)
+
+  override private[spark] def serializeStream(
+      out: OutputStream,
+      useBuffering: Boolean): SerializationStream = new SerializationStream {
+    private[this] var writeBuffer: Array[Byte] = null
     private[this] val dOut: DataOutputStream =
-      new DataOutputStream(new BufferedOutputStream(out))
+      new DataOutputStream(if (useBuffering) new BufferedOutputStream(out) else out)
 
     override def writeValue[T: ClassTag](value: T): SerializationStream = {
       val row = value.asInstanceOf[UnsafeRow]
+      // Heap-backed rows write their array directly; only other layouts need a staging buffer.
+      if (writeBuffer == null && !row.getBaseObject.isInstanceOf[Array[Byte]]) {
+        writeBuffer = new Array[Byte](4096)
+      }
       if (dataSize != null) {
         dataSize.add(row.getSizeInBytes)
       }
@@ -99,7 +110,10 @@ private class UnsafeRowSerializerInstance(
 
   override def deserializeStream(in: InputStream): DeserializationStream = {
     new DeserializationStream {
-      private[this] val dIn: DataInputStream = new DataInputStream(new BufferedInputStream(in))
+      // The stream and its reusable row are confined to the consuming task.
+      private[this] val dIn: DataInputStream = new DataInputStream(
+        new UnsynchronizedBufferedInputStream.Builder()
+          .setInputStream(in).setBufferSize(8192).get())
       // 1024 is a default buffer size; this buffer will grow to accommodate larger rows
       private[this] var rowBuffer: Array[Byte] = new Array[Byte](1024)
       private[this] var row: UnsafeRow = new UnsafeRow(numFields)

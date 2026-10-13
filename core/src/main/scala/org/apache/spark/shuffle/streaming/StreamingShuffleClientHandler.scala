@@ -81,8 +81,20 @@ class StreamingShuffleClientHandler(
     onTermAckResponse = handler
   }
 
+  // Each connection still acknowledges its writer immediately. Only the last completed writer
+  // needs to wake the consuming task; earlier completions carry no rows to process.
+  private[streaming] var shouldEnqueueTermination: Int => Boolean = _ => true
+
+  // Register ownership before advertising readiness. A connection may activate after its task
+  // has already cleaned up; such a channel must never start receiving buffered shuffle data.
+  private[streaming] var registerClient: TransportClient => Boolean = _ => true
+
   override def channelActive(client: TransportClient): Unit = {
     channel = client.getChannel
+    if (!registerClient(client)) {
+      channel.close()
+      return
+    }
     channel.config.setOption(ChannelOption.SO_RCVBUF, RECVBUF_SIZE)
     channel.config.setOption(ChannelOption.SO_SNDBUF, SENDBUF_SIZE)
     sendCreditControlMessage(client, shuffleWriterId, 1) // Tell upstream writer that we're ready.
@@ -184,18 +196,21 @@ class StreamingShuffleClientHandler(
           updateQuota(messageSize)
           dataMessage.setReleaseCallback(() => updateQuota(-messageSize))
           // we can only release the buf after we have decoded all the rows in the buffer
-          sendCreditControlMessage(client, dataMessage.shuffleWriterId, 1)
+          // TCP auto-read enforces the quota. The initial credit already enabled this writer.
+          queue.put(dataMessage)
         case controlMessage: TerminationControlMessage =>
           // Record termination before sending the ack: the writer only closes its connection
           // after it receives this ack, so setting the flag here guarantees it is visible before
           // the resulting channelInactive fires, avoiding a false "premature disconnect" error.
           terminationReceived = true
           sendTerminationAckMessage(client, controlMessage.shuffleWriterId)
+          if (shouldEnqueueTermination(controlMessage.shuffleWriterId)) {
+            queue.put(controlMessage)
+          }
         case _ =>
           throw new IllegalArgumentException(s"Unexpected message type in ShuffleClientHandler: " +
             s"${shuffleMessage.messageType()}");
       }
-      queue.put(shuffleMessage)
     } catch {
       case (ex: Throwable) =>
         logError(log"Streaming shuffle client handler receive failed.", ex)

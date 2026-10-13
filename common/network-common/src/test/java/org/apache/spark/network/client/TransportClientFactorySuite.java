@@ -18,12 +18,16 @@
 package org.apache.spark.network.client;
 
 import java.io.IOException;
+import java.nio.ByteBuffer;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Map;
 import java.util.NoSuchElementException;
 import java.util.Set;
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import org.junit.jupiter.api.AfterEach;
@@ -36,6 +40,7 @@ import org.apache.spark.network.TransportContext;
 import org.apache.spark.network.server.NoOpRpcHandler;
 import org.apache.spark.network.server.RpcHandler;
 import org.apache.spark.network.server.TransportServer;
+import org.apache.spark.network.server.TransportServerFactory;
 import org.apache.spark.network.util.ConfigProvider;
 import org.apache.spark.network.util.MapConfigProvider;
 import org.apache.spark.network.util.JavaUtils;
@@ -150,6 +155,87 @@ public class TransportClientFactorySuite {
     assertTrue(c2.isActive());
     assertNotSame(c1, c2);
     factory.close();
+  }
+
+  @Test
+  public void sharedServerWorkersPreserveIndependentHandlersAndLifetimes() throws Exception {
+    try (TransportServerFactory servers = context.createServerFactory();
+         TransportServer first = servers.createServer(replyingHandler((byte) 1));
+         TransportServer second = servers.createServer(replyingHandler((byte) 2));
+         TransportClientFactory clients = context.createClientFactory();
+         TransportClient c1 = clients.createClient(TestUtils.getLocalHost(), first.getPort());
+         TransportClient c2 = clients.createClient(TestUtils.getLocalHost(), second.getPort())) {
+      assertNotEquals(first.getPort(), second.getPort());
+      assertSame(first.getPooledByteBufAllocator(), second.getPooledByteBufAllocator());
+      assertSame(first.channelFuture().channel().eventLoop().parent(),
+        second.channelFuture().channel().eventLoop().parent());
+      assertEquals(1, c1.sendRpcSync(ByteBuffer.allocate(0), 10000).get());
+      assertEquals(2, c2.sendRpcSync(ByteBuffer.allocate(0), 10000).get());
+      first.close();
+      assertTrue(c1.getChannel().closeFuture().await(10, TimeUnit.SECONDS));
+      assertEquals(2, c2.sendRpcSync(ByteBuffer.allocate(0), 10000).get());
+      // Closing a server does not prevent subsequent binds using the shared workers.
+      try (TransportServer third = servers.createServer(replyingHandler((byte) 3));
+           TransportClient c3 = clients.createClient(TestUtils.getLocalHost(), third.getPort())) {
+        assertEquals(3, c3.sendRpcSync(ByteBuffer.allocate(0), 10000).get());
+        servers.close();
+        assertTrue(c2.getChannel().closeFuture().await(10, TimeUnit.SECONDS));
+        assertTrue(c3.getChannel().closeFuture().await(10, TimeUnit.SECONDS));
+        assertThrows(IllegalStateException.class,
+          () -> servers.createServer(new NoOpRpcHandler()));
+      }
+    }
+  }
+
+  private RpcHandler replyingHandler(byte value) {
+    return new NoOpRpcHandler() {
+      @Override
+      public void receive(
+          TransportClient client, ByteBuffer message, RpcResponseCallback callback) {
+        callback.onSuccess(ByteBuffer.wrap(new byte[] {value}));
+      }
+    };
+  }
+
+  @Test
+  public void unmanagedClientsHaveIndependentHandlersAndLifetimes() throws Exception {
+    RpcHandler echo = new NoOpRpcHandler() {
+      @Override
+      public void receive(
+          TransportClient client, ByteBuffer message, RpcResponseCallback callback) {
+        client.send(ByteBuffer.wrap(new byte[] {message.get()}));
+      }
+    };
+    try (TransportContext serverContext = new TransportContext(conf, echo);
+         TransportServer server = serverContext.createServer();
+         TransportClientFactory factory = context.createClientFactory()) {
+      BlockingQueue<Byte> firstMessages = new LinkedBlockingQueue<>();
+      BlockingQueue<Byte> secondMessages = new LinkedBlockingQueue<>();
+      try (TransportClient first = factory.createUnmanagedClient(
+             TestUtils.getLocalHost(), server.getPort(), collectingHandler(firstMessages));
+           TransportClient second = factory.createUnmanagedClient(
+             TestUtils.getLocalHost(), server.getPort(), collectingHandler(secondMessages))) {
+        assertNotSame(first, second);
+        first.send(ByteBuffer.wrap(new byte[] {1}));
+        second.send(ByteBuffer.wrap(new byte[] {2}));
+        assertEquals(Byte.valueOf((byte) 1), firstMessages.poll(10, TimeUnit.SECONDS));
+        assertEquals(Byte.valueOf((byte) 2), secondMessages.poll(10, TimeUnit.SECONDS));
+        first.close();
+        second.send(ByteBuffer.wrap(new byte[] {3}));
+        assertEquals(Byte.valueOf((byte) 3), secondMessages.poll(10, TimeUnit.SECONDS));
+        assertTrue(firstMessages.isEmpty());
+      }
+    }
+  }
+
+  private static RpcHandler collectingHandler(BlockingQueue<Byte> messages) {
+    return new NoOpRpcHandler() {
+      @Override
+      public void receive(
+          TransportClient client, ByteBuffer message, RpcResponseCallback callback) {
+        messages.add(message.get());
+      }
+    };
   }
 
   @Test

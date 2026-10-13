@@ -163,6 +163,21 @@ abstract class SparkPlan extends QueryPlan[SparkPlan] with Logging with Serializ
   def outputPartitioning: Partitioning = UnknownPartitioning(0) // TODO: WRONG WIDTH!
 
   /**
+   * Estimated number of tasks producing this operator's output. This may plan input splits, but
+   * must not construct readers, broadcast execution state, or run Spark jobs.
+   * Unlike outputPartitioning, this does not assert how rows are distributed. None means that
+   * the width is not available during planning. Admission must still check actual RDD widths.
+   */
+  def estimatedPartitionCount: Option[Int] = {
+    val width = outputPartitioning.numPartitions
+    if (width > 0) Some(width)
+    else this match {
+      case unary: UnaryExecNode => unary.child.estimatedPartitionCount
+      case _ => None
+    }
+  }
+
+  /**
    * Specifies the data distribution requirements of all the children for this operator. By default
    * it's [[UnspecifiedDistribution]] for each child, which means each child can have any
    * distribution.

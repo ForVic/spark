@@ -22,6 +22,7 @@ import java.util.Properties
 import java.util.concurrent.{CountDownLatch, LinkedBlockingQueue, Semaphore, TimeoutException, TimeUnit}
 
 import scala.concurrent.{ExecutionContext, Future}
+import scala.jdk.CollectionConverters._
 import scala.language.reflectiveCalls
 import scala.reflect.ClassTag
 
@@ -39,7 +40,8 @@ import org.scalatestplus.mockito.MockitoSugar
 import org.apache.spark._
 import org.apache.spark.LocalSparkContext.withSpark
 import org.apache.spark.internal.Logging
-import org.apache.spark.internal.config.{SHUFFLE_MANAGER_INCREMENTAL, STREAMING_SHUFFLE_CHECKSUM_ENABLED, STREAMING_SHUFFLE_NETWORK_BUFFER_SIZE, STREAMING_SHUFFLE_READER_MAX_MEMORY, STREAMING_SHUFFLE_WRITER_MAX_MEMORY}
+import org.apache.spark.internal.config.{IO_COMPRESSION_CODEC, SHUFFLE_COMPRESS, SHUFFLE_MANAGER_INCREMENTAL, STREAMING_SHUFFLE_CHECKSUM_ENABLED, STREAMING_SHUFFLE_NETWORK_BUFFER_SIZE, STREAMING_SHUFFLE_READER_MAX_MEMORY, STREAMING_SHUFFLE_WRITER_MAX_MEMORY}
+import org.apache.spark.io.CompressionCodec
 import org.apache.spark.memory.{TaskMemoryManager, TestMemoryManager}
 import org.apache.spark.metrics.MetricsSystem
 import org.apache.spark.network.client.{RpcResponseCallback, TransportClient, TransportClientFactory}
@@ -129,7 +131,11 @@ class StreamingShuffleSuite
       errorNotifier: ErrorNotifier = new ErrorNotifier())
     extends StreamingShuffleReader[K, C](handle, context, clientHandler, errorNotifier)
 
-  private class ShuffleGroup[T: ClassTag](sc: SparkContext, mappers: Int, reducers: Int) {
+  private class ShuffleGroup[T: ClassTag](
+      sc: SparkContext,
+      mappers: Int,
+      reducers: Int,
+      clientFactory: Option[TransportClientFactory] = None) {
     assert(SparkEnv.get.pipelinedShuffleManager.isInstanceOf[StreamingShuffleManager])
     assert(SparkEnv.get.streamingShuffleOutputTracker.isDefined)
     SparkEnv.get.streamingShuffleOutputTracker.get
@@ -167,7 +173,8 @@ class StreamingShuffleSuite
     }
     val readers: Array[StreamingShuffleReader[T, T]] = Array.tabulate(reducers) { i =>
       val taskContext = createTaskContext(sc.conf, i)
-      new StreamingShuffleReader[T, T](handle, taskContext) {
+      new StreamingShuffleReader[T, T](handle, taskContext,
+          sharedClientFactory = clientFactory) {
         override def read(): Iterator[Product2[T, T]] = {
 
           val it = super.read()
@@ -250,6 +257,66 @@ class StreamingShuffleSuite
       eventually(Timeout(10.seconds)) {
         g.writers(0).allAcksReceived.getCount should be(0)
         g.writers(0).server.channelFuture() should be(null)
+      }
+    }
+  }
+
+  gridTest("streaming frames round trip with Spark shuffle codecs")(
+      Seq("none", "lz4", "lzf", "snappy", "zstd")) { codec =>
+    sparkConf.set(SHUFFLE_COMPRESS, codec != "none")
+      .set(IO_COMPRESSION_CODEC, if (codec == "none") "lz4" else codec)
+      .set(STREAMING_SHUFFLE_NETWORK_BUFFER_SIZE, 4096)
+    withSpark(new SparkContext("local", "StreamingShuffleSuite", sparkConf)) { sc =>
+      val group = new ShuffleGroup[Int](sc, 2, 1)
+      try {
+        group.writers(0).write((0 until 1000).iterator.map(i => (i, i)))
+        group.writers(1).write((1000 until 2000).iterator.map(i => (i, i)))
+        assert(await(group.read(0)._2) == (0 until 2000).map(i => (i, i)).toSet)
+      } finally {
+        group.writers.foreach(_.context.markTaskCompleted(None))
+        group.readers.foreach(_.context.markTaskCompleted(None))
+      }
+    }
+  }
+
+  test("completed writers are acknowledged without waking the reader before more data") {
+    withSpark(new SparkContext("local", "StreamingShuffleSuite", sparkConf)) { sc =>
+      val g = new ShuffleGroup[Int](sc, 3, 1)
+      try {
+        g.writers(0).write(Iterator.empty)
+        g.writers(1).write(Iterator.empty)
+        assert(g.writers.take(2).forall(_.allAcksReceived.getCount == 0))
+        assert(g.readers(0).messageQueue.isEmpty)
+
+        g.writers(2).write(Iterator((7, 7)))
+        eventually(Timeout(10.seconds)) {
+          val queued = g.readers(0).messageQueue.asScala.toSeq
+          assert(queued.count(_.isInstanceOf[TerminationControlMessage]) == 1)
+          assert(queued.last.isInstanceOf[TerminationControlMessage])
+        }
+        assert(await(g.read(0)._2) == Set((7, 7)))
+      } finally {
+        g.writers.foreach(_.context.markTaskCompleted(None))
+        g.readers.foreach(_.context.markTaskCompleted(None))
+      }
+    }
+  }
+
+  test("concurrent writer completion enqueues one end marker after every data message") {
+    withSpark(new SparkContext("local", "StreamingShuffleSuite", sparkConf)) { sc =>
+      val g = new ShuffleGroup[Int](sc, 16, 1)
+      try {
+        val writes = (0 until 16).map(i => g.write(i, Iterator((i, i))))
+        writes.foreach(await(_))
+        eventually(Timeout(10.seconds)) {
+          val queued = g.readers(0).messageQueue.asScala.toSeq
+          assert(queued.count(_.isInstanceOf[TerminationControlMessage]) == 1)
+          assert(queued.last.isInstanceOf[TerminationControlMessage])
+        }
+        assert(await(g.read(0)._2) == (0 until 16).map(i => (i, i)).toSet)
+      } finally {
+        g.writers.foreach(_.context.markTaskCompleted(None))
+        g.readers.foreach(_.context.markTaskCompleted(None))
       }
     }
   }
@@ -744,6 +811,8 @@ class StreamingShuffleSuite
 
   test("writer write blocks if reader doesn't catch up") {
     withSpark(new SparkContext("local", "StreamingShuffleSuite", sparkConf
+        // Exercise TCP backpressure using the frame sizes asserted below, without compression.
+        .set(SHUFFLE_COMPRESS, false)
         .set(STREAMING_SHUFFLE_WRITER_MAX_MEMORY, 128 << 10)
         .set(STREAMING_SHUFFLE_NETWORK_BUFFER_SIZE, 64 << 10)
         .set(STREAMING_SHUFFLE_READER_MAX_MEMORY, 1))) { sc =>
@@ -1340,33 +1409,37 @@ class StreamingShuffleSuite
     }
   }
 
-  test("client factories are closed and EventLoopGroup threads are cleaned up after read") {
-    withSpark(new SparkContext("local", "StreamingShuffleSuite", sparkConf)) { sc =>
-      val g = new ShuffleGroup[Int](sc, 2, 1)
+  test("client connections close per read while I/O workers follow their owner's lifetime") {
+    for (shared <- Seq(false, true)) {
+      withSpark(new SparkContext("local", "StreamingShuffleSuite", sparkConf)) { sc =>
+        val manager = SparkEnv.get.pipelinedShuffleManager.asInstanceOf[StreamingShuffleManager]
+        val factory = if (shared) Some(manager.sharedClientFactory) else None
+        val workerGroupField = classOf[TransportClientFactory].getDeclaredField("workerGroup")
+        workerGroupField.setAccessible(true)
 
-      g.writers(0).write(Iterator((1, 1), (2, 2)))
-      g.writers(1).write(Iterator((3, 3), (4, 4)))
+        for (_ <- 0 until 2) {
+          val g = new ShuffleGroup[Int](sc, 2, 1, factory)
+          g.writers(0).write(Iterator((1, 1), (2, 2)))
+          g.writers(1).write(Iterator((3, 3), (4, 4)))
+          await(g.read(0)._2) should be(Set((1, 1), (2, 2), (3, 3), (4, 4)))
 
-      await(g.read(0)._2) should be(Set((1, 1), (2, 2), (3, 3), (4, 4)))
-
-      val reader = g.readers(0)
-      val factoriesField = classOf[StreamingShuffleReader[_, _]].getDeclaredFields
-        .find(_.getName.endsWith("clientFactories"))
-        .getOrElse(fail("Could not find clientFactories field via reflection"))
-      factoriesField.setAccessible(true)
-      val factories = factoriesField.get(reader)
-        .asInstanceOf[java.util.concurrent.ConcurrentLinkedQueue[TransportClientFactory]]
-      assert(factories.size() > 0, "Expected at least one client factory")
-
-      val workerGroupField = classOf[TransportClientFactory].getDeclaredField("workerGroup")
-      workerGroupField.setAccessible(true)
-
-      eventually(Timeout(10.seconds)) {
-        factories.forEach { factory =>
-          val workerGroup = workerGroupField.get(factory)
+          val reader = g.readers(0)
+          val workerGroup = workerGroupField.get(reader.clientFactory)
             .asInstanceOf[_root_.io.netty.channel.EventLoopGroup]
-          assert(workerGroup.isTerminated,
-            "TransportClientFactory EventLoopGroup was not shut down after read completed.")
+          eventually(Timeout(10.seconds)) {
+            assert(reader.clientMap.values().asScala.forall(!_.isActive))
+            if (shared) assert(!workerGroup.isShuttingDown)
+            else assert(workerGroup.isTerminated)
+          }
+          SparkEnv.get.streamingShuffleOutputTracker.get.unregisterShuffle(shuffleId)
+        }
+
+        factory.foreach { f =>
+          manager.stop()
+          eventually(Timeout(10.seconds)) {
+            assert(workerGroupField.get(f)
+              .asInstanceOf[_root_.io.netty.channel.EventLoopGroup].isTerminated)
+          }
         }
       }
     }
@@ -1577,13 +1650,19 @@ object StreamingShuffleSuite {
     // a DataMessage data containing only a dummy (K,V) record
     val partitionBuffer = PooledByteBufAllocator.DEFAULT.buffer(BUFFER_SIZE)
     val serializerInstance = shuffleDep.serializer.newInstance()
+    val output = new ByteBufOutputStream(partitionBuffer)
+    val serializedOutput = if (SparkEnv.get.conf.get(SHUFFLE_COMPRESS)) {
+      CompressionCodec.createCodec(SparkEnv.get.conf).compressedOutputStream(output)
+    } else {
+      output
+    }
     val partitionSerializationStream =
-      serializerInstance.serializeStream(new ByteBufOutputStream(partitionBuffer))
+      serializerInstance.serializeStream(serializedOutput)
     if (serializerInstance.isInstanceOf[JavaSerializerInstance]) {
       partitionSerializationStream.writeKey(datum.asInstanceOf[Any])
     }
     partitionSerializationStream.writeValue(datum.asInstanceOf[Any])
-    partitionSerializationStream.flush()
+    partitionSerializationStream.close()
 
     // Calculate checksum
     val shuffleChecksum = new ShuffleChecksum()

@@ -17,7 +17,7 @@
 
 package org.apache.spark.sql.execution
 
-import java.io.{ByteArrayInputStream, ByteArrayOutputStream}
+import java.io.{ByteArrayInputStream, ByteArrayOutputStream, EOFException}
 import java.util.{HashMap, Properties}
 
 import org.apache.spark._
@@ -31,6 +31,7 @@ import org.apache.spark.sql.catalyst.{CatalystTypeConverters, InternalRow}
 import org.apache.spark.sql.catalyst.expressions.{UnsafeProjection, UnsafeRow}
 import org.apache.spark.sql.execution.metric.SQLShuffleReadMetricsReporter
 import org.apache.spark.sql.types._
+import org.apache.spark.unsafe.Platform
 import org.apache.spark.util.collection.ExternalSorter
 
 /**
@@ -89,12 +90,112 @@ class UnsafeRowSerializerSuite extends SparkFunSuite with LocalSparkSession {
     assert(input.closed)
   }
 
+  test("already buffered destinations preserve row framing without a second buffer") {
+    val rows = Seq(Row("small", 1), Row("x" * 12000, 2))
+      .map(row => toUnsafeRow(row, Array(StringType, IntegerType)))
+    val serializer = new UnsafeRowSerializer(numFields = 2).newInstance()
+    def write(useBuffering: Boolean): Array[Byte] = {
+      val output = new ByteArrayOutputStream()
+      val stream = serializer.serializeStream(output, useBuffering)
+      rows.foreach { row =>
+        val before = output.size()
+        stream.writeValue(row)
+        if (!useBuffering) {
+          assert(output.size() - before === 4 + row.getSizeInBytes)
+        }
+      }
+      stream.close()
+      output.toByteArray
+    }
+    val bytes = write(useBuffering = false)
+    assert(bytes.toSeq === write(useBuffering = true).toSeq)
+    val input = new ClosableByteArrayInputStream(bytes)
+    val decoded = serializer.deserializeStream(input).asKeyValueIterator
+      .map(_._2.asInstanceOf[UnsafeRow].copy()).toArray
+    assert(decoded.toSeq === rows)
+    assert(input.closed)
+  }
+
+  test("a stream can switch from heap rows to off-heap rows without changing framing") {
+    val row = toUnsafeRow(Row("x" * 12000, 7), Array(StringType, IntegerType))
+    val address = Platform.allocateMemory(row.getSizeInBytes)
+    try {
+      Platform.copyMemory(row.getBaseObject, row.getBaseOffset,
+        null, address, row.getSizeInBytes)
+      val offHeap = new UnsafeRow(2)
+      offHeap.pointTo(null, address, row.getSizeInBytes)
+      for (buffered <- Seq(false, true)) {
+        val serializer = new UnsafeRowSerializer(2).newInstance()
+        val output = new ByteArrayOutputStream()
+        val stream = serializer.serializeStream(output, buffered)
+        Seq(row, offHeap, row).foreach(stream.writeValue(_))
+        stream.close()
+        val decoded = serializer.deserializeStream(new ByteArrayInputStream(output.toByteArray))
+          .asKeyValueIterator.map(_._2.asInstanceOf[UnsafeRow].copy()).toSeq
+        assert(decoded == Seq.fill(3)(row))
+      }
+    } finally {
+      Platform.freeMemory(address)
+    }
+  }
+
   test("close empty input stream") {
     val input = new ClosableByteArrayInputStream(Array.empty)
     val serializer = new UnsafeRowSerializer(numFields = 2).newInstance()
     val deserializerIter = serializer.deserializeStream(input).asKeyValueIterator
     assert(!deserializerIter.hasNext)
     assert(input.closed)
+  }
+
+  gridTest("row decoding preserves framing across short reads")(Seq(1, 7, 8191, 8192)) {
+    chunkSize =>
+      val rows = Seq(0, 1, 1013, 8160, 8176, 16384).zipWithIndex.map { case (size, index) =>
+        toUnsafeRow(Row("x" * size, index), Array(StringType, IntegerType))
+      }
+      val serializer = new UnsafeRowSerializer(2).newInstance()
+      val output = new ByteArrayOutputStream()
+      val writer = serializer.serializeStream(output)
+      rows.foreach(writer.writeValue(_))
+      writer.close()
+      for (useIterator <- Seq(false, true)) {
+        val input = new ClosableByteArrayInputStream(output.toByteArray) {
+          override def read(bytes: Array[Byte], offset: Int, length: Int): Int = {
+            super.read(bytes, offset, math.min(length, chunkSize))
+          }
+        }
+        val reader = serializer.deserializeStream(input)
+        if (useIterator) {
+          assert(reader.asKeyValueIterator.map(_._2.asInstanceOf[UnsafeRow].copy()).toSeq ===
+            rows)
+          assert(input.closed)
+        } else {
+          rows.foreach(row => assert(reader.readValue[UnsafeRow]().copy() === row))
+          intercept[EOFException](reader.readValue[UnsafeRow]())
+        }
+        reader.close()
+        assert(input.closed)
+      }
+  }
+
+  test("row decoding reports truncated payloads") {
+    val row = toUnsafeRow(Row("x" * 16384, 1), Array(StringType, IntegerType))
+    val serializer = new UnsafeRowSerializer(2).newInstance()
+    val output = new ByteArrayOutputStream()
+    val writer = serializer.serializeStream(output)
+    writer.writeValue(row)
+    writer.close()
+    for (useIterator <- Seq(false, true)) {
+      val input = new ClosableByteArrayInputStream(output.toByteArray.dropRight(1))
+      val reader = serializer.deserializeStream(input)
+      try {
+        intercept[EOFException] {
+          if (useIterator) reader.asKeyValueIterator.next() else reader.readValue[UnsafeRow]()
+        }
+      } finally {
+        reader.close()
+      }
+      assert(input.closed)
+    }
   }
 
   test("SPARK-10466: external sorter spilling with unsafe row serializer") {

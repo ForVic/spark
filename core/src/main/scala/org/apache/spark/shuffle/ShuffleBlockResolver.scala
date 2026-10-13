@@ -33,6 +33,7 @@ trait ShuffleBlockResolver {
 
   /**
    * Retrieve the data for the specified block.
+   * The caller owns one reference to the returned buffer and must release it after use.
    *
    * When the dirs parameter is None then use the disk manager's local directories. Otherwise,
    * read from the specified directories.

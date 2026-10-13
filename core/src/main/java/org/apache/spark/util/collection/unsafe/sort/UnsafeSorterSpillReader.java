@@ -32,6 +32,7 @@ import org.apache.spark.storage.BlockId;
 import org.apache.spark.unsafe.Platform;
 
 import java.io.*;
+import java.util.concurrent.atomic.AtomicReference;
 
 /**
  * Reads spill files written by {@link UnsafeSorterSpillWriter} (see that class for a description
@@ -54,6 +55,8 @@ public final class UnsafeSorterSpillReader extends UnsafeSorterIterator implemen
   private byte[] arr = new byte[1024 * 1024];
   private Object baseObject = arr;
   private final TaskContext taskContext = TaskContext.get();
+  private final AtomicReference<UnsafeSorterSpillReader> taskCompletionReference =
+    new AtomicReference<>(this);
 
   public UnsafeSorterSpillReader(
       SerializerManager serializerManager,
@@ -87,11 +90,17 @@ public final class UnsafeSorterSpillReader extends UnsafeSorterIterator implemen
       throw e;
     }
     if (taskContext != null) {
+      // Capture a releasable reference, not this reader. A bounded merge can close many readers
+      // before the task ends; retaining each reader here also retains its last-record buffer.
+      final AtomicReference<UnsafeSorterSpillReader> readerReference = taskCompletionReference;
       taskContext.addTaskCompletionListener(context -> {
-        try {
-          close();
-        } catch (IOException e) {
-          logger.info("error while closing UnsafeSorterSpillReader", e);
+        UnsafeSorterSpillReader reader = readerReference.getAndSet(null);
+        if (reader != null) {
+          try {
+            reader.close();
+          } catch (IOException e) {
+            logger.info("error while closing UnsafeSorterSpillReader", e);
+          }
         }
       });
     }
@@ -157,13 +166,19 @@ public final class UnsafeSorterSpillReader extends UnsafeSorterIterator implemen
 
   @Override
   public void close() throws IOException {
-   if (in != null) {
-     try {
-       in.close();
-     } finally {
-       in = null;
-       din = null;
-     }
-   }
+    try {
+      if (in != null) {
+        try {
+          in.close();
+        } finally {
+          in = null;
+          din = null;
+        }
+      }
+    } finally {
+      // loadNext closes the stream after the last record. Keep that record readable through this
+      // iterator, but release the task's ownership even when stream closure throws.
+      taskCompletionReference.set(null);
+    }
   }
 }

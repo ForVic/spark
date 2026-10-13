@@ -48,6 +48,21 @@ class FileSourceStrategySuite extends SharedSparkSession {
 
   protected override def sparkConf = super.sparkConf.set(config.DEFAULT_PARALLELISM.key, "1")
 
+  test("estimating scan width does not construct a file reader") {
+    withSQLConf(SQLConf.FILES_MAX_PARTITION_BYTES.key -> "11",
+        SQLConf.FILES_OPEN_COST_IN_BYTES.key -> "1") {
+      val df = createTable(Seq("file1" -> 5, "file2" -> 5, "file3" -> 5))
+      val scan = df.queryExecution.executedPlan.collectFirst {
+        case s: FileSourceScanExec => s
+      }.get
+      LastArguments.options = null
+      assert(scan.estimatedPartitionCount.contains(2))
+      assert(LastArguments.options == null, "width planning must not call buildReader")
+      assert(scan.inputRDD.getNumPartitions == 2)
+      assert(LastArguments.options != null, "execution must still construct the reader")
+    }
+  }
+
   test("unpartitioned table, single partition") {
     val table =
       createTable(
