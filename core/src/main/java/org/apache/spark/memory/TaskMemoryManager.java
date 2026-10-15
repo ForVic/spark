@@ -22,6 +22,7 @@ import java.io.InterruptedIOException;
 import java.io.IOException;
 import java.nio.channels.ClosedByInterruptException;
 import java.util.*;
+import java.util.function.BooleanSupplier;
 
 import com.google.common.annotations.VisibleForTesting;
 
@@ -99,6 +100,15 @@ public class TaskMemoryManager {
   private final long taskAttemptId;
 
   /**
+   * The manager of the task this manager works for, if it was created for a thread that helps run
+   * another task (see {@link #TaskMemoryManager(TaskMemoryManager)}), else null.
+   */
+  private final TaskMemoryManager parent;
+
+  /** See {@link #setMemoryReclaimer}. */
+  private volatile BooleanSupplier memoryReclaimer = null;
+
+  /**
    * Tracks whether we're on-heap or off-heap. For off-heap, we short-circuit most of these methods
    * without doing any masking or lookups. Since this branching should be well-predicted by the JIT,
    * this extra layer of indirection / abstraction hopefully shouldn't be too expensive.
@@ -148,6 +158,31 @@ public class TaskMemoryManager {
     this.memoryManager = memoryManager;
     this.taskAttemptId = taskAttemptId;
     this.consumers = new HashSet<>();
+    this.parent = null;
+  }
+
+  /**
+   * Construct a TaskMemoryManager for a thread that helps run the task of {@code parent}, e.g. a
+   * morsel helper. Its memory counts towards that task in the memory pool, so the pool does not
+   * see an extra task, and towards the task's peak memory. It has its own consumers and pages, so
+   * it only spills and cleans up its own.
+   */
+  public TaskMemoryManager(TaskMemoryManager parent) {
+    this.tungstenMemoryMode = parent.tungstenMemoryMode;
+    this.memoryManager = parent.memoryManager;
+    this.taskAttemptId = parent.taskAttemptId;
+    this.consumers = new HashSet<>();
+    this.parent = parent;
+  }
+
+  /**
+   * Sets a callback for when a consumer cannot get all the memory it requests even after spilling
+   * this manager's consumers. The callback may free memory that other threads hold for the task
+   * (see {@link #TaskMemoryManager(TaskMemoryManager)}) and returns whether it did, in which case
+   * the request is retried. It runs on the requesting thread, without holding this manager's lock.
+   */
+  public void setMemoryReclaimer(BooleanSupplier reclaimer) {
+    this.memoryReclaimer = reclaimer;
   }
 
   /**
@@ -157,6 +192,15 @@ public class TaskMemoryManager {
    * @return number of bytes successfully granted (<= N).
    */
   public long acquireExecutionMemory(long required, MemoryConsumer requestingConsumer) {
+    long got = acquireExecutionMemoryOrSpill(required, requestingConsumer);
+    BooleanSupplier reclaimer = memoryReclaimer;
+    if (got < required && reclaimer != null && reclaimer.getAsBoolean()) {
+      got += acquireExecutionMemoryOrSpill(required - got, requestingConsumer);
+    }
+    return got;
+  }
+
+  private long acquireExecutionMemoryOrSpill(long required, MemoryConsumer requestingConsumer) {
     assert(required >= 0);
     assert(requestingConsumer != null);
     MemoryMode mode = requestingConsumer.getMode();
@@ -221,18 +265,7 @@ public class TaskMemoryManager {
           requestingConsumer);
       }
 
-      if (mode == MemoryMode.OFF_HEAP) {
-        synchronized (offHeapMemoryLock) {
-          currentOffHeapMemory += got;
-          peakOffHeapMemory = Math.max(peakOffHeapMemory, currentOffHeapMemory);
-        }
-      } else {
-        synchronized (onHeapMemoryLock) {
-          currentOnHeapMemory += got;
-          peakOnHeapMemory = Math.max(peakOnHeapMemory, currentOnHeapMemory);
-        }
-      }
-
+      trackAcquired(got, mode);
       return got;
     }
   }
@@ -304,7 +337,28 @@ public class TaskMemoryManager {
         consumer);
     }
     memoryManager.releaseExecutionMemory(size, taskAttemptId, consumer.getMode());
-    if (consumer.getMode() == MemoryMode.OFF_HEAP) {
+    trackReleased(size, consumer.getMode());
+  }
+
+  private void trackAcquired(long size, MemoryMode mode) {
+    if (mode == MemoryMode.OFF_HEAP) {
+      synchronized (offHeapMemoryLock) {
+        currentOffHeapMemory += size;
+        peakOffHeapMemory = Math.max(peakOffHeapMemory, currentOffHeapMemory);
+      }
+    } else {
+      synchronized (onHeapMemoryLock) {
+        currentOnHeapMemory += size;
+        peakOnHeapMemory = Math.max(peakOnHeapMemory, currentOnHeapMemory);
+      }
+    }
+    if (parent != null) {
+      parent.trackAcquired(size, mode);
+    }
+  }
+
+  private void trackReleased(long size, MemoryMode mode) {
+    if (mode == MemoryMode.OFF_HEAP) {
       synchronized (offHeapMemoryLock) {
         currentOffHeapMemory -= size;
       }
@@ -312,6 +366,9 @@ public class TaskMemoryManager {
       synchronized (onHeapMemoryLock) {
         currentOnHeapMemory -= size;
       }
+    }
+    if (parent != null) {
+      parent.trackReleased(size, mode);
     }
   }
 
@@ -547,6 +604,24 @@ public class TaskMemoryManager {
         }
       }
       Arrays.fill(pageTable, null);
+    }
+
+    if (parent != null) {
+      // Other threads of the task may still hold memory, so release only this manager's,
+      // including the memory that is not used by any consumer.
+      long onHeap;
+      synchronized (onHeapMemoryLock) {
+        onHeap = currentOnHeapMemory;
+      }
+      long offHeap;
+      synchronized (offHeapMemoryLock) {
+        offHeap = currentOffHeapMemory;
+      }
+      memoryManager.releaseExecutionMemory(onHeap, taskAttemptId, MemoryMode.ON_HEAP);
+      trackReleased(onHeap, MemoryMode.ON_HEAP);
+      memoryManager.releaseExecutionMemory(offHeap, taskAttemptId, MemoryMode.OFF_HEAP);
+      trackReleased(offHeap, MemoryMode.OFF_HEAP);
+      return onHeap + offHeap - acquiredButNotUsed;
     }
 
     // release the memory that is not used by any consumer (acquired for pages in tungsten mode).

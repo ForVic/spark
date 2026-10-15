@@ -251,6 +251,7 @@ case class ShuffleExchangeExec(
       val reason = MorselSafety.unsafeReason(child, outputPartitioning)
       dep.morselSafe = reason.isEmpty
       dep.morselOutputVariesWithSplit = MorselSafety.outputVariesWithSplit(child)
+      dep.morselJoinSplits = MorselSafety.joinSplits(child)
       logDebug(s"Shuffle ${dep.shuffleId} morsel-safe: ${reason.map("no, " + _).getOrElse("yes")}")
     }
     metrics("numPartitions").set(dep.partitioner.numPartitions)

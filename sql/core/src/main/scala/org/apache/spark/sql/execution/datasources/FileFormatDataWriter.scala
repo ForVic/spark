@@ -131,6 +131,19 @@ abstract class FileFormatDataWriter(
     WriteTaskResult(taskCommitMessage, summary)
   }
 
+  /**
+   * Closes the files written so far and returns their summary without committing the task, for a
+   * task whose files several writers write and the task then commits together, see
+   * [[FileWriteMorselSink]].
+   */
+  private[datasources] final def closeWithoutCommit(): ExecutedWriteSummary =
+    enrichWriteError(description.path) {
+      releaseResources()
+      ExecutedWriteSummary(
+        updatedPartitions = updatedPartitions.toSet,
+        stats = statsTrackers.map(_.getFinalStats(0L)))
+    }
+
   final def abort(): Unit = enrichWriteError(description.path) {
     try {
       releaseResources()

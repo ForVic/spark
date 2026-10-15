@@ -4954,10 +4954,12 @@ object SQLConf {
 
   val MORSEL_EXECUTION_ENABLED =
     buildConf("spark.sql.execution.morsel.enabled")
-      .doc("When true, shuffle map stages that scan files and only apply row-wise operators, " +
-        "broadcast joins and partial aggregations are marked as safe for morsel execution, so " +
-        "that idle executor cores can help their tasks. Requires " +
-        "spark.executor.morsel.enabled on the executors.")
+      .doc("When true, the tasks of stages whose input can be split into independent pieces " +
+        "(morsels) without changing their output, i.e. shuffle map stages and file writes over " +
+        "file scans, data source V2 scans or coalesced shuffle reads with suitable operators, " +
+        "may run as morsels, so that idle executor cores, and the spare cores of tasks with " +
+        "spark.task.cpus > 1, can help them. Requires spark.executor.morsel.enabled on the " +
+        "executors.")
       .version("4.2.0")
       .booleanConf
       .createWithDefault(false)

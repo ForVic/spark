@@ -28,6 +28,9 @@ import org.apache.spark.sql.catalyst.plans.physical.{KeyedPartitioning, SinglePa
 import org.apache.spark.sql.catalyst.util.{truncatedString, InternalRowComparableWrapper}
 import org.apache.spark.sql.connector.catalog.Table
 import org.apache.spark.sql.connector.read._
+import org.apache.spark.sql.execution.datasources.parquet.ParquetMorsels
+import org.apache.spark.sql.execution.datasources.v2.parquet.ParquetPartitionReaderFactory
+import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.util.ArrayImplicits._
 
 /**
@@ -133,8 +136,20 @@ case class BatchScanExec(
       // return an empty RDD with 1 partition if dynamic filtering removed the only split
       sparkContext.parallelize(Array.empty[InternalRow].toImmutableArraySeq, 1)
     } else {
-      new DataSourceRDD(
+      val rdd = new DataSourceRDD(
         sparkContext, filteredPartitions, readerFactory, supportsColumnar, customMetrics)
+      readerFactory match {
+        // Morsels of V2 Parquet scans are row groups. Readers of pushed down aggregates read
+        // whole files.
+        case parquet: ParquetPartitionReaderFactory
+            if conf.getConf(SQLConf.MORSEL_EXECUTION_ENABLED) && parquet.aggregation.isEmpty =>
+          val hadoopConf = parquet.broadcastedConf
+          val readColumns = Some(parquet.readDataSchema.fieldNames.toSet)
+          rdd.fileSplitter = (file, targetSize) => ParquetMorsels.split(file,
+            hadoopConf.value.value, targetSize, splitRowGroups = false, readColumns = readColumns)
+        case _ =>
+      }
+      rdd
     }
     postDriverMetrics()
     rdd

@@ -41,8 +41,8 @@ import org.apache.spark.sql.internal.{SessionStateHelper, SQLConf}
 import org.apache.spark.sql.sources.{BaseRelation, Filter}
 import org.apache.spark.sql.types.StructType
 import org.apache.spark.sql.vectorized.ColumnarBatch
-import org.apache.spark.util.{SerializableConfiguration, Utils}
 import org.apache.spark.util.ArrayImplicits._
+import org.apache.spark.util.Utils
 import org.apache.spark.util.collection.BitSet
 
 trait DataSourceScanExec extends LeafExecNode with StreamSourceAwareSparkPlan {
@@ -742,10 +742,11 @@ case class FileSourceScanExec(
         // reads page ranges, and row indexes are only generated for whole row groups.
         val splitRowGroups = supportsColumnar &&
           !requiredSchema.fieldNames.contains(ParquetSource.ROW_INDEX_TEMPORARY_COLUMN_NAME)
-        val hadoopConf = sparkContext.broadcast(new SerializableConfiguration(
-          getHadoopConf(relation.sparkSession, relation.options)))
-        fileScan.morselSplitter = (file, targetSize) =>
-          ParquetMorsels.split(file, hadoopConf.value.value, targetSize, splitRowGroups)
+        val hadoopConf = ParquetMorsels.broadcastConf(sparkContext,
+          getHadoopConf(relation.sparkSession, relation.options))
+        val readColumns = Some(requiredSchema.fieldNames.toSet)
+        fileScan.morselSplitter = (file, targetSize) => ParquetMorsels.split(file,
+          hadoopConf.value.value, targetSize, splitRowGroups, readColumns = readColumns)
       case _ =>
     }
     sendDriverMetrics()

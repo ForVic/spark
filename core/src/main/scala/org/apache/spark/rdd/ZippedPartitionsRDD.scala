@@ -87,11 +87,21 @@ private[spark] class ZippedPartitionsRDD2[A: ClassTag, B: ClassTag, V: ClassTag]
 
   override def compute(s: Partition, context: TaskContext): Iterator[V] = s match {
     case morsels: MorselPartition =>
-      // Both sides read the same morsels, e.g. the same reducer partitions of two shuffles.
       val partitions = morsels.parent.asInstanceOf[ZippedPartitionsPartition].partitions
-      val input = new SharedMorselInput(morsels.morsels)
-      f(rdd1.iterator(new MorselPartition(partitions(0), input.sourceIterator()), context),
-        rdd2.iterator(new MorselPartition(partitions(1), input.sourceIterator()), context))
+      morsels.zippedSide match {
+        // The morsels split one side; the other side is read whole.
+        case Some(0) =>
+          f(rdd1.iterator(new MorselPartition(partitions(0), morsels.morsels), context),
+            rdd2.iterator(partitions(1), context))
+        case Some(_) =>
+          f(rdd1.iterator(partitions(0), context),
+            rdd2.iterator(new MorselPartition(partitions(1), morsels.morsels), context))
+        // Both sides read the same morsels, e.g. the same reducer partitions of two shuffles.
+        case None =>
+          val input = new SharedMorselInput(morsels.morsels)
+          f(rdd1.iterator(new MorselPartition(partitions(0), input.sourceIterator()), context),
+            rdd2.iterator(new MorselPartition(partitions(1), input.sourceIterator()), context))
+      }
     case _ =>
       val partitions = s.asInstanceOf[ZippedPartitionsPartition].partitions
       f(rdd1.iterator(partitions(0), context), rdd2.iterator(partitions(1), context))

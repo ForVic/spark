@@ -22,6 +22,7 @@ import java.util.Date
 import org.apache.spark.{SparkException, TaskContext}
 import org.apache.spark.internal.io.{FileCommitProtocol, SparkHadoopWriterUtils}
 import org.apache.spark.rdd.RDD
+import org.apache.spark.scheduler.morsel.MorselSinkRDD
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.catalog.BucketSpec
 import org.apache.spark.sql.catalyst.catalog.CatalogTypes.TablePartitionSpec
@@ -30,6 +31,8 @@ import org.apache.spark.sql.catalyst.plans.logical.{LogicalPlan, UnaryNode}
 import org.apache.spark.sql.connector.write.WriterCommitMessage
 import org.apache.spark.sql.execution.{SparkPlan, UnaryExecNode}
 import org.apache.spark.sql.execution.datasources.FileFormatWriter.ConcurrentOutputWriterSpec
+import org.apache.spark.sql.execution.exchange.MorselSafety
+import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.util.ArrayImplicits._
 
 /**
@@ -91,6 +94,25 @@ case class WriteFilesExec(
     val description = writeFilesSpec.description
     val committer = writeFilesSpec.committer
     val jobTrackerID = SparkHadoopWriterUtils.createJobTrackerID(new Date())
+    if (conf.getConf(SQLConf.MORSEL_EXECUTION_ENABLED)) {
+      // The writer needs the rows of each output partition and bucket together, which unless
+      // concurrent writers are used the stage must ensure within each participant.
+      val requiresGroupedInput = concurrentOutputWriterSpec.isEmpty &&
+        (partitionColumns.length > staticPartitions.size || bucketSpec.isDefined)
+      val unsafeReason = FileWriteMorselSink.unsupportedReason(description)
+        .orElse(MorselSafety.writeUnsafeReason(child, requiresGroupedInput))
+      unsafeReason match {
+        case None =>
+          val sinkRdd = new MorselSinkRDD[InternalRow, WriterCommitMessage](
+            rddWithNonEmptyPartitions,
+            new FileWriteMorselSink(description, jobTrackerID, committer,
+              concurrentOutputWriterSpec))
+          sinkRdd.joinSplits = MorselSafety.joinSplits(child)
+          return sinkRdd
+        case Some(reason) =>
+          logDebug(s"Write tasks will not run as morsels: $reason")
+      }
+    }
     rddWithNonEmptyPartitions.mapPartitionsInternal { iterator =>
       val sparkStageId = TaskContext.get().stageId()
       val sparkPartitionId = TaskContext.get().partitionId()

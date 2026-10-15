@@ -25,9 +25,11 @@ import org.apache.spark._
 import org.apache.spark.deploy.SparkHadoopUtil
 import org.apache.spark.internal.Logging
 import org.apache.spark.rdd.RDD
+import org.apache.spark.scheduler.morsel.{Morsel, MorselPartition, MorselSource}
 import org.apache.spark.sql.catalyst.InternalRow
-import org.apache.spark.sql.connector.read.{InputPartition, PartitionReader, PartitionReaderFactory}
+import org.apache.spark.sql.connector.read.{HasPartitionStatistics, InputPartition, PartitionReader, PartitionReaderFactory, SplittableInputPartition}
 import org.apache.spark.sql.errors.QueryExecutionErrors
+import org.apache.spark.sql.execution.datasources.{FilePartition, PartitionedFile}
 import org.apache.spark.sql.execution.metric.{CustomMetrics, SQLMetric}
 import org.apache.spark.sql.vectorized.ColumnarBatch
 import org.apache.spark.util.ArrayImplicits._
@@ -69,7 +71,14 @@ class DataSourceRDD(
     partitionReaderFactory: PartitionReaderFactory,
     columnarReads: Boolean,
     customMetrics: Map[String, SQLMetric])
-  extends RDD[InternalRow](sc, Nil) {
+  extends RDD[InternalRow](sc, Nil) with MorselSource {
+
+  /**
+   * Splits a file of a [[FilePartition]] (of a V2 file source) into morsels of about the given
+   * size, returning each with its size. Whole files by default.
+   */
+  @volatile private[sql] var fileSplitter: (PartitionedFile, Long) => Seq[(PartitionedFile, Long)] =
+    (file, _) => Seq((file, file.length))
 
   // Map from task attempt ID to the most recently created ReaderState for that task.
   // When compute() is called multiple times for the same task (due to coalescing), the map entry
@@ -111,7 +120,11 @@ class DataSourceRDD(
       }
     }
 
-    castPartition(split).inputPartition.iterator.flatMap { inputPartition =>
+    val inputPartitions = split match {
+      case morsels: MorselPartition => morsels.morsels.map(_.asInstanceOf[InputPartition])
+      case _ => castPartition(split).inputPartition.iterator
+    }
+    inputPartitions.flatMap { inputPartition =>
       val (iter, reader) = if (columnarReads) {
         val batchReader = partitionReaderFactory.createColumnarReader(inputPartition)
         val iter = new MetricsBatchIterator(
@@ -144,6 +157,42 @@ class DataSourceRDD(
 
   override def getPreferredLocations(split: Partition): Seq[String] = {
     castPartition(split).inputPartition.toSeq.flatMap(_.preferredLocations())
+  }
+
+  /**
+   * Splits the input partition of a task into morsels: the files of a V2 file source's
+   * [[FilePartition]], further split by `fileSplitter`, or the pieces of a
+   * [[SplittableInputPartition]]. Other input partitions are a single morsel.
+   */
+  override private[spark] def splitIntoMorsels(
+      split: Partition,
+      targetSize: Long): IndexedSeq[Morsel] = castPartition(split).inputPartition match {
+    case Some(partition: FilePartition) =>
+      partition.files.toIndexedSeq.flatMap(fileSplitter(_, targetSize)).map { case (file, size) =>
+        Morsel(FilePartition(partition.index, Array(file)), size)
+      }
+    case Some(partition: SplittableInputPartition) =>
+      val pieces = partition.split(targetSize).toIndexedSeq
+      // Each piece must be readable like the partition, see SplittableInputPartition.
+      if (pieces.forall(partitionReaderFactory.supportColumnarReads(_) == columnarReads)) {
+        pieces.map(piece => Morsel(piece, sizeInBytes(piece).getOrElse(targetSize)))
+      } else {
+        IndexedSeq(Morsel(partition, sizeInBytes(partition).getOrElse(targetSize)))
+      }
+    case Some(partition) => IndexedSeq(Morsel(partition, sizeInBytes(partition).getOrElse(0L)))
+    case None => IndexedSeq.empty
+  }
+
+  /** Reads adjacent files of a [[FilePartition]] together. */
+  override private[spark] def mergeMorsels(first: AnyRef, next: AnyRef): Option[AnyRef] =
+    (first, next) match {
+      case (a: FilePartition, b: FilePartition) => Some(FilePartition(a.index, a.files ++ b.files))
+      case _ => None
+    }
+
+  private def sizeInBytes(partition: InputPartition): Option[Long] = partition match {
+    case p: HasPartitionStatistics if p.sizeInBytes().isPresent => Some(p.sizeInBytes().getAsLong)
+    case _ => None
   }
 }
 

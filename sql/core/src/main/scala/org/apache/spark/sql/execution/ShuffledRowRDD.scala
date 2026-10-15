@@ -19,6 +19,8 @@ package org.apache.spark.sql.execution
 
 import java.util.Arrays
 
+import scala.collection.mutable
+
 import org.apache.spark._
 import org.apache.spark.rdd.RDD
 import org.apache.spark.scheduler.morsel.{Morsel, MorselPartition, MorselSource}
@@ -227,8 +229,87 @@ class ShuffledRowRDD(
           PartialMapperPartitionSpec(nextMapIndex, nextStart, nextEnd))
           if mapIndex == nextMapIndex && end <= nextStart =>
         Some(PartialMapperPartitionSpec(mapIndex, start, nextEnd))
+      case (PartialReducerPartitionSpec(reducer, start, end, size),
+          PartialReducerPartitionSpec(nextReducer, nextStart, nextEnd, nextSize))
+          if reducer == nextReducer && end == nextStart =>
+        Some(PartialReducerPartitionSpec(reducer, start, nextEnd, size + nextSize))
       case _ => None
     }
+
+  override private[spark] def joinSideId: Option[Int] = Some(dependency.shuffleId)
+
+  override private[spark] def partitionSize(split: Partition): Option[Long] =
+    split.asInstanceOf[ShuffledRowRDDPartition].spec match {
+      case CoalescedPartitionSpec(startReducerIndex, endReducerIndex, _) =>
+        blockSizes(0, Int.MaxValue, startReducerIndex, endReducerIndex, 1)((_, _) => 0)
+          .map(_.head)
+      case PartialReducerPartitionSpec(reducerIndex, startMapIndex, endMapIndex, _) =>
+        blockSizes(startMapIndex, endMapIndex, reducerIndex, reducerIndex + 1, 1)((_, _) => 0)
+          .map(_.head)
+      case _ => None
+    }
+
+  /**
+   * Splits each reducer partition that a partition reads into ranges of map outputs of about
+   * `targetSize` bytes, like AQE's skew join splitting: a range of a reducer partition joins with
+   * the whole reducer partition of the other side.
+   */
+  override private[spark] def splitIntoOneSidedMorsels(
+      split: Partition,
+      targetSize: Long): Option[IndexedSeq[Morsel]] =
+    split.asInstanceOf[ShuffledRowRDDPartition].spec match {
+      case CoalescedPartitionSpec(startReducerIndex, endReducerIndex, _) =>
+        mapRangeMorsels(startReducerIndex, endReducerIndex, 0, Int.MaxValue, targetSize)
+      case PartialReducerPartitionSpec(reducerIndex, startMapIndex, endMapIndex, _) =>
+        mapRangeMorsels(reducerIndex, reducerIndex + 1, startMapIndex, endMapIndex, targetSize)
+      case _ => None
+    }
+
+  private def mapRangeMorsels(
+      startReducerIndex: Int,
+      endReducerIndex: Int,
+      startMapIndex: Int,
+      endMapIndex: Int,
+      targetSize: Long): Option[IndexedSeq[Morsel]] = {
+    // Block sizes by reducer partition and map index.
+    val sizes = Array.fill(endReducerIndex - startReducerIndex)(mutable.TreeMap.empty[Int, Long])
+    var onlyShuffleBlocks = true
+    SparkEnv.get.mapOutputTracker.getMapSizesByExecutorId(dependency.shuffleId,
+        startMapIndex, endMapIndex, startReducerIndex, endReducerIndex)
+      .foreach { case (_, blocks) =>
+        blocks.foreach {
+          case (block: ShuffleBlockId, size, mapIndex) =>
+            val reducerSizes = sizes(block.reduceId - startReducerIndex)
+            reducerSizes(mapIndex) = reducerSizes.getOrElse(mapIndex, 0L) + size
+          case _ => onlyShuffleBlocks = false
+        }
+      }
+    if (!onlyShuffleBlocks) {
+      return None
+    }
+    Some(sizes.indices.flatMap { i =>
+      val reducer = startReducerIndex + i
+      val ranges = new mutable.ArrayBuffer[Morsel]
+      var rangeStart = startMapIndex
+      var rangeSize = 0L
+      sizes(i).foreach { case (mapIndex, size) =>
+        if (rangeSize > 0 && rangeSize + size > targetSize) {
+          ranges += Morsel(
+            PartialReducerPartitionSpec(reducer, rangeStart, mapIndex, rangeSize), rangeSize)
+          rangeStart = mapIndex
+          rangeSize = 0L
+        }
+        rangeSize += size
+      }
+      if (ranges.isEmpty && startMapIndex == 0 && endMapIndex == Int.MaxValue) {
+        ranges += Morsel(CoalescedPartitionSpec(reducer, reducer + 1), rangeSize)
+      } else {
+        ranges += Morsel(
+          PartialReducerPartitionSpec(reducer, rangeStart, endMapIndex, rangeSize), rangeSize)
+      }
+      ranges
+    })
+  }
 
   private def morselsOf(spec: ShufflePartitionSpec): Option[IndexedSeq[Morsel]] = spec match {
     case CoalescedPartitionSpec(startReducerIndex, endReducerIndex, _) =>

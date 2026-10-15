@@ -102,7 +102,13 @@ case class ParquetPartitionReaderFactory(
       // 1. opening the file twice by transfering the SeekableInputStream
       // 2. reading the footer twice by reading all row groups in advance and filter row groups
       //    according to filters that require push down
-      ParquetFooterReader.openFileAndReadFooter(hadoopConf, file, enableVectorizedReader)
+      // The footer may also have been read already, when splitting the file into morsels.
+      (if (enableVectorizedReader) {
+        ParquetMorsels.openWithCachedFooter(hadoopConf, file)
+      } else {
+        None
+      }).getOrElse(
+        ParquetFooterReader.openFileAndReadFooter(hadoopConf, file, enableVectorizedReader))
     }
   }
 

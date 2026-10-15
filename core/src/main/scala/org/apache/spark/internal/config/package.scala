@@ -730,9 +730,11 @@ package object config {
   private[spark] val MORSEL_ENABLED =
     ConfigBuilder("spark.executor.morsel.enabled")
       .doc("Whether executors run an executor-wide morsel scheduler. When enabled, eligible " +
-        "shuffle map tasks split their input into morsels, and executor cores that would " +
-        "otherwise be idle help run the remaining morsels of tasks that are still running. " +
-        "Each task keeps ownership of its input partition and its map output.")
+        "tasks (shuffle map tasks and file writes) split their input into morsels, and " +
+        "executor cores that would otherwise be idle, as well as the spare cores of tasks " +
+        "with spark.task.cpus > 1, help run the remaining morsels of tasks that are still " +
+        "running. Each task keeps ownership of its input partition and its output, and helpers " +
+        "share the memory of the task they help.")
       .version("4.2.0")
       .booleanConf
       .createWithDefault(false)

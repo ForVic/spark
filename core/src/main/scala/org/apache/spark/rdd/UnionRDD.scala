@@ -107,8 +107,8 @@ class UnionRDD[T: ClassTag](
   override def compute(s: Partition, context: TaskContext): Iterator[T] = s match {
     case morsels: MorselPartition =>
       val part = morsels.parent.asInstanceOf[UnionPartition[T]]
-      parent[T](part.parentRddIndex)
-        .iterator(new MorselPartition(part.parentPartition, morsels.morsels), context)
+      parent[T](part.parentRddIndex).iterator(
+        new MorselPartition(part.parentPartition, morsels.morsels, morsels.zippedSide), context)
     case _ =>
       val part = s.asInstanceOf[UnionPartition[T]]
       parent[T](part.parentRddIndex).iterator(part.parentPartition, context)

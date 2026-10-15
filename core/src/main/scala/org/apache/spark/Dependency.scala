@@ -27,6 +27,7 @@ import org.apache.spark.annotation.DeveloperApi
 import org.apache.spark.internal.Logging
 import org.apache.spark.internal.LogKeys._
 import org.apache.spark.rdd.RDD
+import org.apache.spark.scheduler.morsel.MorselJoinSplit
 import org.apache.spark.serializer.Serializer
 import org.apache.spark.shuffle.{ShuffleHandle, ShuffleWriteProcessor}
 import org.apache.spark.shuffle.checksum.RowBasedChecksum
@@ -154,6 +155,9 @@ class ShuffleDependency[K: ClassTag, V: ClassTag, C: ClassTag](
    * was split, e.g. a partial aggregation emits one row per key per participant.
    */
   @volatile private[spark] var morselOutputVariesWithSplit: Boolean = true
+
+  /** Joins in the map side whose morsels may split one side only, see [[MorselJoinSplit]]. */
+  @volatile private[spark] var morselJoinSplits: Seq[MorselJoinSplit] = Nil
 
   def shuffleMergeEnabled : Boolean = shuffleMergeAllowed && mergerLocs.nonEmpty
 

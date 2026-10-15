@@ -17,11 +17,12 @@
 
 package org.apache.spark.sql.execution.datasources.parquet
 
-import java.util.Optional
+import java.util.{Locale, Optional}
 
 import scala.jdk.CollectionConverters._
 import scala.util.control.NonFatal
 
+import com.google.common.cache.CacheBuilder
 import org.apache.hadoop.conf.Configuration
 import org.apache.parquet.HadoopReadOptions
 import org.apache.parquet.hadoop.ParquetFileReader
@@ -29,8 +30,10 @@ import org.apache.parquet.hadoop.metadata.FileMetaData.EncryptionType
 import org.apache.parquet.hadoop.metadata.ParquetMetadata
 import org.apache.parquet.hadoop.util.HadoopInputFile
 
+import org.apache.spark.SparkContext
+import org.apache.spark.broadcast.Broadcast
 import org.apache.spark.sql.execution.datasources.PartitionedFile
-import org.apache.spark.util.Utils
+import org.apache.spark.util.{SerializableConfiguration, Utils}
 
 /**
  * Splits Parquet files into morsels for morsel-driven execution (see
@@ -82,6 +85,22 @@ object ParquetMorsels {
         inputFile, Optional.of(inputFile.newStream()))
     }
 
+  // Broadcasts of Hadoop configurations for splitting files on executors, by application and
+  // configuration entries.
+  private val broadcastConfs = CacheBuilder.newBuilder().maximumSize(8)
+    .build[(String, Seq[(String, String)]), Broadcast[SerializableConfiguration]]()
+
+  /**
+   * A broadcast of `conf`, for splitting files on executors. Broadcasting a Hadoop configuration
+   * (a thousand entries or so) takes milliseconds, a noticeable part of a short query when every
+   * scan does it, so scans with the same configuration share one broadcast.
+   */
+  def broadcastConf(sc: SparkContext, conf: Configuration): Broadcast[SerializableConfiguration] = {
+    val entries = conf.iterator().asScala.map(e => (e.getKey, e.getValue)).toSeq.sorted
+    broadcastConfs.get((sc.applicationId, entries),
+      () => sc.broadcast(new SerializableConfiguration(conf)))
+  }
+
   /**
    * Rows per morsel. Compressed bytes can badly underestimate the work in a row group (e.g.
    * highly compressible data), so row groups are also split by row count, like the ~100k-row
@@ -90,24 +109,30 @@ object ParquetMorsels {
   val ROWS_PER_MORSEL: Long = 1L << 20
 
   /**
-   * Splits the row groups of a file range into morsels of about `targetSize` bytes, returning
-   * each morsel with its size.
+   * Splits the row groups of a file range into morsels of about `targetSize` bytes of work,
+   * returning each morsel with its size. The work of a row group is the uncompressed size of the
+   * columns that are read, plus a byte per row (e.g. when no column is read).
    *
    * @param splitRowGroups whether large row groups may be split into page ranges, which only the
-   *                       vectorized reader supports.
+   *                       vectorized reader of [[ParquetFileFormat]] supports.
+   * @param cacheFooter whether to pass the footer to the reader, see [[openWithCachedFooter]].
+   * @param readColumns the top-level columns that are read, case-insensitively; None if all.
    */
   def split(
       file: PartitionedFile,
       conf: Configuration,
       targetSize: Long,
-      splitRowGroups: Boolean): Seq[(PartitionedFile, Long)] = {
+      splitRowGroups: Boolean,
+      cacheFooter: Boolean = true,
+      readColumns: Option[Set[String]] = None): Seq[(PartitionedFile, Long)] = {
     // Not worth reading the footer of tiny files. If the footer cannot be read, leave the file
     // whole, so that the reader handles the error (e.g. honoring ignoreMissingFiles).
     if (file.length * 64 < targetSize) {
       Seq((file, file.length))
     } else {
       try {
-        splitRowGroupsOf(file, conf, targetSize, splitRowGroups)
+        splitRowGroupsOf(file, conf, targetSize, splitRowGroups, cacheFooter,
+          readColumns.map(_.map(_.toLowerCase(Locale.ROOT))))
       } catch {
         case NonFatal(_) => Seq((file, file.length))
       }
@@ -118,7 +143,9 @@ object ParquetMorsels {
       file: PartitionedFile,
       conf: Configuration,
       targetSize: Long,
-      splitRowGroups: Boolean): Seq[(PartitionedFile, Long)] = {
+      splitRowGroups: Boolean,
+      cacheFooter: Boolean,
+      readColumns: Option[Set[String]]): Seq[(PartitionedFile, Long)] = {
     val options = HadoopReadOptions.builder(conf, file.toPath)
       .withRange(file.start, file.start + file.length)
       .build()
@@ -127,7 +154,8 @@ object ParquetMorsels {
       val footer = reader.getFooter
       // Readers of encrypted files decrypt footer metadata lazily, so they don't share it.
       val cachedFooter =
-        if (footer.getFileMetaData.getEncryptionType == EncryptionType.UNENCRYPTED) {
+        if (cacheFooter &&
+            footer.getFileMetaData.getEncryptionType == EncryptionType.UNENCRYPTED) {
           Map(FOOTER_KEY -> footer)
         } else {
           Map.empty
@@ -137,9 +165,13 @@ object ParquetMorsels {
         val rowGroup = file.copy(start = block.getStartingPos, length = block.getCompressedSize,
           otherConstantMetadataColumnValues =
             file.otherConstantMetadataColumnValues ++ cachedFooter)
-        // Size by uncompressed bytes, which reflect the work better than compressed ones.
-        val size = block.getTotalByteSize
         val columns = block.getColumns.asScala.toSeq
+        val read = columns.filter { c =>
+          readColumns.forall(_.contains(c.getPath.toArray.head.toLowerCase(Locale.ROOT)))
+        }
+        // Uncompressed bytes reflect the work better than compressed ones, and columns that are
+        // not read are no work at all.
+        val size = read.map(_.getTotalUncompressedSize).sum + block.getRowCount
         // Page ranges are slower to read than whole row groups (rows outside the range are
         // skipped one page at a time), so only split row groups that are much larger than a
         // morsel.
@@ -150,8 +182,9 @@ object ParquetMorsels {
             columns.exists(_.getOffsetIndexReference == null)) {
           Seq((rowGroup, size))
         } else {
-          // Split along the pages of the largest column, into ranges of about equal rows.
-          val column = columns.maxBy(_.getTotalSize)
+          // Split along the pages of the largest column that is read, into ranges of about equal
+          // rows.
+          val column = (if (read.nonEmpty) read else columns).maxBy(_.getTotalSize)
           val offsetIndex = reader.readOffsetIndex(column)
           val rowCount = block.getRowCount
           val boundaries = (0 +: (1 until numMorsels).map { m =>

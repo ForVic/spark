@@ -186,7 +186,7 @@ class BasicWriteTaskStatsTracker(
 class BasicWriteJobStatsTracker(
     serializableHadoopConf: SerializableConfiguration,
     @transient val driverSideMetrics: Map[String, SQLMetric],
-    taskCommitTimeMetric: SQLMetric)
+    private[datasources] val taskCommitTimeMetric: SQLMetric)
   extends WriteJobStatsTracker {
 
   def this(

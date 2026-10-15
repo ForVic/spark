@@ -25,6 +25,7 @@ import java.util.Properties
 import org.apache.spark._
 import org.apache.spark.broadcast.Broadcast
 import org.apache.spark.rdd.RDD
+import org.apache.spark.scheduler.morsel.MorselTask
 
 /**
  * A task that sends back the output to the driver application.
@@ -90,7 +91,10 @@ private[spark] class ResultTask[T, U](
       threadMXBean.getCurrentThreadCpuTime - deserializeStartCpuTime
     } else 0L
 
-    func(context, rdd.iterator(partition, context))
+    val records = MorselTask.tryRunResultTask(taskBinary, rdd, partition, context, isBarrier,
+        morselHelperCpuTimeNs = _).map(_.asInstanceOf[Iterator[T]])
+      .getOrElse(rdd.iterator(partition, context))
+    func(context, records)
   }
 
   // This is only callable on the driver side.

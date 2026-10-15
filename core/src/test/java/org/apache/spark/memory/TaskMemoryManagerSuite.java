@@ -43,6 +43,52 @@ public class TaskMemoryManagerSuite {
   }
 
   @Test
+  public void helperMemoryCountsTowardsItsTask() {
+    final UnifiedMemoryManager memoryManager = new UnifiedMemoryManager(
+      new SparkConf().set(package$.MODULE$.MEMORY_OFFHEAP_ENABLED(), false), 10000, 5000, 1);
+    final TaskMemoryManager task = new TaskMemoryManager(memoryManager, 7);
+    final TaskMemoryManager helper = new TaskMemoryManager(task);
+    final TestMemoryConsumer c1 = new TestMemoryConsumer(task);
+    final TestMemoryConsumer c2 = new TestMemoryConsumer(helper);
+    c1.use(100);
+    c2.use(200);
+    // The pool sees one task, whose peak memory includes the helper's.
+    Assertions.assertEquals(300, memoryManager.getExecutionMemoryUsageForTask(7));
+    Assertions.assertEquals(300, task.getPeakOnHeapExecutionMemory());
+    Assertions.assertEquals(200, helper.getPeakOnHeapExecutionMemory());
+    c2.free(50);
+    Assertions.assertEquals(250, memoryManager.getExecutionMemoryUsageForTask(7));
+    // Cleaning up the helper releases only the helper's memory.
+    Assertions.assertEquals(150, helper.cleanUpAllAllocatedMemory());
+    Assertions.assertEquals(100, memoryManager.getExecutionMemoryUsageForTask(7));
+    Assertions.assertEquals(100, task.cleanUpAllAllocatedMemory());
+    Assertions.assertEquals(0, memoryManager.executionMemoryUsed());
+  }
+
+  @Test
+  public void reclaimerFreesMemoryOfOtherThreads() {
+    final UnifiedMemoryManager memoryManager = new UnifiedMemoryManager(
+      new SparkConf().set(package$.MODULE$.MEMORY_OFFHEAP_ENABLED(), false), 1000, 500, 1);
+    final TaskMemoryManager task = new TaskMemoryManager(memoryManager, 1);
+    final TaskMemoryManager helper = new TaskMemoryManager(task);
+    final TestMemoryConsumer taskConsumer = new TestMemoryConsumer(task);
+    final TestMemoryConsumer helperConsumer = new TestMemoryConsumer(helper);
+    helperConsumer.use(1000);
+    taskConsumer.use(500);
+    // The task's thread cannot spill the helper's consumer.
+    Assertions.assertEquals(0, taskConsumer.getUsed());
+    task.setMemoryReclaimer(() -> {
+      helperConsumer.free(helperConsumer.getUsed());
+      return true;
+    });
+    taskConsumer.use(500);
+    Assertions.assertEquals(500, taskConsumer.getUsed());
+    task.setMemoryReclaimer(null);
+    Assertions.assertEquals(0, helper.cleanUpAllAllocatedMemory());
+    Assertions.assertEquals(500, task.cleanUpAllAllocatedMemory());
+  }
+
+  @Test
   public void encodePageNumberAndOffsetOffHeap() {
     final SparkConf conf = new SparkConf()
       .set(package$.MODULE$.MEMORY_OFFHEAP_ENABLED(), true)
