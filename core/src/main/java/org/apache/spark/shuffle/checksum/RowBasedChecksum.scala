@@ -62,6 +62,13 @@ abstract class RowBasedChecksum() extends Serializable with Logging {
     }
   }
 
+  /** Adds the rows of `other` to this checksum, as if they had been passed to `update`. */
+  def merge(other: RowBasedChecksum): Unit = {
+    hasError = hasError || other.hasError
+    checksumXor = checksumXor ^ other.checksumXor
+    checksumSum += other.checksumSum
+  }
+
   /** Computes and returns the checksum value for the given (key, value) pair */
   protected def calculateRowChecksum(key: Any, value: Any): Long
 

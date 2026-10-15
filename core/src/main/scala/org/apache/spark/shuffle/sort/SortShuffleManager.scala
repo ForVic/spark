@@ -175,6 +175,22 @@ private[spark] class SortShuffleManager(conf: SparkConf) extends ShuffleManager 
     }
   }
 
+  /**
+   * Returns the writer of a morsel-executed map task, which all participants of the task use,
+   * and registers the task's map output.
+   */
+  private[spark] def getMorselWriter[K, V](
+      handle: ShuffleHandle,
+      mapId: Long): MorselShuffleWriter[K, V] = {
+    val mapTaskIds = taskIdMapsForShuffle.computeIfAbsent(
+      handle.shuffleId, _ => new OpenHashSet[Long](16))
+    mapTaskIds.synchronized { mapTaskIds.add(mapId) }
+    val env = SparkEnv.get
+    new MorselShuffleWriter(env.blockManager,
+      handle.asInstanceOf[BaseShuffleHandle[K, V, V]].dependency, mapId, env.conf,
+      shuffleExecutorComponents)
+  }
+
   /** Remove a shuffle's metadata from the ShuffleManager. */
   override def unregisterShuffle(shuffleId: Int): Boolean = {
     Option(taskIdMapsForShuffle.remove(shuffleId)).foreach { mapTaskIds =>

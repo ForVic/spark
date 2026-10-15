@@ -222,8 +222,12 @@ class ParquetFileFormat
       // 1. opening the file twice by transfering the SeekableInputStream
       // 2. reading the footer twice by reading all row groups in advance and filter row groups
       //    according to filters that require push down
-      val openedFooter =
-        ParquetFooterReader.openFileAndReadFooter(sharedConf, file, enableVectorizedReader)
+      val openedFooter = (if (enableVectorizedReader) {
+        ParquetMorsels.openWithCachedFooter(sharedConf, file)
+      } else {
+        None
+      }).getOrElse(
+        ParquetFooterReader.openFileAndReadFooter(sharedConf, file, enableVectorizedReader))
       assert(openedFooter.inputStreamOpt.isPresent == enableVectorizedReader)
 
       // Before transferring the ownership of inputStream to the vectorizedReader,
@@ -284,11 +288,14 @@ class ParquetFileFormat
         pushed.foreach {
           ParquetInputFormat.setFilterPredicate(hadoopAttemptContext.getConfiguration, _)
         }
+        val pageRange = ParquetMorsels.pageRange(file)
         if (enableVectorizedReader) {
           buildVectorizedIterator(
             hadoopAttemptContext, split, file.partitionValues, partitionSchema, convertTz,
             datetimeRebaseSpec, int96RebaseSpec, enableOffHeapColumnVector, returningBatch,
-            capacity, openedFooter, shouldCloseInputStream)
+            capacity, openedFooter, shouldCloseInputStream, pageRange)
+        } else if (pageRange.isDefined) {
+          throw new IllegalStateException("Only the vectorized reader can read page ranges")
         } else {
           logDebug(s"Falling back to parquet-mr")
           buildRowBasedIterator(
@@ -316,7 +323,8 @@ class ParquetFileFormat
       returningBatch: Boolean,
       batchSize: Int,
       openedFooter: OpenedParquetFooter,
-      shouldCloseInputStream: AtomicBoolean): Iterator[InternalRow] = {
+      shouldCloseInputStream: AtomicBoolean,
+      pageRange: Option[ParquetMorsels.PageRange]): Iterator[InternalRow] = {
     // scalastyle:on argcount
     assert(openedFooter.inputStreamOpt.isPresent)
     val vectorizedReader = new VectorizedParquetRecordReader(
@@ -336,6 +344,9 @@ class ParquetFileFormat
     // Instead, we use FileScanRDD's task completion listener to close this iterator.
     val iter = new RecordReaderIterator(vectorizedReader)
     try {
+      pageRange.foreach { range =>
+        vectorizedReader.setMorselPageRange(range.columnPath, range.firstPage, range.endPage)
+      }
       vectorizedReader.initialize(
         split, hadoopAttemptContext, Some(openedFooter.inputFile),
         Some(openedFooter.inputStream), Some(openedFooter.footer))

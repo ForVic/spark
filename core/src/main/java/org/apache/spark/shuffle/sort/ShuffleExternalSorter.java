@@ -122,6 +122,11 @@ final class ShuffleExternalSorter extends MemoryConsumer implements ShuffleCheck
   // Checksum calculator for each partition. Empty when shuffle checksum disabled.
   private final Checksum[] partitionChecksums;
 
+  // If true, the files returned by closeAndGetSpills() are always merged with the output of other
+  // sorters (morsel execution), so the final in-memory dump is never the final output file. Its
+  // bytes are counted when the files are merged.
+  private boolean outputIsMergeInput = false;
+
   ShuffleExternalSorter(
       TaskMemoryManager memoryManager,
       BlockManager blockManager,
@@ -157,6 +162,10 @@ final class ShuffleExternalSorter extends MemoryConsumer implements ShuffleCheck
     return getChecksumValues(partitionChecksums);
   }
 
+  void setOutputIsMergeInput() {
+    this.outputIsMergeInput = true;
+  }
+
   /**
    * Sorts the in-memory records and writes the sorted records to an on-disk file.
    * This method does not free the sort data structures.
@@ -164,10 +173,12 @@ final class ShuffleExternalSorter extends MemoryConsumer implements ShuffleCheck
    * @param isFinalFile if true, this indicates that we're writing the final output file and that
    *                    the bytes written should be counted towards shuffle write metrics rather
    *                    than shuffle spill metrics.
+   * @param isSpill if true, this file is written in response to memory pressure and its bytes
+   *                are counted towards shuffle spill metrics.
    */
-  private void writeSortedFile(boolean isFinalFile) {
+  private void writeSortedFile(boolean isFinalFile, boolean isSpill) {
     // Only emit the log if this is an actual spilling.
-    if (!isFinalFile) {
+    if (isSpill) {
       logger.info(
         "Task {} on Thread {} spilling sort data of {} to disk ({} {} so far)",
         MDC.of(LogKeys.TASK_ATTEMPT_ID, taskContext.taskAttemptId()),
@@ -289,8 +300,10 @@ final class ShuffleExternalSorter extends MemoryConsumer implements ShuffleCheck
       // of this method.
       writeMetrics.incRecordsWritten(
         ((ShuffleWriteMetrics)writeMetricsToUse).recordsWritten());
-      taskContext.taskMetrics().incDiskBytesSpilled(
-        ((ShuffleWriteMetrics)writeMetricsToUse).bytesWritten());
+      if (isSpill) {
+        taskContext.taskMetrics().incDiskBytesSpilled(
+          ((ShuffleWriteMetrics)writeMetricsToUse).bytesWritten());
+      }
     }
   }
 
@@ -303,7 +316,7 @@ final class ShuffleExternalSorter extends MemoryConsumer implements ShuffleCheck
       return 0L;
     }
 
-    writeSortedFile(false);
+    writeSortedFile(false, true);
     final long spillSize = freeMemory();
     inMemSorter.reset();
     // Reset the in-memory sorter's pointer array only after freeing up the memory pages holding the
@@ -469,7 +482,10 @@ final class ShuffleExternalSorter extends MemoryConsumer implements ShuffleCheck
     if (inMemSorter != null) {
       // Here we are spilling the remaining data in the buffer. If there is no spill before, this
       // final spill file will be the final shuffle output file.
-      writeSortedFile(/* isFinalFile = */spills.isEmpty());
+      // In merge-input mode the last file is neither the final output nor a spill: its records
+      // are counted here and its bytes when the files are merged.
+      final boolean isFinalFile = !outputIsMergeInput && spills.isEmpty();
+      writeSortedFile(isFinalFile, /* isSpill = */ !outputIsMergeInput && !isFinalFile);
       freeMemory();
       inMemSorter.free();
       inMemSorter = null;

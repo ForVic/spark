@@ -22,6 +22,7 @@ import java.io.{IOException, ObjectOutputStream}
 import scala.reflect.ClassTag
 
 import org.apache.spark.{OneToOneDependency, Partition, SparkContext, TaskContext}
+import org.apache.spark.scheduler.morsel.{MorselPartition, SharedMorselInput}
 import org.apache.spark.util.Utils
 
 private[spark] class ZippedPartitionsPartition(
@@ -84,9 +85,16 @@ private[spark] class ZippedPartitionsRDD2[A: ClassTag, B: ClassTag, V: ClassTag]
     preservesPartitioning: Boolean = false)
   extends ZippedPartitionsBaseRDD[V](sc, List(rdd1, rdd2), preservesPartitioning) {
 
-  override def compute(s: Partition, context: TaskContext): Iterator[V] = {
-    val partitions = s.asInstanceOf[ZippedPartitionsPartition].partitions
-    f(rdd1.iterator(partitions(0), context), rdd2.iterator(partitions(1), context))
+  override def compute(s: Partition, context: TaskContext): Iterator[V] = s match {
+    case morsels: MorselPartition =>
+      // Both sides read the same morsels, e.g. the same reducer partitions of two shuffles.
+      val partitions = morsels.parent.asInstanceOf[ZippedPartitionsPartition].partitions
+      val input = new SharedMorselInput(morsels.morsels)
+      f(rdd1.iterator(new MorselPartition(partitions(0), input.sourceIterator()), context),
+        rdd2.iterator(new MorselPartition(partitions(1), input.sourceIterator()), context))
+    case _ =>
+      val partitions = s.asInstanceOf[ZippedPartitionsPartition].partitions
+      f(rdd1.iterator(partitions(0), context), rdd2.iterator(partitions(1), context))
   }
 
   override def clearDependencies(): Unit = {

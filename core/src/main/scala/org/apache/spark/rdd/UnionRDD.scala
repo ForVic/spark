@@ -27,6 +27,7 @@ import scala.reflect.ClassTag
 import org.apache.spark.{Dependency, Partition, RangeDependency, SparkContext, TaskContext}
 import org.apache.spark.annotation.DeveloperApi
 import org.apache.spark.internal.config.RDD_PARALLEL_LISTING_THRESHOLD
+import org.apache.spark.scheduler.morsel.MorselPartition
 import org.apache.spark.util.{ThreadUtils, Utils}
 
 /**
@@ -103,9 +104,14 @@ class UnionRDD[T: ClassTag](
     deps.toSeq
   }
 
-  override def compute(s: Partition, context: TaskContext): Iterator[T] = {
-    val part = s.asInstanceOf[UnionPartition[T]]
-    parent[T](part.parentRddIndex).iterator(part.parentPartition, context)
+  override def compute(s: Partition, context: TaskContext): Iterator[T] = s match {
+    case morsels: MorselPartition =>
+      val part = morsels.parent.asInstanceOf[UnionPartition[T]]
+      parent[T](part.parentRddIndex)
+        .iterator(new MorselPartition(part.parentPartition, morsels.morsels), context)
+    case _ =>
+      val part = s.asInstanceOf[UnionPartition[T]]
+      parent[T](part.parentRddIndex).iterator(part.parentPartition, context)
   }
 
   override def getPreferredLocations(s: Partition): Seq[String] =

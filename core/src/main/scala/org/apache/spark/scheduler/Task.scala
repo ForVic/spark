@@ -195,6 +195,9 @@ private[spark] abstract class Task[T](
   protected var _executorDeserializeTimeNs: Long = 0
   protected var _executorDeserializeCpuTime: Long = 0
 
+  // CPU time other threads spent running this task's morsels, see MorselScheduler.
+  @transient @volatile private[spark] var morselHelperCpuTimeNs: Long = 0
+
   /**
    * If defined, this task has been killed and this option contains the reason.
    */

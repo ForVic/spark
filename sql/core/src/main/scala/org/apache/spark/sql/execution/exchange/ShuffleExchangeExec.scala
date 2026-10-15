@@ -247,6 +247,12 @@ case class ShuffleExchangeExec(
       outputPartitioning,
       serializer,
       writeMetrics)
+    if (conf.morselExecutionEnabled) {
+      val reason = MorselSafety.unsafeReason(child, outputPartitioning)
+      dep.morselSafe = reason.isEmpty
+      dep.morselOutputVariesWithSplit = MorselSafety.outputVariesWithSplit(child)
+      logDebug(s"Shuffle ${dep.shuffleId} morsel-safe: ${reason.map("no, " + _).getOrElse("yes")}")
+    }
     metrics("numPartitions").set(dep.partitioner.numPartitions)
     val executionId = sparkContext.getLocalProperty(SQLExecution.EXECUTION_ID_KEY)
     SQLMetrics.postDriverMetricUpdates(

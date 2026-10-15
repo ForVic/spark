@@ -26,6 +26,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.stream.IntStream;
 
 import scala.Option;
 
@@ -46,9 +47,12 @@ import org.apache.parquet.hadoop.ParquetFileReader;
 import org.apache.parquet.hadoop.ParquetInputFormat;
 import org.apache.parquet.hadoop.api.InitContext;
 import org.apache.parquet.hadoop.api.ReadSupport;
+import org.apache.parquet.hadoop.metadata.BlockMetaData;
+import org.apache.parquet.hadoop.metadata.ColumnChunkMetaData;
 import org.apache.parquet.hadoop.metadata.ParquetMetadata;
 import org.apache.parquet.hadoop.util.ConfigurationUtil;
 import org.apache.parquet.hadoop.util.HadoopInputFile;
+import org.apache.parquet.internal.filter2.columnindex.RowRanges;
 import org.apache.parquet.io.SeekableInputStream;
 import org.apache.parquet.schema.MessageType;
 import org.apache.parquet.schema.Types;
@@ -88,6 +92,22 @@ public abstract class SpecificParquetRecordReaderBase<T> extends RecordReader<Vo
   protected ParquetRowGroupReader reader;
 
   protected Configuration configuration;
+
+  // Morsel execution: read only the rows of these pages of one column, see ParquetMorsels.
+  private String morselColumnPath;
+  private int morselFirstPage;
+  private int morselEndPage;
+
+  /**
+   * Reads only the rows of pages {@code [firstPage, endPage)} of the column at
+   * {@code columnPath} of the single row group the split selects. Must be called before
+   * initialize().
+   */
+  public void setMorselPageRange(String columnPath, int firstPage, int endPage) {
+    this.morselColumnPath = columnPath;
+    this.morselFirstPage = firstPage;
+    this.morselEndPage = endPage;
+  }
 
   @Override
   public void initialize(InputSplit inputSplit, TaskAttemptContext taskAttemptContext)
@@ -137,7 +157,14 @@ public abstract class SpecificParquetRecordReaderBase<T> extends RecordReader<Vo
     this.parquetColumn = converter.convertParquetColumn(requestedSchema,
       Option.apply(this.sparkRequestedSchema));
     this.sparkSchema = (StructType) parquetColumn.sparkType();
-    this.totalRowCount = fileReader.getFilteredRecordCount();
+    if (morselColumnPath != null) {
+      PageRangeRowGroupReader pageRangeReader = new PageRangeRowGroupReader(
+        fileReader, morselColumnPath, morselFirstPage, morselEndPage);
+      this.reader = pageRangeReader;
+      this.totalRowCount = pageRangeReader.rowCount();
+    } else {
+      this.totalRowCount = fileReader.getFilteredRecordCount();
+    }
 
     // For test purpose.
     // If the last external accumulator is `NumRowGroupsAccumulator`, the row group number to read
@@ -278,6 +305,55 @@ public abstract class SpecificParquetRecordReaderBase<T> extends RecordReader<Vo
      * Reads the next row group from this reader. Returns null if there is no more row group.
      */
     PageReadStore readNextRowGroup() throws IOException;
+  }
+
+  /** Reads the rows of a range of pages of one column of the only selected row group. */
+  private static class PageRangeRowGroupReader implements ParquetRowGroupReader {
+    private final ParquetFileReader reader;
+    private final RowRanges rowRanges;
+    private boolean done = false;
+
+    PageRangeRowGroupReader(
+        ParquetFileReader reader,
+        String columnPath,
+        int firstPage,
+        int endPage) throws IOException {
+      this.reader = reader;
+      List<BlockMetaData> rowGroups = reader.getRowGroups();
+      if (rowGroups.isEmpty()) {
+        // Row group statistics filtered out the row group.
+        this.rowRanges = RowRanges.EMPTY;
+      } else if (rowGroups.size() == 1) {
+        BlockMetaData rowGroup = rowGroups.get(0);
+        ColumnChunkMetaData column = rowGroup.getColumns().stream()
+          .filter(c -> c.getPath().toDotString().equals(columnPath))
+          .findFirst()
+          .orElseThrow(() -> new IllegalStateException("No column " + columnPath));
+        this.rowRanges = RowRanges.create(rowGroup.getRowCount(),
+          IntStream.range(firstPage, endPage).iterator(), reader.readOffsetIndex(column));
+      } else {
+        throw new IllegalStateException(
+          "A page range must select one row group, but selected " + rowGroups.size());
+      }
+    }
+
+    long rowCount() {
+      return rowRanges.rowCount();
+    }
+
+    @Override
+    public PageReadStore readNextRowGroup() throws IOException {
+      if (done || rowRanges.rowCount() == 0) {
+        return null;
+      }
+      done = true;
+      return reader.readFilteredRowGroup(0, rowRanges);
+    }
+
+    @Override
+    public void close() throws IOException {
+      reader.close();
+    }
   }
 
   private static class ParquetRowGroupReaderImpl implements ParquetRowGroupReader {

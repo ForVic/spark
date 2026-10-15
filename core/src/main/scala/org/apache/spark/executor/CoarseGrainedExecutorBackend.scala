@@ -169,7 +169,7 @@ private[spark] class CoarseGrainedExecutorBackend(
       logInfo("Successfully registered with driver")
       try {
         executor = new Executor(executorId, hostname, env, getUserClassPath, isLocal = false,
-          resources = _resources)
+          resources = _resources, numCores = Some(cores))
         driver.get.send(LaunchedExecutor(executorId))
       } catch {
         case NonFatal(e) =>

@@ -4952,6 +4952,16 @@ object SQLConf {
       .booleanConf
       .createWithDefault(false)
 
+  val MORSEL_EXECUTION_ENABLED =
+    buildConf("spark.sql.execution.morsel.enabled")
+      .doc("When true, shuffle map stages that scan files and only apply row-wise operators, " +
+        "broadcast joins and partial aggregations are marked as safe for morsel execution, so " +
+        "that idle executor cores can help their tasks. Requires " +
+        "spark.executor.morsel.enabled on the executors.")
+      .version("4.2.0")
+      .booleanConf
+      .createWithDefault(false)
+
   val SORT_BEFORE_REPARTITION =
     buildConf("spark.sql.execution.sortBeforeRepartition")
       .internal()
@@ -7522,6 +7532,8 @@ class SQLConf extends Serializable with Logging with SqlApiConf {
   def stringRedactionPattern: Option[Regex] = getConf(SQL_STRING_REDACTION_PATTERN)
 
   def sortBeforeRepartition: Boolean = getConf(SORT_BEFORE_REPARTITION)
+
+  def morselExecutionEnabled: Boolean = getConf(MORSEL_EXECUTION_ENABLED)
 
   def topKSortFallbackThreshold: Int = getConf(TOP_K_SORT_FALLBACK_THRESHOLD)
 

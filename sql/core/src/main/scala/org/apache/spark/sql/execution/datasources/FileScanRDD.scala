@@ -29,6 +29,7 @@ import org.apache.spark.deploy.SparkHadoopUtil
 import org.apache.spark.internal.LogKeys.{CURRENT_FILE, PATH}
 import org.apache.spark.paths.SparkPath
 import org.apache.spark.rdd.{InputFileBlockHolder, RDD}
+import org.apache.spark.scheduler.morsel.{Morsel, MorselPartition, MorselSource}
 import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.catalyst.{FileSourceOptions, InternalRow}
 import org.apache.spark.sql.catalyst.expressions.{AttributeReference, GenericInternalRow, JoinedRow, Literal, UnsafeProjection, UnsafeRow}
@@ -85,10 +86,41 @@ class FileScanRDD(
     val metadataColumns: Seq[AttributeReference] = Seq.empty,
     metadataExtractors: Map[String, PartitionedFile => Any] = Map.empty,
     options: FileSourceOptions = new FileSourceOptions(CaseInsensitiveMap(Map.empty)))
-  extends RDD[InternalRow](sparkSession.sparkContext, Nil) {
+  extends RDD[InternalRow](sparkSession.sparkContext, Nil) with MorselSource {
 
   private val ignoreCorruptFiles = options.ignoreCorruptFiles
   private val ignoreMissingFiles = options.ignoreMissingFiles
+
+  /**
+   * Splits a file into morsels of about the given size, returning each with its size, for
+   * formats whose files can be split further than the planner split them (see [[MorselSource]]).
+   * Null if files are whole morsels.
+   */
+  private[sql] var morselSplitter: (PartitionedFile, Long) => Seq[(PartitionedFile, Long)] = null
+
+  /** Splits a partition into morsels: its files, split further by `morselSplitter` if set. */
+  override private[spark] def splitIntoMorsels(
+      split: RDDPartition,
+      targetSize: Long): IndexedSeq[Morsel] = {
+    split.asInstanceOf[FilePartition].files.toIndexedSeq.flatMap { file =>
+      if (morselSplitter != null) {
+        morselSplitter(file, targetSize).map { case (piece, size) => Morsel(piece, size) }
+      } else {
+        Seq(Morsel(file, file.length))
+      }
+    }
+  }
+
+  /** Merges consecutive byte ranges of a file that `morselSplitter` split. */
+  override private[spark] def mergeMorsels(first: AnyRef, next: AnyRef): Option[AnyRef] =
+    (first, next) match {
+      case (a: PartitionedFile, b: PartitionedFile)
+          if morselSplitter != null && a.filePath == b.filePath &&
+            a.start + a.length == b.start && a.partitionValues == b.partitionValues &&
+            a.otherConstantMetadataColumnValues == b.otherConstantMetadataColumnValues =>
+        Some(a.copy(length = a.length + b.length))
+      case _ => None
+    }
 
   override def compute(split: RDDPartition, context: TaskContext): Iterator[InternalRow] = {
     val iterator = new Iterator[Object] with AutoCloseable {
@@ -108,7 +140,10 @@ class FileScanRDD(
         inputMetrics.setBytesRead(existingBytesRead + getBytesReadCallback())
       }
 
-      private[this] val files = split.asInstanceOf[FilePartition].files.iterator
+      private[this] val files: Iterator[PartitionedFile] = split match {
+        case morsels: MorselPartition => morsels.morsels.asInstanceOf[Iterator[PartitionedFile]]
+        case _ => split.asInstanceOf[FilePartition].files.iterator
+      }
       private[this] var currentFile: PartitionedFile = null
       private[this] var currentIterator: Iterator[Object] = null
 

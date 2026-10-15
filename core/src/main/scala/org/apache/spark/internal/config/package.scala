@@ -727,6 +727,42 @@ package object config {
       .checkValue(_ > 0, "Number of cores to allocate for each task should be positive.")
       .createWithDefault(1)
 
+  private[spark] val MORSEL_ENABLED =
+    ConfigBuilder("spark.executor.morsel.enabled")
+      .doc("Whether executors run an executor-wide morsel scheduler. When enabled, eligible " +
+        "shuffle map tasks split their input into morsels, and executor cores that would " +
+        "otherwise be idle help run the remaining morsels of tasks that are still running. " +
+        "Each task keeps ownership of its input partition and its map output.")
+      .version("4.2.0")
+      .booleanConf
+      .createWithDefault(false)
+
+  private[spark] val MORSEL_SLOTS =
+    ConfigBuilder("spark.executor.morsel.slots")
+      .doc("Number of CPU slots the morsel scheduler manages. Defaults to the executor's cores.")
+      .version("4.2.0")
+      .intConf
+      .checkValue(_ > 0, "The number of morsel slots must be positive.")
+      .createOptional
+
+  private[spark] val MORSEL_TARGET_SIZE =
+    ConfigBuilder("spark.executor.morsel.targetSize")
+      .doc("Target input size of one morsel. Sources split partitions into pieces of about " +
+        "this size, subject to their own granularity (e.g. Parquet row groups).")
+      .version("4.2.0")
+      .bytesConf(ByteUnit.BYTE)
+      .checkValue(_ > 0, "The morsel target size must be positive.")
+      .createWithDefaultString("16m")
+
+  private[spark] val MORSEL_HELPER_DELAY =
+    ConfigBuilder("spark.executor.morsel.helperDelay")
+      .doc("How long a CPU slot must stay free before an idle helper starts stealing morsels. " +
+        "This avoids helpers starting in the short gap between a task finishing and the " +
+        "driver launching the next one.")
+      .version("4.2.0")
+      .timeConf(TimeUnit.MILLISECONDS)
+      .createWithDefaultString("20ms")
+
   private[spark] val DYN_ALLOCATION_ENABLED =
     ConfigBuilder("spark.dynamicAllocation.enabled")
       .version("1.2.0")

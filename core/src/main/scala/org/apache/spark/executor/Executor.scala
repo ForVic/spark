@@ -51,6 +51,7 @@ import org.apache.spark.metrics.source.JVMCPUSource
 import org.apache.spark.resource.ResourceInformation
 import org.apache.spark.rpc.RpcTimeout
 import org.apache.spark.scheduler._
+import org.apache.spark.scheduler.morsel.MorselScheduler
 import org.apache.spark.serializer.SerializerHelper
 import org.apache.spark.shuffle.{FetchFailedException, ShuffleBlockPusher}
 import org.apache.spark.status.api.v1.ThreadStackTrace
@@ -252,7 +253,8 @@ private[spark] class Executor(
     userClassPath: Seq[URL] = Nil,
     isLocal: Boolean = false,
     uncaughtExceptionHandler: UncaughtExceptionHandler = new SparkUncaughtExceptionHandler,
-    resources: immutable.Map[String, ResourceInformation])
+    resources: immutable.Map[String, ResourceInformation],
+    numCores: Option[Int] = None)
   extends Logging {
 
   logInfo(log"Starting executor ID ${MDC(LogKeys.EXECUTOR_ID, executorId)}" +
@@ -310,6 +312,16 @@ private[spark] class Executor(
       .setThreadFactory((r: Runnable) => new UninterruptibleThread(r, "unused"))
       .build()
     Executors.newCachedThreadPool(threadFactory).asInstanceOf[ThreadPoolExecutor]
+  }
+  // Lends idle CPU slots to running tasks whose work can be split into morsels.
+  private val morselScheduler: Option[MorselScheduler] = if (conf.get(MORSEL_ENABLED)) {
+    val slots = conf.get(MORSEL_SLOTS).getOrElse(numCores.getOrElse(conf.get(EXECUTOR_CORES)))
+    logInfo(s"Starting morsel scheduler with $slots slots")
+    val scheduler = new MorselScheduler(slots, conf)
+    MorselScheduler.set(scheduler)
+    Some(scheduler)
+  } else {
+    None
   }
   private val schemes = conf.get(EXECUTOR_METRICS_FILESYSTEM_SCHEMES)
     .toLowerCase(Locale.ROOT).split(",").map(_.trim).filter(_.nonEmpty)
@@ -663,6 +675,10 @@ private[spark] class Executor(
       if (threadPool != null) {
         threadPool.shutdown()
       }
+      morselScheduler.foreach { scheduler =>
+        scheduler.stop()
+        MorselScheduler.clear(scheduler)
+      }
       if (killMarkCleanupService != null) {
         killMarkCleanupService.shutdown()
       }
@@ -827,6 +843,7 @@ private[spark] class Executor(
       val ser = env.closureSerializer.newInstance()
       logInfo(log"Running ${MDC(TASK_NAME, taskName)}")
       execBackend.statusUpdate(taskId, TaskState.RUNNING, EMPTY_BYTE_BUFFER)
+      morselScheduler.foreach(_.taskStarted(taskDescription.cpus))
       var taskStartTimeNs: Long = 0
       var taskStartCpu: Long = 0
       startGCTime = computeTotalGcTime()
@@ -952,7 +969,8 @@ private[spark] class Executor(
           (taskFinishNs - taskStartTimeNs) * taskDescription.cpus
             - task.executorDeserializeTimeNs))
         task.metrics.setExecutorCpuTime(
-          (taskFinishCpu - taskStartCpu) - task.executorDeserializeCpuTime)
+          (taskFinishCpu - taskStartCpu) - task.executorDeserializeCpuTime +
+            task.morselHelperCpuTimeNs)
         task.metrics.setJvmGCTime(computeTotalGcTime() - startGCTime)
         task.metrics.setResultSerializationTime(TimeUnit.NANOSECONDS.toMillis(
           afterSerializationNs - beforeSerializationNs))
@@ -1112,6 +1130,7 @@ private[spark] class Executor(
             uncaughtExceptionHandler.uncaughtException(Thread.currentThread(), t)
           }
       } finally {
+        morselScheduler.foreach(_.taskFinished(taskDescription.cpus))
         cleanMDCForTask(taskName, mdcProperties)
         runningTasks.remove(taskId)
         if (taskStarted) {

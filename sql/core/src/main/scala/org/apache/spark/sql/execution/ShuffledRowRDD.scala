@@ -21,10 +21,12 @@ import java.util.Arrays
 
 import org.apache.spark._
 import org.apache.spark.rdd.RDD
+import org.apache.spark.scheduler.morsel.{Morsel, MorselPartition, MorselSource}
 import org.apache.spark.shuffle.sort.SortShuffleManager
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.execution.metric.{SQLMetric, SQLShuffleReadMetricsReporter}
 import org.apache.spark.sql.internal.SQLConf
+import org.apache.spark.storage.ShuffleBlockId
 
 sealed trait ShufflePartitionSpec
 
@@ -131,7 +133,7 @@ class ShuffledRowRDD(
     var dependency: ShuffleDependency[Int, InternalRow, InternalRow],
     metrics: Map[String, SQLMetric],
     partitionSpecs: Array[ShufflePartitionSpec])
-  extends RDD[InternalRow](dependency.rdd.context, Nil) {
+  extends RDD[InternalRow](dependency.rdd.context, Nil) with MorselSource {
 
   def this(
       dependency: ShuffleDependency[Int, InternalRow, InternalRow],
@@ -185,12 +187,111 @@ class ShuffledRowRDD(
     }
   }
 
-  override def compute(split: Partition, context: TaskContext): Iterator[InternalRow] = {
+  /**
+   * Splits a partition into morsels whose payloads are the [[ShufflePartitionSpec]]s they read:
+   *  - a read of several reducer partitions (AQE coalescing) into one morsel per reducer
+   *    partition. Each holds every row of its keys, so key-grouped operators (final aggregation,
+   *    windows, joins) can process it on its own.
+   *  - a local read of several map outputs into one morsel per map output, and a local read of
+   *    one map output into one morsel per reducer partition. These only suit row-wise pipelines.
+   * Empty morsels are dropped: they produce no rows.
+   */
+  override private[spark] def splitIntoMorsels(
+      split: Partition,
+      targetSize: Long): IndexedSeq[Morsel] = {
+    morselsOf(split.asInstanceOf[ShuffledRowRDDPartition].spec)
+      .map(_.filter(_.sizeInBytes > 0))
+      .getOrElse(IndexedSeq(Morsel(split, 0L)))
+  }
+
+  /** Reducer partitions of different shuffles hold the same keys, so they align across sides. */
+  override private[spark] def splitIntoAlignedMorsels(
+      split: Partition): Option[IndexedSeq[Morsel]] = {
+    split.asInstanceOf[ShuffledRowRDDPartition].spec match {
+      case spec: CoalescedPartitionSpec => morselsOf(spec)
+      case _ => None
+    }
+  }
+
+  /** Merges adjacent morsels into one read; empty reducer partitions in between hold no rows. */
+  override private[spark] def mergeMorsels(first: AnyRef, next: AnyRef): Option[AnyRef] =
+    (first, next) match {
+      case (CoalescedPartitionSpec(start, end, _), CoalescedPartitionSpec(nextStart, nextEnd, _))
+          if end <= nextStart =>
+        Some(CoalescedPartitionSpec(start, nextEnd))
+      case (CoalescedMapperPartitionSpec(start, end, numReducers),
+          CoalescedMapperPartitionSpec(nextStart, nextEnd, nextNumReducers))
+          if end <= nextStart && numReducers == nextNumReducers =>
+        Some(CoalescedMapperPartitionSpec(start, nextEnd, numReducers))
+      case (PartialMapperPartitionSpec(mapIndex, start, end),
+          PartialMapperPartitionSpec(nextMapIndex, nextStart, nextEnd))
+          if mapIndex == nextMapIndex && end <= nextStart =>
+        Some(PartialMapperPartitionSpec(mapIndex, start, nextEnd))
+      case _ => None
+    }
+
+  private def morselsOf(spec: ShufflePartitionSpec): Option[IndexedSeq[Morsel]] = spec match {
+    case CoalescedPartitionSpec(startReducerIndex, endReducerIndex, _) =>
+      blockSizes(0, Int.MaxValue, startReducerIndex, endReducerIndex,
+          endReducerIndex - startReducerIndex)((block, _) => block.reduceId - startReducerIndex)
+        .map(sizes => sizes.indices.map { i =>
+          val r = startReducerIndex + i
+          Morsel(CoalescedPartitionSpec(r, r + 1), sizes(i))
+        })
+    case CoalescedMapperPartitionSpec(startMapIndex, endMapIndex, numReducers) =>
+      blockSizes(startMapIndex, endMapIndex, 0, numReducers,
+          endMapIndex - startMapIndex)((_, mapIndex) => mapIndex - startMapIndex)
+        .map(sizes => sizes.indices.map { i =>
+          val m = startMapIndex + i
+          Morsel(CoalescedMapperPartitionSpec(m, m + 1, numReducers), sizes(i))
+        })
+    case PartialMapperPartitionSpec(mapIndex, startReducerIndex, endReducerIndex) =>
+      blockSizes(mapIndex, mapIndex + 1, startReducerIndex, endReducerIndex,
+          endReducerIndex - startReducerIndex)((block, _) => block.reduceId - startReducerIndex)
+        .map(sizes => sizes.indices.map { i =>
+          val r = startReducerIndex + i
+          Morsel(PartialMapperPartitionSpec(mapIndex, r, r + 1), sizes(i))
+        })
+    case _ => None
+  }
+
+  /**
+   * Sizes of map output blocks, from the map statuses the reader fetches anyway. None if the read
+   * includes other kinds of blocks (e.g. push-merged ones), whose rows morsels can't attribute.
+   */
+  private def blockSizes(
+      startMapIndex: Int,
+      endMapIndex: Int,
+      startReducerIndex: Int,
+      endReducerIndex: Int,
+      numSlots: Int)(slot: (ShuffleBlockId, Int) => Int): Option[Array[Long]] = {
+    val sizes = new Array[Long](numSlots)
+    var onlyShuffleBlocks = true
+    SparkEnv.get.mapOutputTracker.getMapSizesByExecutorId(dependency.shuffleId,
+        startMapIndex, endMapIndex, startReducerIndex, endReducerIndex)
+      .foreach { case (_, blocks) =>
+        blocks.foreach {
+          case (block: ShuffleBlockId, size, mapIndex) => sizes(slot(block, mapIndex)) += size
+          case _ => onlyShuffleBlocks = false
+        }
+      }
+    if (onlyShuffleBlocks) Some(sizes) else None
+  }
+
+  override def compute(split: Partition, context: TaskContext): Iterator[InternalRow] =
+    split match {
+      // Read the claimed morsels one at a time.
+      case morsels: MorselPartition =>
+        morsels.morsels.flatMap(spec => read(spec.asInstanceOf[ShufflePartitionSpec], context))
+      case _ => read(split.asInstanceOf[ShuffledRowRDDPartition].spec, context)
+    }
+
+  private def read(spec: ShufflePartitionSpec, context: TaskContext): Iterator[InternalRow] = {
     val tempMetrics = context.taskMetrics().createTempShuffleReadMetrics()
     // `SQLShuffleReadMetricsReporter` will update its own metrics for SQL exchange operator,
     // as well as the `tempMetrics` for basic shuffle metrics.
     val sqlMetricsReporter = new SQLShuffleReadMetricsReporter(tempMetrics, metrics)
-    val reader = split.asInstanceOf[ShuffledRowRDDPartition].spec match {
+    val reader = spec match {
       case CoalescedPartitionSpec(startReducerIndex, endReducerIndex, _) =>
         SparkEnv.get.shuffleManager.getReader(
           dependency.shuffleHandle,

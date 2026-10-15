@@ -63,7 +63,7 @@ private[spark] class LocalEndpoint(
   // local mode doesn't support extra resources like GPUs right now
   private val executor = new Executor(
     localExecutorId, localExecutorHostname, SparkEnv.get, userClassPath, isLocal = true,
-    resources = Map.empty[String, ResourceInformation])
+    resources = Map.empty[String, ResourceInformation], numCores = Some(totalCores))
 
   override def receive: PartialFunction[Any, Unit] = {
     case ReviveOffers =>

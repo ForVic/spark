@@ -25,6 +25,7 @@ import org.apache.spark._
 import org.apache.spark.broadcast.Broadcast
 import org.apache.spark.internal.{config, Logging}
 import org.apache.spark.rdd.RDD
+import org.apache.spark.scheduler.morsel.MorselShuffleMapTask
 
 /**
  * A ShuffleMapTask divides the elements of an RDD into multiple buckets (based on a partitioner
@@ -103,12 +104,15 @@ private[spark] class ShuffleMapTask(
     } else {
       context.taskAttemptId()
     }
-    dep.shuffleWriterProcessor.write(
-      rdd.iterator(partition, context),
-      dep,
-      mapId,
-      partitionId,
-      context)
+    MorselShuffleMapTask.tryRun(taskBinary, rdd, dep, partition, mapId, context, isBarrier,
+        morselHelperCpuTimeNs = _).getOrElse {
+      dep.shuffleWriterProcessor.write(
+        rdd.iterator(partition, context),
+        dep,
+        mapId,
+        partitionId,
+        context)
+    }
   }
 
   override def preferredLocations: Seq[TaskLocation] = preferredLocs

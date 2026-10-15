@@ -33,7 +33,7 @@ import org.apache.spark.sql.connector.read.streaming.SparkDataStream
 import org.apache.spark.sql.errors.QueryExecutionErrors
 import org.apache.spark.sql.execution
 import org.apache.spark.sql.execution.datasources._
-import org.apache.spark.sql.execution.datasources.parquet.{ParquetFileFormat => ParquetSource}
+import org.apache.spark.sql.execution.datasources.parquet.{ParquetFileFormat => ParquetSource, ParquetMorsels}
 import org.apache.spark.sql.execution.datasources.v2.{PushedDownOperators, TableSampleInfo}
 import org.apache.spark.sql.execution.metric.{SQLMetric, SQLMetrics}
 import org.apache.spark.sql.execution.vectorized.ConstantColumnVector
@@ -41,8 +41,8 @@ import org.apache.spark.sql.internal.{SessionStateHelper, SQLConf}
 import org.apache.spark.sql.sources.{BaseRelation, Filter}
 import org.apache.spark.sql.types.StructType
 import org.apache.spark.sql.vectorized.ColumnarBatch
+import org.apache.spark.util.{SerializableConfiguration, Utils}
 import org.apache.spark.util.ArrayImplicits._
-import org.apache.spark.util.Utils
 import org.apache.spark.util.collection.BitSet
 
 trait DataSourceScanExec extends LeafExecNode with StreamSourceAwareSparkPlan {
@@ -731,6 +731,22 @@ case class FileSourceScanExec(
       createBucketedReadRDD(relation.bucketSpec.get, readFile, dynamicallySelectedPartitions)
     } else {
       createReadRDD(readFile, dynamicallySelectedPartitions)
+    }
+    readRDD match {
+      // Splitting changes a file's block start and length, so not when those are read.
+      case fileScan: FileScanRDD if conf.morselExecutionEnabled &&
+          relation.fileFormat.getClass == classOf[ParquetSource] &&
+          !fileConstantMetadataColumns.exists(c =>
+            c.name == FileFormat.FILE_BLOCK_START || c.name == FileFormat.FILE_BLOCK_LENGTH) =>
+        // Morsels are row groups, or page ranges of large row groups. Only the vectorized reader
+        // reads page ranges, and row indexes are only generated for whole row groups.
+        val splitRowGroups = supportsColumnar &&
+          !requiredSchema.fieldNames.contains(ParquetSource.ROW_INDEX_TEMPORARY_COLUMN_NAME)
+        val hadoopConf = sparkContext.broadcast(new SerializableConfiguration(
+          getHadoopConf(relation.sparkSession, relation.options)))
+        fileScan.morselSplitter = (file, targetSize) =>
+          ParquetMorsels.split(file, hadoopConf.value.value, targetSize, splitRowGroups)
+      case _ =>
     }
     sendDriverMetrics()
     readRDD

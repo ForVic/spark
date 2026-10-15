@@ -36,6 +36,10 @@ private[spark] class ShuffleWriteProcessor extends Serializable with Logging {
     context.taskMetrics().shuffleWriteMetrics
   }
 
+  /** Creates the metrics reporter for one participant of a morsel-executed map task. */
+  private[spark] final def morselMetricsReporter(
+      context: TaskContext): ShuffleWriteMetricsReporter = createMetricsReporter(context)
+
   /**
    * The write process for particular partition, it controls the life circle of [[ShuffleWriter]]
    * get from [[ShuffleManager]] finally return the [[MapStatus]] for this task.

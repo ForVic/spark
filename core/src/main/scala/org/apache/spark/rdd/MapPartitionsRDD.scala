@@ -45,7 +45,7 @@ private[spark] class MapPartitionsRDD[U: ClassTag, T: ClassTag](
     f: (TaskContext, Int, Iterator[T]) => Iterator[U],  // (TaskContext, partition index, iterator)
     preservesPartitioning: Boolean = false,
     isFromBarrier: Boolean = false,
-    isOrderSensitive: Boolean = false,
+    private[spark] val isOrderSensitive: Boolean = false,
     val preservesPartitionSizes: Boolean = false)
   extends RDD[U](prev) {
 

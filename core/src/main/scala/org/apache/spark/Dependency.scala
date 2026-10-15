@@ -141,6 +141,20 @@ class ShuffleDependency[K: ClassTag, V: ClassTag, C: ClassTag](
     _shuffleMergeAllowed = shuffleMergeAllowed
   }
 
+  /**
+   * Whether the map side of this shuffle may be executed as morsels: the map output for a
+   * partition must be the same multiset of records for any split of the partition's input into
+   * pieces that are processed independently (e.g. row-wise operators and partial aggregation).
+   * Set by the planner that built the RDD chain; see [[org.apache.spark.scheduler.morsel]].
+   */
+  @volatile private[spark] var morselSafe: Boolean = false
+
+  /**
+   * Whether the rows (not just their order) of a morsel-executed map output depend on how its input
+   * was split, e.g. a partial aggregation emits one row per key per participant.
+   */
+  @volatile private[spark] var morselOutputVariesWithSplit: Boolean = true
+
   def shuffleMergeEnabled : Boolean = shuffleMergeAllowed && mergerLocs.nonEmpty
 
   def shuffleMergeAllowed : Boolean = _shuffleMergeAllowed
