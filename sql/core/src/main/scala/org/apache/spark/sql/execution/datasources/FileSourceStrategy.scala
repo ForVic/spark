@@ -196,13 +196,13 @@ object FileSourceStrategy extends Strategy with PredicateHelper with Logging {
     val checked = StorageFilterPlanning.checkedColumn(
       sparkSession.sessionState.conf, offered, scanOutput)
     if (checked.isEmpty) return (offered, None)
-    // A conjunct over the key columns alone adds no column to the read.
+    // A conjunct over the key columns alone adds no column to the read. The offered conjuncts
+    // already leave a read column out, so `offeredConjuncts` never drops these for covering them.
     val storageKeyAttrs = AttributeSet.fromAttributeSets(offered.map(_.references))
-    val onKeys = ExpressionSet(normalizedFilters).toSeq.filter { expr =>
-      val refs = expr.references
-      refs.nonEmpty && refs.subsetOf(storageKeyAttrs) && !offered.contains(expr) &&
-        fsRelation.fileFormat.supportsStorageFilterOnKeys(sparkSession, expr)
-    }
+    val offeredSet = ExpressionSet(offered)
+    val onKeys = StorageFilterPlanning.offeredConjuncts(normalizedFilters, storageKeyAttrs,
+      dataAttrs, expr => !offeredSet.contains(expr) &&
+        fsRelation.fileFormat.supportsStorageFilterOnKeys(sparkSession, expr))
     (offered ++ onKeys, checked)
   }
 

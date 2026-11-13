@@ -2787,8 +2787,13 @@ class ParquetStorageFilterSuite extends QueryTest with SharedSparkSession
     }
     val (_, plain) = run(pushdown = false)
     val (plan, rows) = run(pushdown = true)
-    assert(scanOf(plan).storageFilters.length > 1,
-      s"the key conjuncts must be offered with the bloom.\nPlan:\n$plan")
+    // Every conjunct over the key, not only the `isnotnull(k)` the optimizer infers.
+    val k = columnOf(relation, "k")
+    val offered = scanOf(plan).storageFilters
+    val onKey = splitConjunctivePredicates(filtered.condition)
+      .filter(_.references.forall(_.semanticEquals(k)))
+    assert(onKey.forall(c => offered.exists(_.semanticEquals(c))),
+      s"every conjunct over the key must be offered; got $offered.\nPlan:\n$plan")
     check(plain, rows, rowsExcludedByStorageFilters(plan))
   }
 
@@ -2886,6 +2891,26 @@ class ParquetStorageFilterSuite extends QueryTest with SharedSparkSession
       }
     }
     assert(givenUp == 0, s"the reader gave $givenUp row groups up")
+  }
+
+  test("an IsNotNull over an expression on the key columns keeps its place after the " +
+    "conjuncts written before it") {
+    // `FilterExec` checks `isnotnull(100 % k)` after `k <> 0`, which does not contain `100 % k`.
+    // Under ANSI, `100 % k` throws on k = 0, which the bloom keeps, so the reader has to check it
+    // after `k <> 0` too, or it would give that row group up.
+    withSQLConf(SQLConf.ANSI_ENABLED.key -> "true") {
+      val (_, givenUp) = withLogged(evaluationGivenUp) {
+        readKeysUnder { (k, _) =>
+          And(And(BloomFilterMightContain(bloomLiteralOf(0L, 42L), new XxHash64(Seq(k))),
+            Not(EqualTo(k, Literal(0L)))), IsNotNull(Remainder(Literal(100L), k)))
+        } { (plain, rows, excluded) =>
+          assert(rows == Seq(42L) && rows == plain, s"got $rows, a plain read got $plain")
+          assert(excluded == 999L,
+            s"the reader must not give a row group up; it excluded $excluded")
+        }
+      }
+      assert(givenUp == 0, s"the reader gave $givenUp row groups up")
+    }
   }
 
   test("a null mark leaves the offered conjunct as it was, an And around it included") {

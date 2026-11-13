@@ -141,8 +141,9 @@ object ParquetStorageFilter {
   /**
    * Builds a [[ParquetStorageFilter]] from storage filters bound to the scan's requested data
    * schema. The blooms are combined with AND, and so are the conjuncts over their key columns,
-   * `IsNotNull` first, which are evaluated only where the blooms keep the row. Every condition
-   * below is asserted, since `storageFiltersFor` pre-checks them and a violation is a planner bug.
+   * an `IsNotNull` over a key column first, which are evaluated only where the blooms keep the
+   * row. Every condition below is asserted, since `storageFiltersFor` pre-checks them and a
+   * violation is a planner bug.
    */
   def create(
       boundExpressions: Seq[Expression],
@@ -156,9 +157,14 @@ object ParquetStorageFilter {
     // they share on every row.
     val (blooms, conditions) =
       boundExpressions.partition(_.isInstanceOf[BloomFilterMightContain])
-    // `IsNotNull` first, as `FilterExec` checks it before the conjuncts over its column, so a
-    // conjunct that throws on null never sees the null keys the blooms keep.
-    val onKeys = conditions.sortBy(e => if (e.isInstanceOf[IsNotNull]) 0 else 1)
+    // An `IsNotNull` over a key column first, as `FilterExec` checks one before the conjuncts
+    // over its column, so a conjunct that throws on null never sees the null keys the blooms
+    // keep. One over an expression keeps its place, since `FilterExec` checks it only before a
+    // conjunct that contains the expression, or after the others.
+    val onKeys = conditions.sortBy {
+      case IsNotNull(_: BoundReference) => 0
+      case _ => 1
+    }
     val expr = if (blooms.isEmpty || onKeys.isEmpty) {
       boundExpressions.reduce(And)
     } else {
